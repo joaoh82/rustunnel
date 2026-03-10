@@ -34,6 +34,9 @@ pub enum Error {
 
     #[error("http error: {0}")]
     Http(String),
+
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

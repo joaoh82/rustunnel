@@ -29,4 +29,12 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server",
 http-body-util = "0.1"
 bytes = "1"
 tower = { version = "0.4", features = ["timeout", "util"] }
+axum = { version = "0.7", features = ["macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+rust-embed = { version = "8", features = ["axum"] }
+mime_guess = "2"
 rustunnel-protocol = { path = "crates/rustunnel-protocol" }

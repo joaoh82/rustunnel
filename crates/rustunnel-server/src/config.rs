@@ -23,7 +23,12 @@ pub struct ServerSection {
     pub https_port: u16,
     /// Port the control-plane WebSocket listens on
     pub control_port: u16,
+    /// Port the dashboard HTTP API listens on (default 4040)
+    #[serde(default = "default_dashboard_port")]
+    pub dashboard_port: u16,
 }
+
+fn default_dashboard_port() -> u16 { 4040 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsSection {
@@ -94,6 +99,7 @@ impl Default for ServerConfig {
                 http_port: 8080,
                 https_port: 8443,
                 control_port: 9000,
+                dashboard_port: 4040,
             },
             tls: TlsSection {
                 cert_path: "cert.pem".to_string(),
