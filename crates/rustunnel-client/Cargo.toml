@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "rustunnel-client"
+name = "rustunnel"
 path = "src/main.rs"
 
 [dependencies]
@@ -13,3 +13,20 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
+thiserror = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+yamux = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+serde_yaml = { workspace = true }
+console = { workspace = true }
+indicatif = { workspace = true }
+rand = { workspace = true }
+dirs = { workspace = true }
+reqwest = { workspace = true }
