@@ -36,5 +36,11 @@ logs/
 /test-certs/
 /tmp/
 
+# Dashboard UI — npm artifacts only; built assets ARE committed so
+# `cargo build` works without a Node.js toolchain installed.
+# Run `make ui-build` to regenerate assets after UI changes.
+dashboard-ui/node_modules/
+dashboard-ui/dist/
+
 # Claude Code project memory (local only)
 .claude/

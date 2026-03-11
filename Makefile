@@ -34,8 +34,20 @@ check:
 
 # ── release ───────────────────────────────────────────────────────────────────
 
-## release      Build optimised release binaries for the host platform.
-release:
+## ui-install   Install dashboard-ui npm dependencies.
+ui-install:
+	cd dashboard-ui && npm install
+
+## ui-dev       Start the Vite dev server (proxies API to localhost:8443).
+ui-dev:
+	cd dashboard-ui && npm run dev
+
+## ui-build     Build the dashboard and embed assets into the server crate.
+ui-build:
+	cd dashboard-ui && npm run build
+
+## release      Build optimised release binaries (runs ui-build first).
+release: ui-build
 	cargo build --release -p rustunnel-server -p rustunnel-client
 	@echo "Binaries: target/release/$(BINARY_SERVER)  target/release/$(BINARY_CLIENT)"
 

@@ -19,6 +19,9 @@
 
 use std::sync::Arc;
 
+use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
@@ -57,6 +60,7 @@ pub fn router(state: ApiState) -> Router {
         // authenticated
         .route("/api/tunnels", get(list_tunnels))
         .route("/api/tunnels/:id", get(get_tunnel))
+        .route("/api/tunnels/:id", delete(force_close_tunnel))
         .route("/api/tunnels/:id/requests", get(tunnel_requests))
         .route("/api/tunnels/:id/replay/:request_id", post(replay_request))
         .route("/api/tokens", get(list_tokens).post(create_token))
@@ -148,6 +152,29 @@ struct TunnelSummary {
     protocol: String,
     label: String,
     public_url: String,
+    /// ISO-8601 UTC timestamp when the tunnel was registered.
+    connected_since: String,
+    /// Total proxied requests / connections through this tunnel.
+    request_count: u64,
+    /// Remote address of the client that owns this tunnel.
+    client_addr: String,
+}
+
+/// Convert an `Instant` recorded at tunnel creation into an ISO-8601 UTC string.
+fn instant_to_iso(created: std::time::Instant) -> String {
+    let elapsed = created.elapsed();
+    let system_time = SystemTime::now()
+        .checked_sub(elapsed)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let secs = system_time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Format as RFC-3339 without pulling in chrono for this helper.
+    let dt = chrono::DateTime::from_timestamp(secs as i64, 0)
+        .unwrap_or_default()
+        .to_rfc3339();
+    dt
 }
 
 async fn list_tunnels(headers: HeaderMap, State(state): State<ApiState>) -> impl IntoResponse {
@@ -159,25 +186,61 @@ async fn list_tunnels(headers: HeaderMap, State(state): State<ApiState>) -> impl
 
     for entry in state.core.http_routes.iter() {
         let info = entry.value();
+        let client_addr = state
+            .core
+            .sessions
+            .get(&info.session_id)
+            .map(|s| s.client_addr.to_string())
+            .unwrap_or_default();
         tunnels.push(TunnelSummary {
             tunnel_id: info.tunnel_id.to_string(),
             protocol: "http".into(),
             label: entry.key().clone(),
-            public_url: format!("https://{}.{}", entry.key(), ""),
+            public_url: format!("https://{}", entry.key()),
+            connected_since: instant_to_iso(info.created_at),
+            request_count: info.request_count.load(Ordering::Relaxed),
+            client_addr,
         });
     }
 
     for entry in state.core.tcp_routes.iter() {
         let info = entry.value();
+        let client_addr = state
+            .core
+            .sessions
+            .get(&info.session_id)
+            .map(|s| s.client_addr.to_string())
+            .unwrap_or_default();
         tunnels.push(TunnelSummary {
             tunnel_id: info.tunnel_id.to_string(),
             protocol: "tcp".into(),
             label: entry.key().to_string(),
             public_url: format!("tcp://:{}", entry.key()),
+            connected_since: instant_to_iso(info.created_at),
+            request_count: info.request_count.load(Ordering::Relaxed),
+            client_addr,
         });
     }
 
     Json(tunnels).into_response()
+}
+
+async fn force_close_tunnel(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&headers, &state).await {
+        return e.into_response();
+    }
+
+    let tunnel_id = match id.parse::<uuid::Uuid>() {
+        Ok(u) => u,
+        Err(_) => return not_found("invalid tunnel id").into_response(),
+    };
+
+    state.core.remove_tunnel(&tunnel_id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn get_tunnel(
@@ -193,11 +256,20 @@ async fn get_tunnel(
     for entry in state.core.http_routes.iter() {
         if entry.value().tunnel_id.to_string() == id {
             let info = entry.value();
+            let client_addr = state
+                .core
+                .sessions
+                .get(&info.session_id)
+                .map(|s| s.client_addr.to_string())
+                .unwrap_or_default();
             return Json(TunnelSummary {
                 tunnel_id: info.tunnel_id.to_string(),
                 protocol: "http".into(),
                 label: entry.key().clone(),
                 public_url: format!("https://{}", entry.key()),
+                connected_since: instant_to_iso(info.created_at),
+                request_count: info.request_count.load(Ordering::Relaxed),
+                client_addr,
             })
             .into_response();
         }
@@ -207,11 +279,20 @@ async fn get_tunnel(
     for entry in state.core.tcp_routes.iter() {
         if entry.value().tunnel_id.to_string() == id {
             let info = entry.value();
+            let client_addr = state
+                .core
+                .sessions
+                .get(&info.session_id)
+                .map(|s| s.client_addr.to_string())
+                .unwrap_or_default();
             return Json(TunnelSummary {
                 tunnel_id: info.tunnel_id.to_string(),
                 protocol: "tcp".into(),
                 label: entry.key().to_string(),
                 public_url: format!("tcp://:{}", entry.key()),
+                connected_since: instant_to_iso(info.created_at),
+                request_count: info.request_count.load(Ordering::Relaxed),
+                client_addr,
             })
             .into_response();
         }
