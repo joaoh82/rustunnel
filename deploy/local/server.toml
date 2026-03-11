@@ -1,0 +1,29 @@
+[server]
+domain       = "localhost"
+http_port    = 8080
+https_port   = 8443
+control_port = 4040
+dashboard_port = 4041
+
+[tls]
+cert_path = "/tmp/rustunnel-dev/cert.pem"
+key_path  = "/tmp/rustunnel-dev/key.pem"
+
+[auth]
+admin_token  = "dev-secret-change-me"
+require_auth = false
+
+[database]
+path = "/tmp/rustunnel-dev/rustunnel.db"
+
+[logging]
+level  = "debug"
+format = "pretty"
+
+[limits]
+max_tunnels_per_session    = 10
+max_connections_per_tunnel = 50
+rate_limit_rps             = 1000
+ip_rate_limit_rps          = 0        # 0 = disabled locally
+request_body_max_bytes     = 10485760 # 10 MB
+tcp_port_range             = [20000, 20099]
