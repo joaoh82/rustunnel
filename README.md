@@ -177,6 +177,33 @@ http tunnel  →  http://abc123.localhost:8080
 tcp  tunnel  →  tcp://localhost:20000
 ```
 
+### Testing the HTTP tunnel locally
+
+The tunnel URL uses a subdomain (e.g. `http://abc123.localhost:8080`).
+Browsers won't resolve `*.localhost` subdomains by default, so you have two options:
+
+**Option A — curl with a Host header (no setup required)**
+
+```bash
+curl -v -H "Host: abc123.localhost" http://localhost:8080/
+```
+
+**Option B — wildcard DNS via dnsmasq (enables browser access)**
+
+```bash
+# Install and configure dnsmasq to resolve *.localhost → 127.0.0.1
+brew install dnsmasq
+echo "address=/.localhost/127.0.0.1" | sudo tee -a $(brew --prefix)/etc/dnsmasq.conf
+sudo brew services start dnsmasq
+
+# Tell macOS to use dnsmasq for .localhost queries
+sudo mkdir -p /etc/resolver
+echo "nameserver 127.0.0.1" | sudo tee /etc/resolver/localhost
+```
+
+Then visit `http://abc123.localhost:8080` in the browser (include `:8080` since the
+local config uses port 8080, not port 80).
+
 ---
 
 ## Production deployment (Ubuntu / systemd)
