@@ -40,6 +40,8 @@ logs/
 # `cargo build` works without a Node.js toolchain installed.
 # Run `make ui-build` to regenerate assets after UI changes.
 dashboard-ui/node_modules/
+dashboard-ui/.next/
+dashboard-ui/out/
 dashboard-ui/dist/
 
 # Claude Code project memory (local only)
