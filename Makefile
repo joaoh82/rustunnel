@@ -1,6 +1,6 @@
 .PHONY: build test fmt lint check release release-server release-client \
         docker-build docker-run docker-run-monitoring docker-stop docker-logs \
-        deploy deploy-client clean help
+        deploy deploy-client update-server clean help
 
 # ── configuration ─────────────────────────────────────────────────────────────
 
@@ -94,6 +94,14 @@ deploy: release-server
 	systemctl daemon-reload
 	systemctl enable --now rustunnel.service
 	@echo "rustunnel deployed and started."
+
+## update-server  Pull latest code, rebuild, install, and restart the service.
+update-server:
+	git pull
+	$(MAKE) release-server
+	install -Dm755 target/release/$(BINARY_SERVER) /usr/local/bin/$(BINARY_SERVER)
+	systemctl restart rustunnel.service
+	systemctl status rustunnel.service
 
 ## deploy-client  Install the client binary to /usr/local/bin.
 deploy-client: release-client
