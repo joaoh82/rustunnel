@@ -1,0 +1,106 @@
+# /etc/rustunnel/server.toml
+#
+# rustunnel-server production configuration.
+# Copy this file to /etc/rustunnel/server.toml on the server and adjust
+# the values marked with TODO before starting the service.
+
+# ── Server ────────────────────────────────────────────────────────────────────
+[server]
+# Primary domain — must match your wildcard DNS record:
+#   *.tunnel.rustunnel.com  →  <server public IP>
+domain = "tunnel.rustunnel.com"
+
+# Port 80  — HTTP edge (redirects to HTTPS; also handles ACME HTTP-01 challenges)
+# Port 443 — HTTPS edge (TLS-terminated tunnel ingress)
+# Binding to ports < 1024 requires CAP_NET_BIND_SERVICE (granted in the
+# systemd unit via AmbientCapabilities=CAP_NET_BIND_SERVICE).
+http_port  = 80
+https_port = 443
+
+# Clients connect here over a TLS WebSocket (wss://).
+control_port = 4040
+
+# Dashboard UI and REST API.
+dashboard_port = 8443
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+[tls]
+# Certificate and private key written by Certbot after running:
+#
+#   certbot certonly \
+#     --dns-cloudflare \
+#     --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+#     -d "tunnel.rustunnel.com" \
+#     -d "*.tunnel.rustunnel.com" \
+#     --agree-tos --email your@email.com
+#
+cert_path = "/etc/letsencrypt/live/tunnel.rustunnel.com/fullchain.pem"
+key_path  = "/etc/letsencrypt/live/tunnel.rustunnel.com/privkey.pem"
+
+# Built-in ACME renewal — leave false when using Certbot (recommended).
+# Set to true only if you want rustunnel to manage its own certificates
+# via the ACME + Cloudflare DNS-01 challenge workflow.
+acme_enabled = false
+
+# Fields below are only used when acme_enabled = true.
+acme_email       = ""
+acme_staging     = false
+acme_account_dir = "/var/lib/rustunnel"
+
+# Cloudflare credentials for ACME DNS-01 (acme_enabled only).
+# Prefer passing these via environment variables instead of storing them here:
+#   export CLOUDFLARE_API_TOKEN=...
+#   export CLOUDFLARE_ZONE_ID=...
+cloudflare_api_token = ""
+cloudflare_zone_id   = ""
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+[auth]
+# Master admin token — used to authenticate clients and to access the
+# dashboard API.  Generate a strong secret:
+#   openssl rand -hex 32
+# TODO: replace with a real secret before starting the service.
+admin_token  = "REPLACE_WITH_STRONG_SECRET"
+require_auth = true
+
+# ── Database ──────────────────────────────────────────────────────────────────
+[database]
+# SQLite file.  The /var/lib/rustunnel directory is owned by the rustunnel
+# system user and is created by `make deploy` or the steps in README.md.
+path = "/var/lib/rustunnel/rustunnel.db"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+[logging]
+# Verbosity: trace | debug | info | warn | error
+level  = "info"
+# Output format: json (structured, recommended for production) | pretty
+format = "json"
+
+# Append-only audit log recording auth attempts, tunnel registrations,
+# token create/delete, and admin actions.  Comment out to disable.
+audit_log_path = "/var/lib/rustunnel/audit.log"
+
+# ── Limits ────────────────────────────────────────────────────────────────────
+[limits]
+# Maximum tunnels a single authenticated session may hold simultaneously.
+max_tunnels_per_session = 10
+
+# Maximum simultaneous proxied connections per tunnel (semaphore-backed).
+# Prevents a single misbehaving tunnel from exhausting file descriptors.
+max_connections_per_tunnel = 100
+
+# Per-tunnel HTTP request rate limit (requests/second, token-bucket).
+rate_limit_rps = 100
+
+# Per-source-IP rate limit across all tunnels (requests/second, sliding window).
+# Set to 0 to disable.
+ip_rate_limit_rps = 100
+
+# Maximum proxied HTTP request body size in bytes.  Requests exceeding this
+# receive a 413 response.  Default is 10 MB.
+request_body_max_bytes = 10485760
+
+# Inclusive [low, high] port range reserved for TCP tunnels.
+# Each active TCP tunnel consumes one port from this range.
+# Make sure these ports are open in your firewall (see README.md).
+tcp_port_range = [20000, 20099]
