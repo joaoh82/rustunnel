@@ -15,6 +15,9 @@ pub struct Token {
     pub label: String,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Optional comma-separated list of subdomain patterns this token may use.
+    /// `None` means unrestricted (token may register any subdomain / protocol).
+    pub scope: Option<String>,
 }
 
 /// One lifecycle record per tunnel registration.

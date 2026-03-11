@@ -228,11 +228,13 @@ impl TestServer {
             logging: LoggingSection {
                 level: "warn".to_string(),
                 format: "pretty".to_string(),
+                audit_log_path: None,
             },
             limits: LimitsSection {
                 max_tunnels_per_session: 10,
                 max_connections_per_tunnel: 100,
                 rate_limit_rps: 10_000,
+                ip_rate_limit_rps: 100_000,
                 request_body_max_bytes: 1024 * 1024,
                 tcp_port_range: [tcp_low, tcp_high],
             },
@@ -252,6 +254,8 @@ impl TestServer {
         let core = Arc::new(TunnelCore::new(
             config.limits.tcp_port_range,
             config.limits.max_tunnels_per_session,
+            config.limits.max_connections_per_tunnel,
+            config.limits.ip_rate_limit_rps,
         ));
 
         let (capture_tx, capture_rx) = mpsc::channel(256);
@@ -269,6 +273,7 @@ impl TestServer {
                     core,
                     cfg,
                     tls_handle,
+                    rustunnel_server::audit::noop_audit(),
                 )
                 .await;
             }
@@ -281,6 +286,10 @@ impl TestServer {
         let h = tokio::spawn({
             let core = Arc::clone(&core);
             let domain = config.server.domain.clone();
+            let limits = rustunnel_server::edge::HttpEdgeConfig {
+                rate_limit_rps: config.limits.rate_limit_rps,
+                request_body_max_bytes: config.limits.request_body_max_bytes,
+            };
             async move {
                 let _ = rustunnel_server::edge::run_http_edge(
                     http_addr,
@@ -289,6 +298,7 @@ impl TestServer {
                     core,
                     domain,
                     Some(capture_tx),
+                    limits,
                 )
                 .await;
             }
@@ -317,6 +327,7 @@ impl TestServer {
                     pool,
                     capture_rx,
                     admin_token,
+                    rustunnel_server::audit::noop_audit(),
                 )
                 .await;
             }

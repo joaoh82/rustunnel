@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use rustunnel_protocol::{decode_frame, encode_frame, ControlFrame, TunnelProtocol};
 
+use crate::audit::{AuditEvent, AuditTx};
 use crate::config::ServerConfig;
 use crate::control::mux::MuxSession;
 use crate::core::{ControlMessage, TunnelCore};
@@ -33,6 +34,18 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_DEADLINE: Duration = Duration::from_secs(10);
 const CTRL_CHANNEL_SIZE: usize = 64;
 
+// ── session context ───────────────────────────────────────────────────────────
+
+/// Bundles the per-session immutable references that are needed throughout
+/// `main_loop` and `handle_client_message` to keep function argument counts
+/// within the lint limit.
+struct SessionCtx<'a> {
+    session_id: Uuid,
+    core: &'a Arc<TunnelCore>,
+    config: &'a Arc<ServerConfig>,
+    audit_tx: &'a AuditTx,
+}
+
 // ── public entry point ────────────────────────────────────────────────────────
 
 pub async fn handle_session<S>(
@@ -40,10 +53,11 @@ pub async fn handle_session<S>(
     peer_addr: SocketAddr,
     core: Arc<TunnelCore>,
     config: Arc<ServerConfig>,
+    audit_tx: AuditTx,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match run_session(ws, peer_addr, &core, &config).await {
+    match run_session(ws, peer_addr, &core, &config, &audit_tx).await {
         Ok(()) => tracing::info!(%peer_addr, "session ended cleanly"),
         Err(e) => tracing::warn!(%peer_addr, "session error: {e}"),
     }
@@ -56,6 +70,7 @@ async fn run_session<S>(
     peer_addr: SocketAddr,
     core: &Arc<TunnelCore>,
     config: &Arc<ServerConfig>,
+    audit_tx: &AuditTx,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -64,7 +79,8 @@ where
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ControlMessage>(CTRL_CHANNEL_SIZE);
 
     // Auth.
-    let (mut ws, session_id) = auth_handshake(ws, peer_addr, core, config, ctrl_tx).await?;
+    let (mut ws, session_id) =
+        auth_handshake(ws, peer_addr, core, config, ctrl_tx, audit_tx).await?;
 
     tracing::info!(%peer_addr, %session_id, "session authenticated");
 
@@ -82,15 +98,14 @@ where
 
     let mut mux = MuxSession::start_detached();
 
+    let ctx = SessionCtx { session_id, core, config, audit_tx };
     let result = main_loop(
         &mut ws,
         &mut ctrl_rx,
         &mut ping_out_rx,
         pong_in_tx,
-        session_id,
-        core,
-        config,
-        &mut mux, // passed into handle_client_message for DataStreamOpen
+        &ctx,
+        &mut mux,
     )
     .await;
 
@@ -109,6 +124,7 @@ async fn auth_handshake<S>(
     core: &Arc<TunnelCore>,
     config: &Arc<ServerConfig>,
     ctrl_tx: mpsc::Sender<ControlMessage>,
+    audit_tx: &AuditTx,
 ) -> Result<(WebSocketStream<S>, Uuid)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -134,6 +150,11 @@ where
                 },
             )
             .await;
+            let _ = audit_tx.try_send(AuditEvent::AuthAttempt {
+                peer: peer_addr.to_string(),
+                success: false,
+                token_id: None,
+            });
             return Err(Error::Auth(format!("unexpected frame: {other:?}")));
         }
     };
@@ -147,10 +168,22 @@ where
             },
         )
         .await;
+        let _ = audit_tx.try_send(AuditEvent::AuthAttempt {
+            peer: peer_addr.to_string(),
+            success: false,
+            token_id: None,
+        });
         return Err(Error::Auth("invalid token".into()));
     }
 
+    let token_id = token.clone();
     let session_id = core.register_session(peer_addr, token, ctrl_tx);
+
+    let _ = audit_tx.try_send(AuditEvent::AuthAttempt {
+        peer: peer_addr.to_string(),
+        success: true,
+        token_id: Some(token_id),
+    });
 
     send_frame(
         &mut ws,
@@ -171,14 +204,13 @@ async fn main_loop<S>(
     ctrl_rx: &mut mpsc::Receiver<ControlMessage>,
     ping_out_rx: &mut mpsc::Receiver<u64>,
     pong_in_tx: mpsc::Sender<u64>,
-    session_id: Uuid,
-    core: &Arc<TunnelCore>,
-    config: &Arc<ServerConfig>,
+    ctx: &SessionCtx<'_>,
     mux: &mut MuxSession,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let session_id = ctx.session_id;
     loop {
         tokio::select! {
             // Outbound Ping queued by the heartbeat task.
@@ -205,7 +237,7 @@ where
                             std::io::ErrorKind::BrokenPipe, e.to_string())));
                     }
                     Some(Ok(msg)) => {
-                        handle_client_message(msg, ws, session_id, core, config, &pong_in_tx, mux).await?;
+                        handle_client_message(msg, ws, ctx, &pong_in_tx, mux).await?;
                     }
                 }
             }
@@ -237,15 +269,15 @@ where
 async fn handle_client_message<S>(
     msg: Message,
     ws: &mut WebSocketStream<S>,
-    session_id: Uuid,
-    core: &Arc<TunnelCore>,
-    config: &Arc<ServerConfig>,
+    ctx: &SessionCtx<'_>,
     pong_in_tx: &mpsc::Sender<u64>,
     mux: &mut MuxSession,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let SessionCtx { session_id, core, config, audit_tx } = ctx;
+    let session_id = *session_id;
     let frame = match parse_binary(msg) {
         Ok(f) => f,
         Err(_) => return Ok(()),
@@ -269,6 +301,12 @@ where
                                 "http"
                             };
                             let public_url = format!("{scheme}://{}.{}", sub, config.server.domain);
+                            let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
+                                session_id: session_id.to_string(),
+                                tunnel_id: tunnel_id.to_string(),
+                                protocol: format!("{protocol:?}").to_lowercase(),
+                                label: sub.clone(),
+                            });
                             send_frame(
                                 ws,
                                 &ControlFrame::TunnelRegistered {
@@ -295,6 +333,12 @@ where
                 TunnelProtocol::Tcp => match core.register_tcp_tunnel(&session_id) {
                     Ok((tunnel_id, port)) => {
                         let public_url = format!("tcp://{}:{port}", config.server.domain);
+                        let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
+                            session_id: session_id.to_string(),
+                            tunnel_id: tunnel_id.to_string(),
+                            protocol: "tcp".into(),
+                            label: port.to_string(),
+                        });
                         send_frame(
                             ws,
                             &ControlFrame::TunnelRegistered {
@@ -322,6 +366,10 @@ where
 
         ControlFrame::UnregisterTunnel { tunnel_id } => {
             tracing::debug!(%session_id, %tunnel_id, "unregister tunnel");
+            let _ = audit_tx.try_send(AuditEvent::TunnelRemoved {
+                tunnel_id: tunnel_id.to_string(),
+                label: String::new(),
+            });
             core.remove_tunnel(&tunnel_id);
         }
 

@@ -49,3 +49,4 @@ instant-acme = { workspace = true }
 rcgen = { workspace = true }
 arc-swap = { workspace = true }
 x509-parser = { workspace = true }
+socket2 = { workspace = true }

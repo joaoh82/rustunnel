@@ -32,6 +32,7 @@ use sqlx::SqlitePool;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
+use crate::audit::{AuditEvent, AuditTx};
 use crate::core::TunnelCore;
 use crate::dashboard::capture::{load_requests_from_db, CaptureStore};
 use crate::db;
@@ -44,6 +45,7 @@ pub struct ApiState {
     pub pool: SqlitePool,
     pub capture: CaptureStore,
     pub admin_token: String,
+    pub audit_tx: AuditTx,
 }
 
 // ── router ────────────────────────────────────────────────────────────────────
@@ -382,6 +384,9 @@ async fn replay_request(
 #[derive(Deserialize)]
 struct CreateTokenBody {
     label: String,
+    /// Optional scope: comma-separated subdomain patterns.
+    /// Omit or set to null for an unrestricted token.
+    scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -417,17 +422,30 @@ async fn create_token(
     if let Err(e) = require_auth(&headers, &state).await {
         return e.into_response();
     }
+    let is_admin = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t == state.admin_token)
+        .unwrap_or(false);
 
-    match db::create_token(&state.pool, &body.label).await {
-        Ok((token_record, raw)) => (
-            StatusCode::CREATED,
-            Json(CreateTokenResponse {
-                id: token_record.id,
-                label: token_record.label,
-                token: raw,
-            }),
-        )
-            .into_response(),
+    match db::create_token(&state.pool, &body.label, body.scope.as_deref()).await {
+        Ok((token_record, raw)) => {
+            let _ = state.audit_tx.try_send(AuditEvent::TokenCreated {
+                token_id: token_record.id.clone(),
+                label: token_record.label.clone(),
+                admin: is_admin,
+            });
+            (
+                StatusCode::CREATED,
+                Json(CreateTokenResponse {
+                    id: token_record.id,
+                    label: token_record.label,
+                    token: raw,
+                }),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrBody {
@@ -446,9 +464,21 @@ async fn delete_token(
     if let Err(e) = require_auth(&headers, &state).await {
         return e.into_response();
     }
+    let is_admin = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t == state.admin_token)
+        .unwrap_or(false);
 
     match db::delete_token(&state.pool, &id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            let _ = state.audit_tx.try_send(AuditEvent::TokenDeleted {
+                token_id: id,
+                admin: is_admin,
+            });
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => not_found("token not found").into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

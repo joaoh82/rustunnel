@@ -32,6 +32,7 @@ pub async fn init_pool(database_url: &str) -> Result<SqlitePool> {
 
 /// Create tables if they do not yet exist.
 async fn migrate(pool: &SqlitePool) -> Result<()> {
+    // Idempotent schema — safe to run on every startup.
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS tokens (
@@ -39,7 +40,8 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
             token_hash   TEXT NOT NULL UNIQUE,
             label        TEXT NOT NULL,
             created_at   TEXT NOT NULL,
-            last_used_at TEXT
+            last_used_at TEXT,
+            scope        TEXT
         );
 
         CREATE TABLE IF NOT EXISTS tunnel_log (
@@ -74,6 +76,13 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Add `scope` column to existing databases that pre-date this migration.
+    // SQLite does not support IF NOT EXISTS for ALTER TABLE ADD COLUMN in all
+    // versions, so we catch the "duplicate column" error gracefully.
+    let _ = sqlx::query("ALTER TABLE tokens ADD COLUMN scope TEXT")
+        .execute(pool)
+        .await; // intentionally ignore error (column may already exist)
+
     Ok(())
 }
 
@@ -93,19 +102,29 @@ pub fn hash_token(raw: &str) -> String {
 }
 
 /// Insert a new token record.  Returns the raw (unhashed) token string.
-pub async fn create_token(pool: &SqlitePool, label: &str) -> Result<(Token, String)> {
+///
+/// `scope` is an optional comma-separated list of subdomain patterns.
+/// `None` means the token is unrestricted.
+pub async fn create_token(
+    pool: &SqlitePool,
+    label: &str,
+    scope: Option<&str>,
+) -> Result<(Token, String)> {
     let raw = Uuid::new_v4().to_string();
     let hash = hash_token(&raw);
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
-    sqlx::query("INSERT INTO tokens (id, token_hash, label, created_at) VALUES (?, ?, ?, ?)")
-        .bind(&id)
-        .bind(&hash)
-        .bind(label)
-        .bind(now.to_rfc3339())
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO tokens (id, token_hash, label, created_at, scope) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&hash)
+    .bind(label)
+    .bind(now.to_rfc3339())
+    .bind(scope)
+    .execute(pool)
+    .await?;
 
     let token = Token {
         id,
@@ -113,6 +132,7 @@ pub async fn create_token(pool: &SqlitePool, label: &str) -> Result<(Token, Stri
         label: label.to_string(),
         created_at: now,
         last_used_at: None,
+        scope: scope.map(str::to_string),
     };
     Ok((token, raw))
 }
@@ -121,7 +141,8 @@ pub async fn create_token(pool: &SqlitePool, label: &str) -> Result<(Token, Stri
 pub async fn verify_token(pool: &SqlitePool, raw: &str) -> Result<Option<Token>> {
     let hash = hash_token(raw);
     let token: Option<Token> = sqlx::query_as(
-        "SELECT id, token_hash, label, created_at, last_used_at FROM tokens WHERE token_hash = ?",
+        "SELECT id, token_hash, label, created_at, last_used_at, scope \
+         FROM tokens WHERE token_hash = ?",
     )
     .bind(&hash)
     .fetch_optional(pool)
@@ -150,9 +171,11 @@ pub async fn delete_token(pool: &SqlitePool, id: &str) -> Result<bool> {
 
 /// List all tokens.
 pub async fn list_tokens(pool: &SqlitePool) -> Result<Vec<Token>> {
-    let rows: Vec<Token> =
-        sqlx::query_as("SELECT id, token_hash, label, created_at, last_used_at FROM tokens ORDER BY created_at DESC")
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<Token> = sqlx::query_as(
+        "SELECT id, token_hash, label, created_at, last_used_at, scope \
+         FROM tokens ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }

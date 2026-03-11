@@ -19,7 +19,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -30,6 +29,7 @@ use rustunnel_protocol::TunnelProtocol;
 
 use crate::core::{ControlMessage, TcpTunnelEvent, TunnelCore};
 use crate::error::{Error, Result};
+use crate::net::bind_reuse;
 
 // ── timeouts ──────────────────────────────────────────────────────────────────
 
@@ -108,7 +108,7 @@ fn spawn_port_listener(
 
 async fn port_listener(port: u16, core: Arc<TunnelCore>) -> Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_reuse(addr)?;
     info!(port, %addr, "TCP port listener bound");
 
     loop {
@@ -120,6 +120,13 @@ async fn port_listener(port: u16, core: Arc<TunnelCore>) -> Result<()> {
             }
         };
         debug!(port, %peer, "new TCP connection");
+        let _ = tcp.set_nodelay(true);
+
+        // IP rate limit check.
+        if !core.ip_limiter.check(peer.ip()) {
+            debug!(port, %peer, "IP rate limit exceeded — dropping TCP connection");
+            continue;
+        }
 
         let core = core.clone();
         tokio::spawn(async move {
@@ -142,6 +149,16 @@ async fn proxy_tcp_connection(
     let (tunnel_info, control_tx) = core
         .resolve_tcp(port)
         .ok_or_else(|| Error::Tunnel(format!("no TCP tunnel on port {port}")))?;
+
+    // ── acquire connection semaphore ──────────────────────────────────────
+    let _permit = match tunnel_info.conn_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(Error::Tunnel(format!(
+                "too many concurrent connections on port {port}"
+            )));
+        }
+    };
 
     let conn_id = Uuid::new_v4();
     info!(
@@ -235,7 +252,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn make_core() -> Arc<TunnelCore> {
-        Arc::new(TunnelCore::new([25000, 25010], 5))
+        Arc::new(TunnelCore::new([25000, 25010], 5, 100, 1000))
     }
 
     fn add_session(core: &Arc<TunnelCore>) -> (Uuid, mpsc::Receiver<ControlMessage>) {

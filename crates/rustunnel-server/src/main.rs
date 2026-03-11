@@ -21,12 +21,13 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use rustunnel_server::audit;
 use rustunnel_server::config::ServerConfig;
 use rustunnel_server::control::server::run_control_plane;
 use rustunnel_server::core::{ControlMessage, TunnelCore};
 use rustunnel_server::dashboard::run_dashboard;
 use rustunnel_server::db;
-use rustunnel_server::edge::{run_http_edge, run_tcp_edge};
+use rustunnel_server::edge::{run_http_edge, run_tcp_edge, HttpEdgeConfig};
 use rustunnel_server::error::Result;
 use rustunnel_server::tls::CertManager;
 
@@ -92,11 +93,22 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
     let pool = db::init_pool(&config.database.path).await?;
     info!("database ready");
 
+    // ── audit logger ──────────────────────────────────────────────────────────
+
+    let audit_tx = if let Some(path) = &config.logging.audit_log_path {
+        info!(path, "audit logging enabled");
+        audit::start_audit_logger(std::path::Path::new(path))
+    } else {
+        audit::noop_audit()
+    };
+
     // ── tunnel core ───────────────────────────────────────────────────────────
 
     let core = Arc::new(TunnelCore::new(
         config.limits.tcp_port_range,
         config.limits.max_tunnels_per_session,
+        config.limits.max_connections_per_tunnel,
+        config.limits.ip_rate_limit_rps,
     ));
 
     // ── TLS certificate manager ───────────────────────────────────────────────
@@ -140,8 +152,10 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let core = Arc::clone(&core);
         let cfg = Arc::clone(&config);
         let tls_handle = Arc::clone(&tls_handle);
+        let audit_tx = audit_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_control_plane(control_addr, core, cfg, tls_handle).await {
+            if let Err(e) = run_control_plane(control_addr, core, cfg, tls_handle, audit_tx).await
+            {
                 error!("control plane exited: {e}");
             }
         })
@@ -153,6 +167,10 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let core = Arc::clone(&core);
         let domain = config.server.domain.clone();
         let capture_tx = Some(capture_tx.clone());
+        let limits = HttpEdgeConfig {
+            rate_limit_rps: config.limits.rate_limit_rps,
+            request_body_max_bytes: config.limits.request_body_max_bytes,
+        };
         tokio::spawn(async move {
             if let Err(e) = run_http_edge(
                 http_addr,
@@ -161,6 +179,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
                 core,
                 domain,
                 capture_tx,
+                limits,
             )
             .await
             {
@@ -184,8 +203,10 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let core = Arc::clone(&core);
         let pool = pool.clone();
         let admin_token = config.auth.admin_token.clone();
+        let audit_tx = audit_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_dashboard(dashboard_addr, core, pool, capture_rx, admin_token).await
+            if let Err(e) =
+                run_dashboard(dashboard_addr, core, pool, capture_rx, admin_token, audit_tx).await
             {
                 error!("dashboard exited: {e}");
             }

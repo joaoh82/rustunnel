@@ -32,7 +32,6 @@ use hyper::header::HOST;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -44,6 +43,7 @@ use rustunnel_protocol::TunnelProtocol;
 
 use crate::core::{ControlMessage, TunnelCore};
 use crate::edge::capture::{CaptureEvent, CaptureTx};
+use crate::net::bind_reuse;
 
 // ── timeouts ──────────────────────────────────────────────────────────────────
 
@@ -64,11 +64,20 @@ fn empty() -> BoxBody {
 
 // ── shared context ────────────────────────────────────────────────────────────
 
+/// Runtime limits passed through the edge proxy hot-path.
+#[derive(Clone)]
+pub struct HttpEdgeConfig {
+    pub rate_limit_rps: u32,
+    pub request_body_max_bytes: usize,
+}
+
 #[derive(Clone)]
 struct ProxyCtx {
     core: Arc<TunnelCore>,
     capture_tx: Option<CaptureTx>,
     domain: String,
+    rate_limit_rps: u32,
+    request_body_max_bytes: usize,
 }
 
 // ── public entry point ────────────────────────────────────────────────────────
@@ -81,11 +90,14 @@ pub async fn run_http_edge(
     core: Arc<TunnelCore>,
     domain: String,
     capture_tx: Option<CaptureTx>,
+    limits: HttpEdgeConfig,
 ) -> crate::error::Result<()> {
     let ctx = ProxyCtx {
         core,
         capture_tx,
         domain,
+        rate_limit_rps: limits.rate_limit_rps,
+        request_body_max_bytes: limits.request_body_max_bytes,
     };
 
     tokio::select! {
@@ -97,7 +109,7 @@ pub async fn run_http_edge(
 // ── HTTP redirect (port 80) ───────────────────────────────────────────────────
 
 async fn run_http_redirect(addr: SocketAddr, domain: String) -> crate::error::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_reuse(addr)?;
     info!(%addr, "HTTP redirect listener ready");
 
     loop {
@@ -108,6 +120,7 @@ async fn run_http_redirect(addr: SocketAddr, domain: String) -> crate::error::Re
                 continue;
             }
         };
+        let _ = tcp.set_nodelay(true);
         let domain = domain.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(tcp);
@@ -126,11 +139,15 @@ async fn run_http_redirect(addr: SocketAddr, domain: String) -> crate::error::Re
 }
 
 fn redirect_to_https(req: Request<Incoming>, domain: &str) -> Response<BoxBody> {
-    let host = req
+    // Sanitise the Host header to prevent header injection: only allow chars
+    // that are valid in a hostname or port (alphanumeric, hyphens, dots, colon).
+    let raw_host = req
         .headers()
         .get(HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or(domain);
+    let host = sanitize_host(raw_host).unwrap_or_else(|| domain.to_string());
+
     let pq = req
         .uri()
         .path_and_query()
@@ -144,6 +161,33 @@ fn redirect_to_https(req: Request<Incoming>, domain: &str) -> Response<BoxBody> 
         .unwrap()
 }
 
+/// Return `Some(host)` when the value contains only safe hostname characters,
+/// or `None` when it looks like an injection attempt.
+fn sanitize_host(host: &str) -> Option<String> {
+    // Strip trailing port if present: "example.com:8080" → "example.com"
+    let (name, port_part) = match host.rfind(':') {
+        Some(pos) => (&host[..pos], Some(&host[pos..])),
+        None => (host, None),
+    };
+    // Validate hostname part: alphanumeric, hyphens, and dots only.
+    if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && !name.is_empty()
+    {
+        // Validate port part if present: colon + digits.
+        if let Some(port) = port_part {
+            if port.len() > 1 && port[1..].chars().all(|c| c.is_ascii_digit()) {
+                return Some(host.to_string());
+            }
+            return None; // invalid port
+        }
+        Some(host.to_string())
+    } else {
+        None
+    }
+}
+
 // ── HTTPS proxy (port 443) ────────────────────────────────────────────────────
 
 async fn run_https_proxy(
@@ -152,7 +196,7 @@ async fn run_https_proxy(
     ctx: ProxyCtx,
 ) -> crate::error::Result<()> {
     let acceptor = TlsAcceptor::from(tls_config);
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_reuse(addr)?;
     info!(%addr, "HTTPS proxy listener ready");
 
     loop {
@@ -163,6 +207,7 @@ async fn run_https_proxy(
                 continue;
             }
         };
+        let _ = tcp.set_nodelay(true);
         let acceptor = acceptor.clone();
         let ctx = ctx.clone();
 
@@ -199,6 +244,11 @@ async fn proxy_request(
 ) -> Response<BoxBody> {
     let start = Instant::now();
 
+    // ── 0. IP rate limit ──────────────────────────────────────────────────
+    if !ctx.core.ip_limiter.check(peer.ip()) {
+        return err_response(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded");
+    }
+
     // ── 1. Extract subdomain ──────────────────────────────────────────────
     let host = match req.headers().get(HOST).and_then(|v| v.to_str().ok()) {
         Some(h) => h.to_owned(),
@@ -215,6 +265,38 @@ async fn proxy_request(
         None => {
             info!(subdomain, "tunnel not found → 502");
             return gateway_error(&subdomain);
+        }
+    };
+
+    // ── 2a. Per-tunnel rate limit ─────────────────────────────────────────
+    if !ctx
+        .core
+        .rate_limiter
+        .check_rate_limit(&tunnel_info.tunnel_id, ctx.rate_limit_rps)
+    {
+        return err_response(StatusCode::TOO_MANY_REQUESTS, "Tunnel rate limit exceeded");
+    }
+
+    // ── 2b. Request body size limit (Content-Length fast-path) ────────────
+    if let Some(content_length) = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if content_length > ctx.request_body_max_bytes {
+            return err_response(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large");
+        }
+    }
+
+    // ── 2c. Concurrent connection limit ──────────────────────────────────
+    let _permit = match tunnel_info.conn_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return err_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many concurrent connections",
+            );
         }
     };
 

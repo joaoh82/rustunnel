@@ -91,6 +91,9 @@ pub struct LoggingSection {
     pub level: String,
     /// Output format: "json" | "pretty"
     pub format: String,
+    /// Optional path for the audit log file (JSON-lines).  Omit to disable.
+    #[serde(default)]
+    pub audit_log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,10 +104,17 @@ pub struct LimitsSection {
     pub max_connections_per_tunnel: usize,
     /// Per-tunnel request rate limit in requests-per-second
     pub rate_limit_rps: u32,
+    /// Per-source-IP request rate limit in requests-per-second (0 = disabled)
+    #[serde(default = "default_ip_rate_limit_rps")]
+    pub ip_rate_limit_rps: u32,
     /// Maximum size of a proxied request body in bytes
     pub request_body_max_bytes: usize,
     /// Inclusive [low, high] port range reserved for TCP tunnels
     pub tcp_port_range: [u16; 2],
+}
+
+fn default_ip_rate_limit_rps() -> u32 {
+    100
 }
 
 impl ServerConfig {
@@ -154,11 +164,13 @@ impl Default for ServerConfig {
             logging: LoggingSection {
                 level: "info".to_string(),
                 format: "pretty".to_string(),
+                audit_log_path: None,
             },
             limits: LimitsSection {
                 max_tunnels_per_session: 10,
                 max_connections_per_tunnel: 100,
                 rate_limit_rps: 100,
+                ip_rate_limit_rps: 1000,
                 request_body_max_bytes: 10 * 1024 * 1024,
                 tcp_port_range: [20000, 20099],
             },

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use uuid::Uuid;
 use yamux::Stream as YamuxStream;
 
@@ -12,6 +12,8 @@ use rustunnel_protocol::TunnelProtocol;
 
 use crate::error::{Error, Result};
 
+use super::ip_limiter::IpRateLimiter;
+use super::limiter::RateLimiter;
 use super::tunnel::{ControlMessage, SessionInfo, TcpTunnelEvent, TunnelInfo};
 
 /// Broadcast channel capacity for TCP tunnel lifecycle events.
@@ -36,11 +38,17 @@ pub struct TunnelCore {
     tunnel_index: DashMap<Uuid, TunnelKey>,
     /// Maximum tunnels allowed per session (enforced at registration time).
     max_tunnels_per_session: usize,
+    /// Maximum concurrent proxied connections per tunnel (used to init semaphores).
+    max_connections_per_tunnel: usize,
     /// Pending proxy connections: conn_id → oneshot sender that delivers the
     /// yamux data stream once the remote client opens it.
     pending_conns: DashMap<Uuid, oneshot::Sender<YamuxStream>>,
     /// Notifies the TCP edge layer whenever a TCP tunnel is added/removed.
     tcp_events: broadcast::Sender<TcpTunnelEvent>,
+    /// Per-tunnel token-bucket rate limiter (keyed by tunnel_id).
+    pub rate_limiter: Arc<RateLimiter>,
+    /// Per-source-IP sliding-window rate limiter.
+    pub ip_limiter: Arc<IpRateLimiter>,
 }
 
 /// Identifies where a tunnel lives in the routing tables.
@@ -52,7 +60,12 @@ enum TunnelKey {
 
 impl TunnelCore {
     /// Create a new router pre-seeded with the TCP port range `[low, high]` (inclusive).
-    pub fn new(tcp_port_range: [u16; 2], max_tunnels_per_session: usize) -> Self {
+    pub fn new(
+        tcp_port_range: [u16; 2],
+        max_tunnels_per_session: usize,
+        max_connections_per_tunnel: usize,
+        ip_rate_limit_rps: u32,
+    ) -> Self {
         let [low, high] = tcp_port_range;
         let ports: Vec<u16> = (low..=high).collect();
         let (tcp_events, _) = broadcast::channel(TCP_EVENT_CAPACITY);
@@ -63,8 +76,11 @@ impl TunnelCore {
             available_tcp_ports: Mutex::new(ports),
             tunnel_index: DashMap::new(),
             max_tunnels_per_session,
+            max_connections_per_tunnel,
             pending_conns: DashMap::new(),
             tcp_events,
+            rate_limiter: Arc::new(RateLimiter::new()),
+            ip_limiter: Arc::new(IpRateLimiter::new(ip_rate_limit_rps)),
         }
     }
 
@@ -128,6 +144,8 @@ impl TunnelCore {
     /// Register an HTTP tunnel for `session_id`.
     ///
     /// If `subdomain` is `None` an 8-character random hex label is generated.
+    /// User-supplied subdomains are validated: alphanumeric + hyphens only,
+    /// 3–63 characters, no leading or trailing hyphens.
     /// Returns `(tunnel_id, public_subdomain)`.
     pub fn register_http_tunnel(
         &self,
@@ -137,7 +155,13 @@ impl TunnelCore {
     ) -> Result<(Uuid, String)> {
         self.check_session_limit(session_id)?;
 
-        let subdomain = subdomain.unwrap_or_else(random_subdomain);
+        let subdomain = match subdomain {
+            Some(s) => {
+                validate_subdomain(&s)?;
+                s
+            }
+            None => random_subdomain(),
+        };
 
         // Reject duplicate subdomain registrations.
         if self.http_routes.contains_key(&subdomain) {
@@ -155,6 +179,7 @@ impl TunnelCore {
             assigned_port: None,
             created_at: std::time::Instant::now(),
             request_count: Arc::new(AtomicU64::new(0)),
+            conn_semaphore: Arc::new(Semaphore::new(self.max_connections_per_tunnel)),
         };
 
         self.http_routes.insert(subdomain.clone(), info);
@@ -185,6 +210,7 @@ impl TunnelCore {
             assigned_port: Some(port),
             created_at: std::time::Instant::now(),
             request_count: Arc::new(AtomicU64::new(0)),
+            conn_semaphore: Arc::new(Semaphore::new(self.max_connections_per_tunnel)),
         };
 
         self.tcp_routes.insert(port, info);
@@ -263,6 +289,31 @@ impl TunnelCore {
 
 // ── utility ───────────────────────────────────────────────────────────────────
 
+/// Validate a user-supplied subdomain label.
+///
+/// Rules:
+/// * Length: 3–63 characters.
+/// * Characters: ASCII alphanumeric or hyphens only.
+/// * No leading or trailing hyphens.
+fn validate_subdomain(s: &str) -> Result<()> {
+    if !(3..=63).contains(&s.len()) {
+        return Err(Error::Tunnel(format!(
+            "subdomain '{s}' must be 3–63 characters long"
+        )));
+    }
+    if s.starts_with('-') || s.ends_with('-') {
+        return Err(Error::Tunnel(format!(
+            "subdomain '{s}' must not start or end with a hyphen"
+        )));
+    }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(Error::Tunnel(format!(
+            "subdomain '{s}' may only contain letters, digits, and hyphens"
+        )));
+    }
+    Ok(())
+}
+
 /// Generate an 8-character lowercase hex subdomain.
 fn random_subdomain() -> String {
     let id = Uuid::new_v4();
@@ -281,7 +332,7 @@ mod tests {
     use super::*;
 
     fn make_core() -> TunnelCore {
-        TunnelCore::new([20000, 20009], 5)
+        TunnelCore::new([20000, 20009], 5, 100, 1000)
     }
 
     fn dummy_session(core: &TunnelCore) -> (Uuid, mpsc::Receiver<ControlMessage>) {
@@ -382,7 +433,7 @@ mod tests {
 
         let (tunnel_id, port) = core.register_tcp_tunnel(&session_id).unwrap();
 
-        assert!(port >= 20000 && port <= 20009);
+        assert!((20000..=20009).contains(&port));
         assert!(core.tcp_routes.contains_key(&port));
         assert!(core
             .sessions
@@ -394,7 +445,7 @@ mod tests {
 
     #[test]
     fn remove_tcp_tunnel_returns_port_to_pool() {
-        let core = TunnelCore::new([30000, 30000], 5); // single-port range
+        let core = TunnelCore::new([30000, 30000], 5, 100, 1000); // single-port range
         let (session_id, _rx) = dummy_session(&core);
 
         let (tunnel_id, port) = core.register_tcp_tunnel(&session_id).unwrap();
@@ -417,7 +468,7 @@ mod tests {
 
     #[test]
     fn no_ports_available_error() {
-        let core = TunnelCore::new([40000, 40000], 10);
+        let core = TunnelCore::new([40000, 40000], 10, 100, 1000);
         let (sid1, _rx1) = dummy_session(&core);
         let (sid2, _rx2) = dummy_session(&core);
 
@@ -493,7 +544,7 @@ mod tests {
 
     #[test]
     fn tunnel_limit_is_enforced() {
-        let core = TunnelCore::new([50000, 50009], 2);
+        let core = TunnelCore::new([50000, 50009], 2, 100, 1000);
         let (session_id, _rx) = dummy_session(&core);
 
         core.register_http_tunnel(&session_id, None, TunnelProtocol::Http)
@@ -513,6 +564,62 @@ mod tests {
         assert!(matches!(
             core.register_http_tunnel(&ghost, None, TunnelProtocol::Http),
             Err(Error::SessionNotFound(_))
+        ));
+    }
+
+    // ── subdomain validation ──────────────────────────────────────────────────
+
+    #[test]
+    fn valid_subdomains_are_accepted() {
+        let core = make_core();
+        let (sid, _rx) = dummy_session(&core);
+        for s in &["abc", "my-app", "foo123", "a-b-c", "aaa"] {
+            let r = core.register_http_tunnel(&sid, Some(s.to_string()), TunnelProtocol::Http);
+            assert!(r.is_ok(), "expected '{s}' to be valid, got {r:?}");
+        }
+    }
+
+    #[test]
+    fn subdomain_too_short_is_rejected() {
+        let core = make_core();
+        let (sid, _rx) = dummy_session(&core);
+        assert!(matches!(
+            core.register_http_tunnel(&sid, Some("ab".to_string()), TunnelProtocol::Http),
+            Err(Error::Tunnel(_))
+        ));
+    }
+
+    #[test]
+    fn subdomain_leading_hyphen_is_rejected() {
+        let core = make_core();
+        let (sid, _rx) = dummy_session(&core);
+        assert!(matches!(
+            core.register_http_tunnel(&sid, Some("-bad".to_string()), TunnelProtocol::Http),
+            Err(Error::Tunnel(_))
+        ));
+    }
+
+    #[test]
+    fn subdomain_trailing_hyphen_is_rejected() {
+        let core = make_core();
+        let (sid, _rx) = dummy_session(&core);
+        assert!(matches!(
+            core.register_http_tunnel(&sid, Some("bad-".to_string()), TunnelProtocol::Http),
+            Err(Error::Tunnel(_))
+        ));
+    }
+
+    #[test]
+    fn subdomain_invalid_chars_are_rejected() {
+        let core = make_core();
+        let (sid, _rx) = dummy_session(&core);
+        assert!(matches!(
+            core.register_http_tunnel(&sid, Some("bad_name".to_string()), TunnelProtocol::Http),
+            Err(Error::Tunnel(_))
+        ));
+        assert!(matches!(
+            core.register_http_tunnel(&sid, Some("bad.name".to_string()), TunnelProtocol::Http),
+            Err(Error::Tunnel(_))
         ));
     }
 }

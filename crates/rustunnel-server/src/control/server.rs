@@ -7,16 +7,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
 
 use rustls::ServerConfig as RustlsConfig;
 
+use crate::audit::AuditTx;
 use crate::config::ServerConfig;
 use crate::control::session::handle_session;
 use crate::core::TunnelCore;
 use crate::error::Result;
+use crate::net::bind_reuse;
 
 /// Start the control-plane listener.
 ///
@@ -32,8 +33,9 @@ pub async fn run_control_plane(
     core: Arc<TunnelCore>,
     config: Arc<ServerConfig>,
     tls_config: Arc<ArcSwap<RustlsConfig>>,
+    audit_tx: AuditTx,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_reuse(addr)?;
     tracing::info!(%addr, "control plane listening");
 
     loop {
@@ -52,6 +54,7 @@ pub async fn run_control_plane(
         let acceptor = TlsAcceptor::from(Arc::clone(&tls_config.load()));
         let core = core.clone();
         let config = config.clone();
+        let audit_tx = audit_tx.clone();
 
         tokio::spawn(async move {
             // TLS handshake.
@@ -74,7 +77,7 @@ pub async fn run_control_plane(
             };
             tracing::debug!(%peer_addr, "WebSocket upgrade complete");
 
-            handle_session(ws_stream, peer_addr, core, config).await;
+            handle_session(ws_stream, peer_addr, core, config, audit_tx).await;
         });
     }
 }

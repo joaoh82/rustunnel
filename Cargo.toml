@@ -32,7 +32,7 @@ bytes = "1"
 tower = { version = "0.4", features = ["timeout", "util"] }
 axum = { version = "0.7", features = ["macros"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono"] }
-tower-http = { version = "0.5", features = ["cors", "fs"] }
+tower-http = { version = "0.5", features = ["cors", "fs", "set-header"] }
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
@@ -50,4 +50,5 @@ rcgen = "0.13"
 arc-swap = "1"
 x509-parser = "0.16"
 tempfile = "3"
+socket2 = { version = "0.5", features = ["all"] }
 rustunnel-protocol = { path = "crates/rustunnel-protocol" }

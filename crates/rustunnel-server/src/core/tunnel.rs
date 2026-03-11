@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
 use rustunnel_protocol::TunnelProtocol;
@@ -49,6 +49,9 @@ pub struct TunnelInfo {
     pub created_at: Instant,
     /// Monotonically-increasing counter of proxied requests/connections.
     pub request_count: Arc<AtomicU64>,
+    /// Limits concurrent proxied connections for this tunnel.
+    /// Shared across all clones so every proxy task draws from the same pool.
+    pub conn_semaphore: Arc<Semaphore>,
 }
 
 // ── per-session state ─────────────────────────────────────────────────────────
