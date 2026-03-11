@@ -17,8 +17,12 @@ export function makeApi(token: string | null): ApiClient {
     return r.status;
   }
 
-  async function post(path: string) {
-    const r = await fetch(path, { method: 'POST', headers });
+  async function post(path: string, body?: unknown) {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: body ? { ...headers, 'Content-Type': 'application/json' } : headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     return r.json();
   }

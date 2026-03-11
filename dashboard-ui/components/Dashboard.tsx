@@ -12,6 +12,8 @@ import { Panel } from './Panel';
 import { TunnelTable } from './TunnelTable';
 import { RequestList } from './RequestList';
 import { RequestDetail } from './RequestDetail';
+import { TokensPanel } from './TokensPanel';
+import { useTokens } from '@/hooks/useTokens';
 
 export default function Dashboard() {
   const [token, setToken] = useState<string | null>(null);
@@ -29,6 +31,7 @@ export default function Dashboard() {
   const [replayResult, setReplayResult] = useState<string | null>(null);
 
   const { requests } = useRequests(api, selectedTunnel?.tunnel_id ?? null);
+  const { tokens, error: tokenErr, refresh: refreshTokens } = useTokens(api, !!token);
 
   // Deselect tunnel if it disappears.
   useEffect(() => {
@@ -166,6 +169,14 @@ export default function Dashboard() {
             Click a tunnel row to inspect its requests.
           </div>
         )}
+
+        {/* API token management */}
+        <TokensPanel
+          api={api}
+          tokens={tokens}
+          error={tokenErr}
+          refresh={refreshTokens}
+        />
       </main>
     </>
   );

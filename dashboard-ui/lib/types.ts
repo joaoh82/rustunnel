@@ -29,8 +29,23 @@ export interface ServerStatus {
   active_tunnels: number;
 }
 
+export interface ApiToken {
+  id: string;
+  label: string;
+  token_hash: string;
+  created_at: string;
+  last_used_at: string | null;
+  scope: string | null;
+}
+
+export interface CreateTokenResponse {
+  id: string;
+  label: string;
+  token: string; // raw value — shown only once
+}
+
 export interface ApiClient {
   get: (path: string) => Promise<unknown>;
   del: (path: string) => Promise<number>;
-  post: (path: string) => Promise<unknown>;
+  post: (path: string, body?: unknown) => Promise<unknown>;
 }
