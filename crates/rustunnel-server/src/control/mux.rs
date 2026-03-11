@@ -22,7 +22,6 @@ use yamux::{Connection, Mode};
 use tokio::io::DuplexStream;
 use tokio_util::compat::Compat;
 
-
 // ── WsCompat ─────────────────────────────────────────────────────────────────
 
 /// Adapts a `WebSocketStream` into `futures::io::{AsyncRead, AsyncWrite}` so

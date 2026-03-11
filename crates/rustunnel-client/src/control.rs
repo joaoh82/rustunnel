@@ -505,10 +505,7 @@ async fn connect_data_ws(server: &str, session_id: Uuid, insecure: bool) -> Opti
 /// Continuously polls `poll_next_inbound` (which also drives all outbound IO).
 /// For each accepted stream, reads the 16-byte conn_id prefix the server
 /// wrote, then forwards the (conn_id, stream) pair to the main loop.
-async fn drive_client_mux(
-    mut conn: DataConn,
-    stream_tx: mpsc::Sender<(Uuid, YamuxStream)>,
-) {
+async fn drive_client_mux(mut conn: DataConn, stream_tx: mpsc::Sender<(Uuid, YamuxStream)>) {
     loop {
         match poll_fn(|cx| conn.poll_next_inbound(cx)).await {
             Some(Ok(mut stream)) => {

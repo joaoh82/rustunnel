@@ -15,11 +15,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::future::poll_fn;
 use futures_util::io::AsyncWriteExt;
 use futures_util::{SinkExt, StreamExt};
-use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use uuid::Uuid;
 
 use rustunnel_protocol::{decode_frame, encode_frame, ControlFrame, TunnelProtocol};
@@ -349,7 +349,12 @@ async fn handle_client_message<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let SessionCtx { session_id, core, config, audit_tx } = ctx;
+    let SessionCtx {
+        session_id,
+        core,
+        config,
+        audit_tx,
+    } = ctx;
     let session_id = *session_id;
     let frame = match parse_binary(msg) {
         Ok(f) => f,
