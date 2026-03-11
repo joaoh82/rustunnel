@@ -52,8 +52,8 @@ acme_account_dir = "/var/lib/rustunnel"
 # Prefer passing these via environment variables instead of storing them here:
 #   export CLOUDFLARE_API_TOKEN=...
 #   export CLOUDFLARE_ZONE_ID=...
-cloudflare_api_token = "REDACTED"
-cloudflare_zone_id   = "REDACTED"
+cloudflare_api_token = ""
+cloudflare_zone_id   = ""
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 [auth]
@@ -61,7 +61,7 @@ cloudflare_zone_id   = "REDACTED"
 # dashboard API.  Generate a strong secret:
 #   openssl rand -hex 32
 # TODO: replace with a real secret before starting the service.
-admin_token  = "REDACTED"
+admin_token  = ""
 require_auth = true
 
 # ── Database ──────────────────────────────────────────────────────────────────
