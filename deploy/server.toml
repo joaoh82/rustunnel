@@ -21,7 +21,8 @@ https_port = 443
 control_port = 4040
 
 # Dashboard UI and REST API.
-dashboard_port = 8443
+# Note: must be different from http_port (80), https_port (443), and control_port (4040).
+dashboard_port = 8080
 
 # ── TLS ───────────────────────────────────────────────────────────────────────
 [tls]

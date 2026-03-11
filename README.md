@@ -43,7 +43,7 @@ A self-hosted, ngrok-style secure tunnel server written in Rust. Expose local se
 Internet ──── :80 ─────▶│  HTTP edge (301 → HTTPS)                 │
 Internet ──── :443 ────▶│  HTTPS edge  ──▶ yamux stream ──▶ client │
 Client ───── :4040 ────▶│  Control-plane WebSocket (TLS)           │
-Browser ──── :8443 ────▶│  Dashboard UI + REST API                 │
+Browser ──── :8080 ────▶│  Dashboard UI + REST API                 │
 Prometheus ─ :9090 ────▶│  Metrics endpoint                        │
 Internet ── :20000+ ───▶│  TCP tunnel ports (one per TCP tunnel)   │
                         └──────────────────────────────────────────┘
@@ -285,7 +285,7 @@ https_port   = 443
 control_port = 4040
 
 # Dashboard UI and REST API port.
-dashboard_port = 8443
+dashboard_port = 8080
 
 # ── TLS ─────────────────────────────────────────────────────────────────────
 [tls]
@@ -413,7 +413,7 @@ journalctl -u rustunnel.service -f
 ufw allow 80/tcp   comment "rustunnel HTTP edge"
 ufw allow 443/tcp  comment "rustunnel HTTPS edge"
 ufw allow 4040/tcp comment "rustunnel control plane"
-ufw allow 8443/tcp comment "rustunnel dashboard"
+ufw allow 8080/tcp comment "rustunnel dashboard"
 ufw allow 9090/tcp comment "rustunnel Prometheus metrics"
 
 # TCP tunnel port range (must match tcp_port_range in server.toml)
@@ -423,8 +423,8 @@ ufw allow 20000:20099/tcp comment "rustunnel TCP tunnels"
 ### 9 — Verify the server is running
 
 ```bash
-# Health check — use dashboard_port from server.toml (default 8443 in production)
-curl http://localhost:8443/api/status
+# Health check — use dashboard_port from server.toml (default 8080 in production)
+curl http://localhost:8080/api/status
 
 # Confirm which ports the process is actually bound to
 ss -tlnp | grep rustunnel-serve
@@ -552,14 +552,14 @@ Create additional auth tokens via the dashboard API:
 ```bash
 rustunnel token create \
   --name "ci-deploy" \
-  --server tunnel.rustunnel.com:8443 \
+  --server tunnel.rustunnel.com:8080 \
   --admin-token YOUR_ADMIN_TOKEN
 ```
 
 Or via `curl`:
 
 ```bash
-curl -s -X POST http://tunnel.rustunnel.com:8443/api/tokens \
+curl -s -X POST http://tunnel.rustunnel.com:8080/api/tokens \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"label": "ci-deploy"}'
@@ -574,7 +574,7 @@ curl -s -X POST http://tunnel.rustunnel.com:8443/api/tokens \
 | 80 | TCP | HTTP edge — redirects to HTTPS; also ACME HTTP-01 challenge |
 | 443 | TCP | HTTPS edge — TLS-terminated tunnel ingress |
 | 4040 | TCP | Control-plane WebSocket — clients connect here |
-| 8443 | TCP | Dashboard UI and REST API |
+| 8080 | TCP | Dashboard UI and REST API |
 | 9090 | TCP | Prometheus metrics (`/metrics`) |
 | 20000–20099 | TCP | TCP tunnel range (configurable via `tcp_port_range`) |
 
