@@ -98,7 +98,12 @@ where
 
     let mut mux = MuxSession::start_detached();
 
-    let ctx = SessionCtx { session_id, core, config, audit_tx };
+    let ctx = SessionCtx {
+        session_id,
+        core,
+        config,
+        audit_tx,
+    };
     let result = main_loop(
         &mut ws,
         &mut ctrl_rx,
@@ -276,7 +281,12 @@ async fn handle_client_message<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let SessionCtx { session_id, core, config, audit_tx } = ctx;
+    let SessionCtx {
+        session_id,
+        core,
+        config,
+        audit_tx,
+    } = ctx;
     let session_id = *session_id;
     let frame = match parse_binary(msg) {
         Ok(f) => f,

@@ -154,8 +154,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let tls_handle = Arc::clone(&tls_handle);
         let audit_tx = audit_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_control_plane(control_addr, core, cfg, tls_handle, audit_tx).await
-            {
+            if let Err(e) = run_control_plane(control_addr, core, cfg, tls_handle, audit_tx).await {
                 error!("control plane exited: {e}");
             }
         })
@@ -205,8 +204,15 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let admin_token = config.auth.admin_token.clone();
         let audit_tx = audit_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_dashboard(dashboard_addr, core, pool, capture_rx, admin_token, audit_tx).await
+            if let Err(e) = run_dashboard(
+                dashboard_addr,
+                core,
+                pool,
+                capture_rx,
+                admin_token,
+                audit_tx,
+            )
+            .await
             {
                 error!("dashboard exited: {e}");
             }
