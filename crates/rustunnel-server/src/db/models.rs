@@ -48,6 +48,25 @@ pub struct TokenWithCount {
     pub tunnel_count: i64,
 }
 
+/// A tunnel_log row joined with the owning token's label.
+/// Returned by the `GET /api/history` endpoint.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct TunnelLogEntry {
+    pub id: String,
+    pub tunnel_id: String,
+    /// "http" or "tcp"
+    pub protocol: String,
+    /// Subdomain (HTTP) or port string (TCP).
+    pub label: String,
+    pub session_id: String,
+    /// DB token id — `None` for admin-token sessions.
+    pub token_id: Option<String>,
+    /// Human-readable label from the `tokens` table (populated by LEFT JOIN).
+    pub token_label: Option<String>,
+    pub registered_at: DateTime<Utc>,
+    pub unregistered_at: Option<DateTime<Utc>>,
+}
+
 /// A single captured HTTP request/response pair.
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct CapturedRequest {

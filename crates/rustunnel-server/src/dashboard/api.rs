@@ -16,6 +16,7 @@
 //! | GET    | /api/tokens                                    | List tokens (hash masked)          |
 //! | POST   | /api/tokens                                    | Create a new token                 |
 //! | DELETE | /api/tokens/:id                                | Delete a token                     |
+//! | GET    | /api/history                                   | Paginated tunnel history           |
 
 use std::sync::Arc;
 
@@ -67,6 +68,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/tunnels/:id/replay/:request_id", post(replay_request))
         .route("/api/tokens", get(list_tokens).post(create_token))
         .route("/api/tokens/:id", delete(delete_token))
+        .route("/api/history", get(tunnel_history))
         .layer(cors)
         .with_state(state)
 }
@@ -480,6 +482,56 @@ async fn delete_token(
         }
         Ok(false) => not_found("token not found").into_response(),
         Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// ── tunnel history ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    #[serde(default = "default_history_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+    /// Optional filter: "http" or "tcp".
+    protocol: Option<String>,
+}
+
+fn default_history_limit() -> i64 {
+    50
+}
+
+#[derive(Serialize)]
+struct TunnelHistoryResponse {
+    entries: Vec<crate::db::models::TunnelLogEntry>,
+    total: i64,
+}
+
+async fn tunnel_history(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&headers, &state).await {
+        return e.into_response();
+    }
+
+    let proto = q.protocol.as_deref();
+
+    let (entries, total) = tokio::join!(
+        db::list_tunnel_history(&state.pool, q.limit, q.offset, proto),
+        db::count_tunnel_history(&state.pool, proto),
+    );
+
+    match (entries, total) {
+        (Ok(entries), Ok(total)) => Json(TunnelHistoryResponse { entries, total }).into_response(),
+        (Err(e), _) | (_, Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrBody {
                 error: e.to_string(),

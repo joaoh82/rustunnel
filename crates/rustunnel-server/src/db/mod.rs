@@ -94,7 +94,7 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use models::{Token, TokenWithCount};
+use models::{Token, TokenWithCount, TunnelLogEntry};
 
 /// Hash a raw token value with SHA-256.
 pub fn hash_token(raw: &str) -> String {
@@ -225,4 +225,67 @@ pub async fn log_tunnel_unregistered(pool: &SqlitePool, tunnel_id: &str) -> Resu
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ── tunnel history helpers ────────────────────────────────────────────────────
+
+/// Return a page of tunnel history rows, newest first.
+///
+/// `protocol` filters to `"http"` or `"tcp"` when provided.
+pub async fn list_tunnel_history(
+    pool: &SqlitePool,
+    limit: i64,
+    offset: i64,
+    protocol: Option<&str>,
+) -> Result<Vec<TunnelLogEntry>> {
+    let rows: Vec<TunnelLogEntry> = if let Some(proto) = protocol {
+        sqlx::query_as(
+            "SELECT tl.id, tl.tunnel_id, tl.protocol, tl.label, tl.session_id, \
+                    tl.token_id, t.label AS token_label, \
+                    tl.registered_at, tl.unregistered_at \
+             FROM tunnel_log tl \
+             LEFT JOIN tokens t ON t.id = tl.token_id \
+             WHERE tl.protocol = ? \
+             ORDER BY tl.registered_at DESC \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(proto)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT tl.id, tl.tunnel_id, tl.protocol, tl.label, tl.session_id, \
+                    tl.token_id, t.label AS token_label, \
+                    tl.registered_at, tl.unregistered_at \
+             FROM tunnel_log tl \
+             LEFT JOIN tokens t ON t.id = tl.token_id \
+             ORDER BY tl.registered_at DESC \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows)
+}
+
+/// Total number of tunnel_log rows matching an optional protocol filter.
+pub async fn count_tunnel_history(
+    pool: &SqlitePool,
+    protocol: Option<&str>,
+) -> Result<i64> {
+    let count: (i64,) = if let Some(proto) = protocol {
+        sqlx::query_as("SELECT COUNT(*) FROM tunnel_log WHERE protocol = ?")
+            .bind(proto)
+            .fetch_one(pool)
+            .await?
+    } else {
+        sqlx::query_as("SELECT COUNT(*) FROM tunnel_log")
+            .fetch_one(pool)
+            .await?
+    };
+    Ok(count.0)
 }

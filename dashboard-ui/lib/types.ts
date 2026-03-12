@@ -45,6 +45,23 @@ export interface CreateTokenResponse {
   token: string; // raw value — shown only once
 }
 
+export interface TunnelLogEntry {
+  id: string;
+  tunnel_id: string;
+  protocol: string;
+  label: string;
+  session_id: string;
+  token_id: string | null;
+  token_label: string | null;
+  registered_at: string;
+  unregistered_at: string | null;
+}
+
+export interface TunnelHistoryResponse {
+  entries: TunnelLogEntry[];
+  total: number;
+}
+
 export interface ApiClient {
   get: (path: string) => Promise<unknown>;
   del: (path: string) => Promise<number>;

@@ -13,6 +13,7 @@ import { TunnelTable } from './TunnelTable';
 import { RequestList } from './RequestList';
 import { RequestDetail } from './RequestDetail';
 import { TokensPanel } from './TokensPanel';
+import { TunnelHistoryPanel } from './TunnelHistoryPanel';
 import { useTokens } from '@/hooks/useTokens';
 
 export default function Dashboard() {
@@ -177,6 +178,9 @@ export default function Dashboard() {
           error={tokenErr}
           refresh={refreshTokens}
         />
+
+        {/* Tunnel history */}
+        <TunnelHistoryPanel api={api} enabled={!!token} />
       </main>
     </>
   );
