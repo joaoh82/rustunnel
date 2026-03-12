@@ -1,4 +1,4 @@
-.PHONY: build test fmt lint check release release-server release-client \
+.PHONY: build test fmt lint check install-hooks release release-server release-client \
         docker-build docker-run docker-run-monitoring docker-stop docker-logs \
         deploy deploy-client update-server clean help
 
@@ -31,6 +31,11 @@ lint:
 check:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
+
+## install-hooks  Configure git to use .githooks/ (run once after cloning).
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "Git hooks installed from .githooks/"
 
 # ── release ───────────────────────────────────────────────────────────────────
 

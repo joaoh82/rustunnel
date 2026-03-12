@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Pre-push hook — mirrors the CI check step.
+# Install once with: make install-hooks
+set -euo pipefail
+
+echo "⏳ pre-push: cargo fmt --check …"
+cargo fmt --all -- --check
+
+echo "⏳ pre-push: cargo clippy …"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "✅ pre-push checks passed"
