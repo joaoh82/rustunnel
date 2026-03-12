@@ -265,7 +265,11 @@ where
 
     if !config.auth.require_auth {
         // Auth disabled — still try to resolve the DB token ID for tracking.
-        db_token_id = db::verify_token(pool, &token).await.ok().flatten().map(|t| t.id);
+        db_token_id = db::verify_token(pool, &token)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.id);
         authed = true;
     } else if token == config.auth.admin_token {
         db_token_id = None;
@@ -450,7 +454,8 @@ where
                                 &sub,
                                 &session_id.to_string(),
                                 db_token_id.as_deref(),
-                            ).await;
+                            )
+                            .await;
                             send_frame(
                                 ws,
                                 &ControlFrame::TunnelRegistered {
@@ -491,7 +496,8 @@ where
                             &port_str,
                             &session_id.to_string(),
                             db_token_id.as_deref(),
-                        ).await;
+                        )
+                        .await;
                         send_frame(
                             ws,
                             &ControlFrame::TunnelRegistered {

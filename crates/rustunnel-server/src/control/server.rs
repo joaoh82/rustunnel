@@ -22,9 +22,9 @@ use crate::audit::AuditTx;
 use crate::config::ServerConfig;
 use crate::control::session::{handle_data_connection, handle_session};
 use crate::core::TunnelCore;
-use sqlx::SqlitePool;
 use crate::error::Result;
 use crate::net::bind_reuse;
+use sqlx::SqlitePool;
 
 /// Start the control-plane listener.
 ///

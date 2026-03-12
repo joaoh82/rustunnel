@@ -420,15 +420,13 @@ async fn forward_http(
     // first bytes as soon as the local service starts responding (TTFB fix).
     // `sender` is moved into the unfold state to keep the upstream HTTP/1.1
     // connection alive for the entire duration of the body transfer.
-    let body_stream = futures_util::stream::unfold(
-        (resp_body, sender),
-        |(mut body, sender)| async move {
+    let body_stream =
+        futures_util::stream::unfold((resp_body, sender), |(mut body, sender)| async move {
             match body.frame().await {
                 Some(Ok(f)) => Some((Ok::<Frame<Bytes>, Infallible>(f), (body, sender))),
                 _ => None,
             }
-        },
-    );
+        });
 
     Ok(Response::from_parts(
         resp_parts,

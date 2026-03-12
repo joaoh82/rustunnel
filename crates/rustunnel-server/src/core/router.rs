@@ -145,8 +145,10 @@ impl TunnelCore {
         control_tx: mpsc::Sender<ControlMessage>,
     ) -> Uuid {
         let session_id = Uuid::new_v4();
-        self.sessions
-            .insert(session_id, SessionInfo::new(addr, token_id, db_token_id, control_tx));
+        self.sessions.insert(
+            session_id,
+            SessionInfo::new(addr, token_id, db_token_id, control_tx),
+        );
         session_id
     }
 
