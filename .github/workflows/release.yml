@@ -171,3 +171,23 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: publish
+    # Skip pre-releases (tags containing a hyphen, e.g. v1.0.0-rc1).
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          bash .github/scripts/update-homebrew-formula.sh \
+            "${{ github.ref_name }}" \
+            "joaoh82/rustunnel" \
+            "joaoh82/homebrew-rustunnel"
