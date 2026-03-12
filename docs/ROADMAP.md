@@ -30,6 +30,7 @@ This document tracks the features that have already shipped and ideas planned fo
 - [x] Token scope field for future RBAC use
 - [x] Token last-used timestamp tracking
 - [x] Per-token tunnel count tracking
+- [x] Tunnel history page in the dashboard (paginated table with protocol filter, duration, token attribution)
 - [x] Token management via CLI (`rustunnel token create / list / delete`)
 - [x] Token management via Dashboard UI
 
@@ -75,7 +76,6 @@ Items below are not committed to any release timeline. They represent directions
 - [ ] Shell completions for the CLI (bash, zsh, fish)
 - [ ] `rustunnel status` command to inspect the active connection and registered tunnels
 - [ ] Extended Prometheus metrics (bytes proxied, request latency histograms, error rates)
-- [ ] Dashboard tunnel history page (view past tunnels from the `tunnel_log` table)
 
 ### Medium-term
 - [ ] Token RBAC — enforce scope restrictions (e.g. `http-only`, `tcp-only`, read-only dashboard)
