@@ -39,6 +39,7 @@ You can self-host or use our managed service.
   - [Token management](#token-management)
 - [Port reference](#port-reference)
 - [Config file reference (server)](#config-file-reference-server)
+- [REST API](#rest-api)
 - [Monitoring](#monitoring)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
@@ -716,6 +717,30 @@ make docker-run-monitoring
 # Grafana:    http://localhost:3000  (admin / changeme)
 # Prometheus: http://localhost:9090
 ```
+
+---
+
+## REST API
+
+The dashboard port exposes a REST API for programmatic access to tunnels, tokens, captured requests, and tunnel history. All endpoints (except the health check) require an `Authorization: Bearer <token>` header.
+
+**Quick reference**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/status` | Health check (no auth) |
+| `GET` | `/api/tunnels` | List active tunnels |
+| `GET` | `/api/tunnels/:id` | Get a single tunnel |
+| `DELETE` | `/api/tunnels/:id` | Force-close a tunnel |
+| `GET` | `/api/tunnels/:id/requests` | Captured HTTP requests |
+| `POST` | `/api/tunnels/:id/replay/:req_id` | Fetch stored request for replay |
+| `GET` | `/api/tokens` | List API tokens |
+| `POST` | `/api/tokens` | Create an API token |
+| `DELETE` | `/api/tokens/:id` | Delete an API token |
+| `GET` | `/api/history` | Paginated tunnel history |
+
+Full request/response schemas, query parameters, and examples are in
+[**docs/api-reference.md**](docs/api-reference.md).
 
 ---
 
