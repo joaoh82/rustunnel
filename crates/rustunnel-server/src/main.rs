@@ -97,6 +97,10 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
 
     info!(path = %config.database.path, "opening database");
     let pool = db::init_pool(&config.database.path).await?;
+    let stale = db::close_stale_tunnels(&pool).await?;
+    if stale > 0 {
+        info!(count = stale, "closed stale tunnel_log rows from previous run");
+    }
     info!("database ready");
 
     // ── audit logger ──────────────────────────────────────────────────────────

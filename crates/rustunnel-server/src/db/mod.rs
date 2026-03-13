@@ -214,6 +214,21 @@ pub async fn log_tunnel_registered(
     Ok(())
 }
 
+/// Close all tunnel_log rows that are still open (unregistered_at IS NULL).
+///
+/// Called once on server startup to mark tunnels from previous runs as closed,
+/// since their WebSocket connections no longer exist.
+pub async fn close_stale_tunnels(pool: &SqlitePool) -> Result<u64> {
+    let rows = sqlx::query(
+        "UPDATE tunnel_log SET unregistered_at = ? WHERE unregistered_at IS NULL",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows)
+}
+
 /// Set `unregistered_at` on the tunnel_log row for `tunnel_id`.
 pub async fn log_tunnel_unregistered(pool: &SqlitePool, tunnel_id: &str) -> Result<()> {
     sqlx::query(
