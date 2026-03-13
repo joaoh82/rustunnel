@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -2215,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "reqwest",
@@ -2228,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2238,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "axum 0.7.9",

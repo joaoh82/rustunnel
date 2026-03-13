@@ -1,3 +1,27 @@
+# Updating version for full release:
+
+⏺ Update all four crates, in this order:
+
+  ┌──────────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
+  │                 File                 │                                Why                                 │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ crates/rustunnel-client/Cargo.toml   │ rustunnel --version                                                │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ crates/rustunnel-server/Cargo.toml   │ rustunnel-server --version + embedded in the startup banner        │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ crates/rustunnel-mcp/Cargo.toml      │ rustunnel-mcp --version + reported in the MCP initialize handshake │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ crates/rustunnel-protocol/Cargo.toml │ shared library — keep in sync to avoid confusion                   │
+  └──────────────────────────────────────┴────────────────────────────────────────────────────────────────────┘
+
+  Then tag git with the same version:
+
+  1. bump all four Cargo.toml files to e.g. 0.3.0
+  2. cargo build --workspace   (updates Cargo.lock)
+  3. git add -A && git commit -m "chore: bump version to 0.3.0"
+  4. git tag v0.3.0
+  5. git push && git push --tags
+ 
  # On your local machine:
  ```sh
   npm run build           # builds + copies to assets/
