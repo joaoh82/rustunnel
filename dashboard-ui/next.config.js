@@ -11,7 +11,7 @@ const nextConfig = {
 if (isDev) {
   // Proxy API calls to the running Rust server during development.
   nextConfig.rewrites = async () => [
-    { source: '/api/:path*', destination: 'http://localhost:8443/api/:path*' },
+    { source: '/api/:path*', destination: 'http://localhost:4041/api/:path*' },
   ];
 }
 

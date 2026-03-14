@@ -143,7 +143,7 @@ rustunnel setup
 
 | Prompt | Default | Description |
 |--------|---------|-------------|
-| Server address | `tunnel.rustunnel.com:4040` | The control-plane host:port to connect to |
+| Server address | `edge.rustunnel.com:4040` | The control-plane host:port to connect to |
 | Auth token | _(blank)_ | Token issued by the server; leave empty to fill in later |
 
 **Behaviour:**
@@ -158,7 +158,7 @@ rustunnel setup
 ```
 rustunnel setup — create ~/.rustunnel/config.yml
 
-Tunnel server address [tunnel.rustunnel.com:4040]:
+Tunnel server address [edge.rustunnel.com:4040]:
 Auth token (leave blank to skip): rt_live_abc123xyz
 
 Created: /Users/alice/.rustunnel/config.yml
@@ -171,7 +171,7 @@ Run `rustunnel start` to connect using this config.
 # rustunnel configuration
 # Documentation: https://github.com/joaoh82/rustunnel
 
-server: tunnel.rustunnel.com:4040
+server: edge.rustunnel.com:4040
 auth_token: rt_live_abc123xyz
 
 # tunnels:

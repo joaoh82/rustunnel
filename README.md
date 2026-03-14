@@ -59,7 +59,7 @@ You can self-host or use our managed service.
 Internet ──── :80 ─────▶│  HTTP edge (301 → HTTPS)                 │
 Internet ──── :443 ────▶│  HTTPS edge  ──▶ yamux stream ──▶ client │
 Client ───── :4040 ────▶│  Control-plane WebSocket (TLS)           │
-Browser ──── :8080 ────▶│  Dashboard UI + REST API                 │
+Browser ──── :8443 ────▶│  Dashboard UI + REST API                 │
 Prometheus ─ :9090 ────▶│  Metrics endpoint                        │
 Internet ── :20000+ ───▶│  TCP tunnel ports (one per TCP tunnel)   │
                         └──────────────────────────────────────────┘
@@ -243,8 +243,8 @@ If either check fails the push is aborted, keeping the remote branch green.
 ## Production deployment (Ubuntu / systemd)
 
 The steps below match a deployment where:
-- Domain: `tunnel.rustunnel.com`
-- Wildcard DNS: `*.tunnel.rustunnel.com → <server IP>`
+- Domain: `edge.rustunnel.com`
+- Wildcard DNS: `*.edge.rustunnel.com → <server IP>`
 - TLS certs: Let's Encrypt via Certbot + Cloudflare DNS challenge
 
 ### 1 — Install dependencies
@@ -309,7 +309,7 @@ Replace `your-admin-token-here` with a strong random secret (e.g. `openssl rand 
 
 [server]
 # Primary domain — must match your wildcard DNS record.
-domain       = "tunnel.rustunnel.com"
+domain       = "edge.rustunnel.com"
 
 # Ports for incoming tunnel traffic (requires CAP_NET_BIND_SERVICE or root).
 http_port    = 80
@@ -319,13 +319,13 @@ https_port   = 443
 control_port = 4040
 
 # Dashboard UI and REST API port.
-dashboard_port = 8080
+dashboard_port = 8443
 
 # ── TLS ─────────────────────────────────────────────────────────────────────
 [tls]
 # Paths written by Certbot (see step 6).
-cert_path = "/etc/letsencrypt/live/tunnel.rustunnel.com/fullchain.pem"
-key_path  = "/etc/letsencrypt/live/tunnel.rustunnel.com/privkey.pem"
+cert_path = "/etc/letsencrypt/live/edge.rustunnel.com/fullchain.pem"
+key_path  = "/etc/letsencrypt/live/edge.rustunnel.com/privkey.pem"
 
 # Set acme_enabled = true only if you want rustunnel to manage certs itself
 # via the ACME protocol (requires Cloudflare credentials below).
@@ -402,16 +402,16 @@ Request a certificate covering the bare domain and the wildcard (required for HT
 certbot certonly \
   --dns-cloudflare \
   --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
-  -d "tunnel.rustunnel.com" \
-  -d "*.tunnel.rustunnel.com" \
+  -d "edge.rustunnel.com" \
+  -d "*.edge.rustunnel.com" \
   --agree-tos \
-  --email your@email.com
+  --email joaoh82@gmail.com
 ```
 
 Certbot writes the certificate to:
 ```
-/etc/letsencrypt/live/tunnel.rustunnel.com/fullchain.pem
-/etc/letsencrypt/live/tunnel.rustunnel.com/privkey.pem
+/etc/letsencrypt/live/edge.rustunnel.com/fullchain.pem
+/etc/letsencrypt/live/edge.rustunnel.com/privkey.pem
 ```
 
 These paths are already set in the config above. Certbot sets up automatic renewal via a systemd timer — no further action needed.
@@ -421,10 +421,10 @@ Allow the `rustunnel` service user to read the certificates:
 ```bash
 # Grant read access to the live/ and archive/ directories
 chmod 755 /etc/letsencrypt/{live,archive}
-chmod 640 /etc/letsencrypt/live/tunnel.rustunnel.com/*.pem
-chgrp rustunnel /etc/letsencrypt/live/tunnel.rustunnel.com/*.pem
-chgrp rustunnel /etc/letsencrypt/archive/tunnel.rustunnel.com/*.pem
-chmod 640 /etc/letsencrypt/archive/tunnel.rustunnel.com/*.pem
+chmod 640 /etc/letsencrypt/live/edge.rustunnel.com/*.pem
+chgrp rustunnel /etc/letsencrypt/live/edge.rustunnel.com/*.pem
+chgrp rustunnel /etc/letsencrypt/archive/edge.rustunnel.com/*.pem
+chmod 640 /etc/letsencrypt/archive/edge.rustunnel.com/*.pem
 ```
 
 ### 7 — Set up systemd service
@@ -447,7 +447,7 @@ journalctl -u rustunnel.service -f
 ufw allow 80/tcp   comment "rustunnel HTTP edge"
 ufw allow 443/tcp  comment "rustunnel HTTPS edge"
 ufw allow 4040/tcp comment "rustunnel control plane"
-ufw allow 8080/tcp comment "rustunnel dashboard"
+ufw allow 8443/tcp comment "rustunnel dashboard"
 ufw allow 9090/tcp comment "rustunnel Prometheus metrics"
 
 # TCP tunnel port range (must match tcp_port_range in server.toml)
@@ -457,8 +457,8 @@ ufw allow 20000:20099/tcp comment "rustunnel TCP tunnels"
 ### 9 — Verify the server is running
 
 ```bash
-# Health check — use dashboard_port from server.toml (default 8080 in production)
-curl http://localhost:8080/api/status
+# Health check — use dashboard_port from server.toml (default 8443 in production)
+curl http://localhost:8443/api/status
 
 # Confirm which ports the process is actually bound to
 ss -tlnp | grep rustunnel-serve
@@ -589,12 +589,12 @@ The easiest way to create your config file is the interactive setup wizard:
 rustunnel setup
 ```
 
-It prompts for your server address (default: `tunnel.rustunnel.com:4040`) and auth token, then writes `~/.rustunnel/config.yml` with a commented `tunnels:` example section.
+It prompts for your server address (default: `edge.rustunnel.com:4040`) and auth token, then writes `~/.rustunnel/config.yml` with a commented `tunnels:` example section.
 
 ```
 rustunnel setup — create ~/.rustunnel/config.yml
 
-Tunnel server address [tunnel.rustunnel.com:4040]:
+Tunnel server address [edge.rustunnel.com:4040]:
 Auth token (leave blank to skip): rt_live_abc123...
 
 Created: /Users/you/.rustunnel/config.yml
@@ -608,22 +608,22 @@ After running setup, use `rustunnel start` to connect with all tunnels defined i
 ```bash
 # Expose a local HTTP service on port 3000
 rustunnel http 3000 \
-  --server tunnel.rustunnel.com:4040 \
+  --server edge.rustunnel.com:4040 \
   --token YOUR_AUTH_TOKEN
 
 # Expose a local service with a custom subdomain
 rustunnel http 3000 \
-  --server tunnel.rustunnel.com:4040 \
+  --server edge.rustunnel.com:4040 \
   --token YOUR_AUTH_TOKEN \
   --subdomain myapp
 
 # Expose a local TCP service (e.g. a PostgreSQL database)
 rustunnel tcp 5432 \
-  --server tunnel.rustunnel.com:4040 \
+  --server edge.rustunnel.com:4040 \
   --token YOUR_AUTH_TOKEN
 
 # Disable automatic reconnection
-rustunnel http 3000 --server tunnel.rustunnel.com:4040 --no-reconnect
+rustunnel http 3000 --server edge.rustunnel.com:4040 --no-reconnect
 ```
 
 ### Config file
@@ -634,7 +634,7 @@ Default location: `~/.rustunnel/config.yml`
 # ~/.rustunnel/config.yml
 
 # Tunnel server address (host:control_port)
-server: tunnel.rustunnel.com:4040
+server: edge.rustunnel.com:4040
 
 # Auth token (from server admin_token or a token created via the dashboard)
 auth_token: YOUR_AUTH_TOKEN
@@ -666,14 +666,14 @@ Create additional auth tokens via the dashboard API:
 ```bash
 rustunnel token create \
   --name "ci-deploy" \
-  --server tunnel.rustunnel.com:8080 \
+  --server edge.rustunnel.com:8443 \
   --admin-token YOUR_ADMIN_TOKEN
 ```
 
 Or via `curl`:
 
 ```bash
-curl -s -X POST http://tunnel.rustunnel.com:8080/api/tokens \
+curl -s -X POST http://edge.rustunnel.com:8443/api/tokens \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"label": "ci-deploy"}'
@@ -688,7 +688,7 @@ curl -s -X POST http://tunnel.rustunnel.com:8080/api/tokens \
 | 80 | TCP | HTTP edge — redirects to HTTPS; also ACME HTTP-01 challenge |
 | 443 | TCP | HTTPS edge — TLS-terminated tunnel ingress |
 | 4040 | TCP | Control-plane WebSocket — clients connect here |
-| 8080 | TCP | Dashboard UI and REST API |
+| 8443 | TCP | Dashboard UI and REST API |
 | 9090 | TCP | Prometheus metrics (`/metrics`) |
 | 20000–20099 | TCP | TCP tunnel range (configurable via `tcp_port_range`) |
 

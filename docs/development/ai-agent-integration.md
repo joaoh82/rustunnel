@@ -77,7 +77,7 @@ over stdin/stdout. This is the standard MCP deployment for local tools.
   "mcpServers": {
     "rustunnel": {
       "command": "rustunnel-mcp",
-      "args": ["--server", "tunnel.rustunnel.com"]
+      "args": ["--server", "edge.rustunnel.com"]
     }
   }
 }
@@ -90,7 +90,7 @@ over stdin/stdout. This is the standard MCP deployment for local tools.
 
 **Limitations:**
 - Must be installed on the agent's machine
-- The agent's machine must have outbound access to `tunnel.rustunnel.com:4040`
+- The agent's machine must have outbound access to `edge.rustunnel.com:4040`
 
 ### Mode B — Remote (Streamable HTTP transport) — For cloud agents
 
@@ -99,7 +99,7 @@ remote server and forward traffic to the agent's local machine, this mode
 returns **connection instructions** rather than opening tunnels directly.
 
 ```
-https://mcp.tunnel.rustunnel.com/mcp   ← MCP endpoint
+https://mcp.edge.rustunnel.com/mcp   ← MCP endpoint
 ```
 
 The `create_tunnel` tool in this mode returns the CLI command to run locally,
@@ -321,8 +321,8 @@ Returns: `{ public_url: string, tunnel_id: string, protocol: string }`
 Returns:
 ```json
 {
-  "cli_command": "rustunnel http 3000 --server tunnel.rustunnel.com:4040 --token <token>",
-  "server": "tunnel.rustunnel.com:4040",
+  "cli_command": "rustunnel http 3000 --server edge.rustunnel.com:4040 --token <token>",
+  "server": "edge.rustunnel.com:4040",
   "install_url": "https://github.com/joaoh82/rustunnel/releases/latest"
 }
 ```
@@ -359,8 +359,8 @@ Agent: I need to share my local app at port 3000 with a collaborator.
    → Returns token = "abc123-..."
 
 2. Agent calls create_tunnel(token="abc123-...", local_port=3000, protocol="http")
-   → MCP server spawns: rustunnel http 3000 --server tunnel.rustunnel.com:4040 --token abc123-...
-   → Returns: { public_url: "https://xyz.tunnel.rustunnel.com", tunnel_id: "..." }
+   → MCP server spawns: rustunnel http 3000 --server edge.rustunnel.com:4040 --token abc123-...
+   → Returns: { public_url: "https://xyz.edge.rustunnel.com", tunnel_id: "..." }
 
 3. Agent returns the public URL to the user. Tunnel stays open in background.
 
@@ -416,7 +416,7 @@ Deliverable: Agents pay USDC to provision tokens. No human intervention needed.
 
 | Item | Description | Effort |
 |------|-------------|--------|
-| Streamable HTTP transport | MCP server deployed as `mcp.tunnel.rustunnel.com` | Medium |
+| Streamable HTTP transport | MCP server deployed as `mcp.edge.rustunnel.com` | Medium |
 | OAuth 2.1 on MCP endpoint | Auth for remote MCP access | Medium |
 | Usage metering API | `GET /api/usage` returns tunnel-hours, bytes, request counts | Medium |
 | Billing webhook | Emit events when token expires or limits hit | Small |

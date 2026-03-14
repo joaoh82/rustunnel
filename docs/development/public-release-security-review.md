@@ -58,7 +58,7 @@ GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-changeme}"
 
 **Files**: `deploy/server.toml`, `README.md`, `docs/client-guide.md`, `docs/architecture.md`
 ```
-tunnel.rustunnel.com
+edge.rustunnel.com
 ```
 **Assessment**: This is the project's own public domain — a DNS name you control and intend to be publicly known. Exposing it in a public repository is intentional and harmless. It functions as the example domain throughout the documentation, which is standard practice for open-source tunnel services (ngrok, Cloudflare Tunnel, etc. all do this).
 
@@ -113,7 +113,7 @@ None are blocking, but the following would improve the production operator exper
 1. **Add a `GRAFANA_PASSWORD` reminder to README or `deploy/server.toml`**
    The Docker Compose default `changeme` will work but is insecure. A one-line note like _"Set `GRAFANA_PASSWORD` in your environment before running the monitoring stack"_ is sufficient.
 
-2. **Consider replacing `tunnel.rustunnel.com` with a generic example domain in config templates**
+2. **Consider replacing `edge.rustunnel.com` with a generic example domain in config templates**
    Using `tunnel.example.com` in `deploy/server.toml` and the README would make it clearer that operators must substitute their own domain. This is cosmetic and not a security concern — the current domain is public by design — but it is a common convention for open-source project templates.
 
 3. **Ensure `deploy/local/server.toml` has a clear header comment**

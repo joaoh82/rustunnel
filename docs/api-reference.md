@@ -1,6 +1,6 @@
 # REST API Reference
 
-The rustunnel-server exposes a REST API on the **dashboard port** (default `8443` in Docker, `4041` in local dev, `8080` in bare-metal production — check your `server.toml`).
+The rustunnel-server exposes a REST API on the **dashboard port** (default `8443` in production and Docker, `4041` in local dev — check your `server.toml`).
 
 ---
 

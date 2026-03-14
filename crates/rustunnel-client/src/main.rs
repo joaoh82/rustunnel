@@ -230,10 +230,10 @@ async fn run_setup() -> error::Result<()> {
     term.write_line("")?;
 
     // Server prompt
-    term.write_line("Tunnel server address [tunnel.rustunnel.com:4040]: ")?;
+    term.write_line("Tunnel server address [edge.rustunnel.com:4040]: ")?;
     let server_input = term.read_line()?;
     let server = if server_input.trim().is_empty() {
-        "tunnel.rustunnel.com:4040".to_string()
+        "edge.rustunnel.com:4040".to_string()
     } else {
         server_input.trim().to_string()
     };

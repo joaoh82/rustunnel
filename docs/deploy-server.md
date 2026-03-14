@@ -17,10 +17,10 @@
   Then tag git with the same version:
 
   1. bump all four Cargo.toml files to e.g. 0.3.0
-  2. cargo build --workspace   (updates Cargo.lock)
-  3. git add -A && git commit -m "chore: bump version to 0.3.0"
-  4. git tag v0.3.0
-  5. git push && git push --tags
+    - Run: `./scripts/bump-version.sh 0.3.0`
+  2. git add -A && git commit -m "chore: bump version to 0.3.0"
+  3. git tag v0.3.0
+  4. git push && git push --tags
  
  # On your local machine:
  ```sh

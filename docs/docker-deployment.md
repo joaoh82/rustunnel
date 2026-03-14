@@ -149,13 +149,13 @@ Use this when you have a cloud server (Ubuntu 22.04 or later recommended) with a
 
 | Item | Example value |
 |------|--------------|
-| Domain | `tunnel.rustunnel.com` |
-| Wildcard DNS | `*.tunnel.rustunnel.com → <server public IP>` |
+| Domain | `edge.rustunnel.com` |
+| Wildcard DNS | `*.edge.rustunnel.com → <server public IP>` |
 | TLS | Let's Encrypt via Certbot + Cloudflare DNS challenge |
 | OS | Ubuntu 22.04 LTS |
 
 Set up the wildcard DNS record with your DNS provider before continuing.
-Both `tunnel.rustunnel.com` (bare) and `*.tunnel.rustunnel.com` (wildcard) must resolve to your server IP — the wildcard is required so HTTP tunnel subdomains work.
+Both `edge.rustunnel.com` (bare) and `*.edge.rustunnel.com` (wildcard) must resolve to your server IP — the wildcard is required so HTTP tunnel subdomains work.
 
 ### 1 — Install dependencies on the VPS
 
@@ -195,16 +195,16 @@ Request the certificate (bare domain + wildcard):
 certbot certonly \
   --dns-cloudflare \
   --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
-  -d "tunnel.rustunnel.com" \
-  -d "*.tunnel.rustunnel.com" \
+  -d "edge.rustunnel.com" \
+  -d "*.edge.rustunnel.com" \
   --agree-tos \
   --email your@email.com
 ```
 
 Certbot writes the PEM files to:
 ```
-/etc/letsencrypt/live/tunnel.rustunnel.com/fullchain.pem
-/etc/letsencrypt/live/tunnel.rustunnel.com/privkey.pem
+/etc/letsencrypt/live/edge.rustunnel.com/fullchain.pem
+/etc/letsencrypt/live/edge.rustunnel.com/privkey.pem
 ```
 
 Certbot installs a systemd timer for automatic renewal — no further action needed.
@@ -221,11 +221,11 @@ Edit `deploy/server.toml` — set **at minimum**:
 
 ```toml
 [server]
-domain = "tunnel.rustunnel.com"   # ← your domain
+domain = "edge.rustunnel.com"   # ← your domain
 
 [tls]
-cert_path = "/etc/letsencrypt/live/tunnel.rustunnel.com/fullchain.pem"
-key_path  = "/etc/letsencrypt/live/tunnel.rustunnel.com/privkey.pem"
+cert_path = "/etc/letsencrypt/live/edge.rustunnel.com/fullchain.pem"
+key_path  = "/etc/letsencrypt/live/edge.rustunnel.com/privkey.pem"
 
 [auth]
 admin_token  = "PASTE_YOUR_GENERATED_TOKEN_HERE"
@@ -241,8 +241,8 @@ The container runs as a non-root user (`rustunnel`). Certbot sets restrictive pe
 ```bash
 # Allow read access to cert directories
 chmod 755 /etc/letsencrypt/{live,archive}
-chmod 640 /etc/letsencrypt/live/tunnel.rustunnel.com/*.pem
-chmod 640 /etc/letsencrypt/archive/tunnel.rustunnel.com/*.pem
+chmod 640 /etc/letsencrypt/live/edge.rustunnel.com/*.pem
+chmod 640 /etc/letsencrypt/archive/edge.rustunnel.com/*.pem
 ```
 
 > **Alternative**: if you prefer not to relax Certbot permissions, copy the certs
@@ -291,7 +291,7 @@ ufw allow 20000:20099/tcp comment "rustunnel TCP tunnels"
 
 ```bash
 # Health check
-curl https://tunnel.rustunnel.com:8443/health
+curl https://edge.rustunnel.com:8443/health
 
 # Prometheus metrics
 curl -s http://localhost:9090/metrics
@@ -304,7 +304,7 @@ docker compose -f deploy/docker-compose.yml logs -f rustunnel-server
 
 ```bash
 rustunnel http 3000 \
-  --server tunnel.rustunnel.com:4040 \
+  --server edge.rustunnel.com:4040 \
   --token YOUR_ADMIN_TOKEN
 ```
 

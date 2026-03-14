@@ -7,8 +7,8 @@
 # ── Server ────────────────────────────────────────────────────────────────────
 [server]
 # Primary domain — must match your wildcard DNS record:
-#   *.tunnel.rustunnel.com  →  <server public IP>
-domain = "tunnel.rustunnel.com"
+#   *.edge.rustunnel.com  →  <server public IP>
+domain = "edge.rustunnel.com"
 
 # Port 80  — HTTP edge (redirects to HTTPS; also handles ACME HTTP-01 challenges)
 # Port 443 — HTTPS edge (TLS-terminated tunnel ingress)
@@ -32,12 +32,12 @@ dashboard_port = 8443
 #   certbot certonly \
 #     --dns-cloudflare \
 #     --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
-#     -d "tunnel.rustunnel.com" \
-#     -d "*.tunnel.rustunnel.com" \
+#     -d "edge.rustunnel.com" \
+#     -d "*.edge.rustunnel.com" \
 #     --agree-tos --email your@email.com
 #
-cert_path = "/etc/letsencrypt/live/tunnel.rustunnel.com/fullchain.pem"
-key_path  = "/etc/letsencrypt/live/tunnel.rustunnel.com/privkey.pem"
+cert_path = "/etc/letsencrypt/live/edge.rustunnel.com/fullchain.pem"
+key_path  = "/etc/letsencrypt/live/edge.rustunnel.com/privkey.pem"
 
 # Built-in ACME renewal — leave false when using Certbot (recommended).
 # Set to true only if you want rustunnel to manage its own certificates
