@@ -103,7 +103,7 @@ async fn http_tunnel_proxies_hello_world() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM captured_requests")
-        .fetch_one(&server.pool)
+        .fetch_one(&server.db.local)
         .await
         .expect("DB query");
 

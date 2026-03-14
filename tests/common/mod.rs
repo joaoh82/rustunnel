@@ -20,7 +20,7 @@ use rcgen::{CertificateParams, KeyPair};
 use rustls::ClientConfig;
 #[allow(unused_imports)]
 use rustls::ServerConfig as RustlsConfig;
-use sqlx::SqlitePool;
+use rustunnel_server::db::Db;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -147,7 +147,7 @@ pub struct TestServer {
     pub domain: String,
     pub admin_token: String,
     pub core: Arc<TunnelCore>,
-    pub pool: SqlitePool,
+    pub db: Db,
     pub config: Arc<ServerConfig>,
 
     // Kept alive for the test's duration.
@@ -197,12 +197,10 @@ impl TestServer {
 
         let temp_dir = TempDir::new().expect("temp dir");
         let (cert_path, key_path) = generate_test_cert(&temp_dir);
-        let db_path = temp_dir
-            .path()
-            .join("test.db")
-            .to_str()
-            .unwrap()
-            .to_string();
+
+        let pg_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://rustunnel:test@localhost:5432/rustunnel_test".to_string()
+        });
 
         let config = Arc::new(ServerConfig {
             server: ServerSection {
@@ -226,7 +224,10 @@ impl TestServer {
                 admin_token: admin_token.to_string(),
                 require_auth,
             },
-            database: DatabaseSection { path: db_path },
+            database: DatabaseSection {
+                url: pg_url,
+                captured_path: ":memory:".to_string(),
+            },
             logging: LoggingSection {
                 level: "warn".to_string(),
                 format: "pretty".to_string(),
@@ -243,9 +244,9 @@ impl TestServer {
         });
 
         // Database.
-        let pool = rustunnel_server::db::init_pool(&config.database.path)
+        let db = rustunnel_server::db::init_db(&config.database)
             .await
-            .expect("init_pool");
+            .expect("init_db");
 
         // TLS.
         let tls_cfg = build_tls_config(&cert_path, &key_path).expect("build_tls_config");
@@ -269,7 +270,7 @@ impl TestServer {
             let core = Arc::clone(&core);
             let cfg = Arc::clone(&config);
             let tls_handle = Arc::clone(&tls_handle);
-            let pool = pool.clone();
+            let db = db.clone();
             async move {
                 let _ = rustunnel_server::control::server::run_control_plane(
                     control_addr,
@@ -277,7 +278,7 @@ impl TestServer {
                     cfg,
                     tls_handle,
                     rustunnel_server::audit::noop_audit(),
-                    pool,
+                    db,
                 )
                 .await;
             }
@@ -322,13 +323,12 @@ impl TestServer {
         let dashboard_addr: SocketAddr = format!("127.0.0.1:{dashboard_port}").parse().unwrap();
         let h = tokio::spawn({
             let core = Arc::clone(&core);
-            let pool = pool.clone();
             let admin_token = config.auth.admin_token.clone();
             async move {
                 let _ = rustunnel_server::dashboard::run_dashboard(
                     dashboard_addr,
                     core,
-                    pool,
+                    db,
                     capture_rx,
                     admin_token,
                     rustunnel_server::audit::noop_audit(),
@@ -349,7 +349,7 @@ impl TestServer {
             domain: "localhost".to_string(),
             admin_token: admin_token.to_string(),
             core,
-            pool,
+            db,
             config,
             _temp_dir: temp_dir,
             task_handles,
