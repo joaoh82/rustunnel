@@ -36,7 +36,7 @@ services:
     environment:
       RUST_LOG: "rustunnel_server=info,warn"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:8443/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fs http://localhost:8443/api/status || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

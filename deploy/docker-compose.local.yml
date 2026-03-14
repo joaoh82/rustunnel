@@ -33,7 +33,7 @@ services:
     environment:
       RUST_LOG: "rustunnel_server=debug,warn"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsk http://localhost:4041/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsk http://localhost:4041/api/status || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3

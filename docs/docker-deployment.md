@@ -81,7 +81,7 @@ docker compose -f deploy/docker-compose.local.yml up -d
 
 ```bash
 # Health check (HTTP — no TLS required for dashboard in local mode)
-curl http://localhost:4041/health
+curl http://localhost:4041/api/status
 
 # Open the dashboard in a browser
 open http://localhost:4041
@@ -291,7 +291,7 @@ ufw allow 20000:20099/tcp comment "rustunnel TCP tunnels"
 
 ```bash
 # Health check
-curl https://edge.rustunnel.com:8443/health
+curl https://edge.rustunnel.com:8443/api/status
 
 # Prometheus metrics
 curl -s http://localhost:9090/metrics
