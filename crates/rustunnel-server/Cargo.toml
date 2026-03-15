@@ -41,8 +41,6 @@ tower-http = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
-rust-embed = { workspace = true }
-mime_guess = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }
 instant-acme = { workspace = true }

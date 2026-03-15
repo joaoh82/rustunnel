@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "NEXT_EXPORT=false next dev",
-    "build": "next build && rm -rf ../crates/rustunnel-server/src/dashboard/assets && cp -r out ../crates/rustunnel-server/src/dashboard/assets",
+    "dev": "NEXT_PUBLIC_API_URL=http://localhost:8443 next dev",
+    "build": "next build",
     "type-check": "tsc --noEmit"
   },
   "dependencies": {

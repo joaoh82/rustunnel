@@ -37,8 +37,6 @@ tower-http = { version = "0.5", features = ["cors", "fs", "set-header"] }
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
-rust-embed = { version = "8", features = ["axum"] }
-mime_guess = "2"
 clap = { version = "4", features = ["derive"] }
 serde_yaml = "0.9"
 console = "0.15"

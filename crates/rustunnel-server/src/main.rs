@@ -217,10 +217,19 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
     let h_dashboard = {
         let core = Arc::clone(&core);
         let admin_token = config.auth.admin_token.clone();
+        let dashboard_origin = config.server.dashboard_origin.clone();
         let audit_tx = audit_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_dashboard(dashboard_addr, core, db, capture_rx, admin_token, audit_tx).await
+            if let Err(e) = run_dashboard(
+                dashboard_addr,
+                core,
+                db,
+                capture_rx,
+                admin_token,
+                audit_tx,
+                dashboard_origin,
+            )
+            .await
             {
                 error!("dashboard exited: {e}");
             }

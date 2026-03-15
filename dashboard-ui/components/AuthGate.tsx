@@ -2,6 +2,8 @@
 
 import { useState } from 'react';
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+
 interface AuthGateProps {
   onAuth: (token: string) => void;
 }
@@ -16,7 +18,7 @@ export function AuthGate({ onAuth }: AuthGateProps) {
     if (!val.trim()) return;
     setLoading(true);
     try {
-      await fetch('/api/tunnels', {
+      await fetch(`${API_BASE}/api/tunnels`, {
         headers: { Authorization: `Bearer ${val.trim()}` },
       }).then((r) => {
         if (!r.ok) throw new Error('Unauthorized');

@@ -20,10 +20,13 @@ https_port = 443
 # Clients connect here over a TLS WebSocket (wss://).
 control_port = 4040
 
-# Dashboard UI and REST API.
+# Dashboard REST API port.
 # Note: must be different from http_port (80), https_port (443), and control_port (4040).
-# When using Docker this must match the port mapped in docker-compose.yml (8443).
 dashboard_port = 8443
+
+# CORS origin for the external dashboard UI on Vercel.
+# Must match the domain where the Next.js app is deployed.
+dashboard_origin = "https://dashboard.rustunnel.com"
 
 # ── TLS ───────────────────────────────────────────────────────────────────────
 [tls]

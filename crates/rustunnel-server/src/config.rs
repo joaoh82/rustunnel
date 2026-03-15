@@ -26,10 +26,17 @@ pub struct ServerSection {
     /// Port the dashboard HTTP API listens on (default 4040)
     #[serde(default = "default_dashboard_port")]
     pub dashboard_port: u16,
+    /// Allowed CORS origin for the external dashboard (e.g. "https://dashboard.rustunnel.com")
+    #[serde(default = "default_dashboard_origin")]
+    pub dashboard_origin: String,
 }
 
 fn default_dashboard_port() -> u16 {
     4040
+}
+
+fn default_dashboard_origin() -> String {
+    "http://localhost:3000".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,6 +159,7 @@ impl Default for ServerConfig {
                 https_port: 8443,
                 control_port: 9000,
                 dashboard_port: 4040,
+                dashboard_origin: "http://localhost:3000".to_string(),
             },
             tls: TlsSection {
                 cert_path: "cert.pem".to_string(),
