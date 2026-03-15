@@ -20,9 +20,10 @@ https_port = 443
 # Clients connect here over a TLS WebSocket (wss://).
 control_port = 4040
 
-# Dashboard REST API port.
-# Note: must be different from http_port (80), https_port (443), and control_port (4040).
-dashboard_port = 8443
+# Dashboard REST API port — internal only, not exposed directly.
+# nginx proxies https://edge.rustunnel.com:8443 → http://127.0.0.1:<dashboard_port>
+# See deploy/nginx/rustunnel-dashboard for the nginx config.
+dashboard_port = 4041
 
 # CORS origin for the external dashboard UI on Vercel.
 # Must match the domain where the Next.js app is deployed.
