@@ -43,6 +43,7 @@ You can self-host or use our managed service.
 - [Config file reference (server)](#config-file-reference-server)
 - [REST API](#rest-api)
 - [AI agent integration (MCP server)](#ai-agent-integration-mcp-server)
+  - [OpenClaw skill](#openclaw-skill)
 - [Monitoring](#monitoring)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
@@ -887,6 +888,42 @@ sudo install -m755 target/release/rustunnel-mcp /usr/local/bin/rustunnel-mcp
 
 Full setup guide, configuration options, and workflow examples are in
 [**docs/mcp-server.md**](docs/mcp-server.md).
+
+### OpenClaw skill
+
+rustunnel ships an [OpenClaw](https://openclaw.dev) skill that gives any
+OpenClaw-compatible AI agent first-class knowledge of rustunnel — config file
+format, authentication, tool signatures, and common workflows — without you
+having to explain it.
+
+**Skill file:** [`skills/rustunnel/SKILL.md`](skills/rustunnel/SKILL.md)
+
+**What it covers:**
+
+| Topic | Details |
+|-------|---------|
+| Config file | Location (`~/.rustunnel/config.yml`), format, named tunnels |
+| First-time setup | `rustunnel setup` wizard or manual config creation |
+| MCP tools | `create_tunnel`, `list_tunnels`, `close_tunnel`, `get_connection_info`, `get_tunnel_history` |
+| Workflows | Webhook testing, demo sharing, cloud sandbox (no subprocess), named tunnels |
+| Security | Token handling, file permissions, HTTPS-only transport |
+
+**To load the skill in Claude Code:**
+
+```bash
+/skills load skills/rustunnel/SKILL.md
+```
+
+Once loaded, you can ask the agent things like:
+
+> "Expose my local port 3000 as an HTTPS tunnel using rustunnel."
+
+> "List my active tunnels and close the one forwarding port 5432."
+
+> "Set up my rustunnel config file with my token."
+
+The skill instructs the agent to read credentials from `~/.rustunnel/config.yml`
+automatically, so you won't be prompted for your token on every invocation.
 
 ---
 
