@@ -1,0 +1,23 @@
+# Maintainers
+
+This file lists the maintainers of the rustunnel project.
+
+## Active Maintainers
+
+| Name                       | GitHub         | Role            |
+|----------------------------|----------------|-----------------|
+| João Henrique Machado Silva | @joaoh82       | Lead Maintainer |
+
+## Responsibilities
+
+Maintainers are responsible for:
+
+- Reviewing and merging pull requests
+- Triaging issues and bug reports
+- Cutting releases and managing versioning
+- Upholding the project's code quality and direction
+
+## Contributing
+
+If you are interested in contributing, please read the contributing guidelines
+in README.md and open an issue or pull request on GitHub.
