@@ -22,13 +22,6 @@
   3. git tag v0.3.0
   4. git push && git push --tags
  
- # On your local machine:
- ```sh
-  npm run build           # builds + copies to assets/
-  git add crates/rustunnel-server/src/dashboard/assets/
-  git commit -m "chore: rebuild dashboard assets"
-  git push
-  ```
 
 # On the server (or build machine):
 
