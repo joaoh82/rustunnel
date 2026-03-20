@@ -34,8 +34,8 @@ use rustunnel_server::control::mux::WsCompat;
 
 use rustunnel_protocol::{decode_frame, encode_frame, ControlFrame, TunnelProtocol};
 use rustunnel_server::config::{
-    AuthSection, DatabaseSection, LimitsSection, LoggingSection, ServerConfig, ServerSection,
-    TlsSection,
+    AuthSection, DatabaseSection, LimitsSection, LoggingSection, RegionSection, ServerConfig,
+    ServerSection, TlsSection,
 };
 use rustunnel_server::core::TunnelCore;
 use rustunnel_server::tls::acme::build_tls_config;
@@ -255,6 +255,11 @@ impl TestServer {
                 request_body_max_bytes: 1024 * 1024,
                 tcp_port_range: [tcp_low, tcp_high],
             },
+            region: RegionSection {
+                id: "test".to_string(),
+                name: "Test Region".to_string(),
+                location: "localhost".to_string(),
+            },
         });
 
         // Database.
@@ -348,6 +353,11 @@ impl TestServer {
                     admin_token,
                     rustunnel_server::audit::noop_audit(),
                     "http://localhost:3000".to_string(),
+                    rustunnel_server::config::RegionSection {
+                        id: "test".to_string(),
+                        name: "Test Region".to_string(),
+                        location: "localhost".to_string(),
+                    },
                 )
                 .await;
             }

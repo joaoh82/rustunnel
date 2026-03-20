@@ -19,6 +19,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::info;
 
 use crate::audit::AuditTx;
+use crate::config::RegionSection;
 use crate::core::TunnelCore;
 use crate::db::Db;
 use crate::edge::capture::CaptureEvent;
@@ -36,6 +37,8 @@ use capture::start_capture_service;
 /// * `admin_token`      — admin bearer token from config
 /// * `audit_tx`         — audit event sender
 /// * `dashboard_origin` — allowed CORS origin for the external dashboard UI
+/// * `region`           — identity of this server instance
+#[allow(clippy::too_many_arguments)]
 pub async fn run_dashboard(
     addr: SocketAddr,
     core: Arc<TunnelCore>,
@@ -44,6 +47,7 @@ pub async fn run_dashboard(
     admin_token: String,
     audit_tx: AuditTx,
     dashboard_origin: String,
+    region: RegionSection,
 ) -> Result<()> {
     let capture_store = start_capture_service(capture_rx, db.local.clone());
 
@@ -53,6 +57,7 @@ pub async fn run_dashboard(
         capture: capture_store,
         admin_token,
         audit_tx,
+        region,
     };
 
     // ── CORS ──────────────────────────────────────────────────────────────────

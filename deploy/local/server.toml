@@ -32,3 +32,8 @@ rate_limit_rps             = 1000
 ip_rate_limit_rps          = 0        # 0 = disabled locally
 request_body_max_bytes     = 10485760 # 10 MB
 tcp_port_range             = [20000, 20099]
+
+[region]
+id       = "local"
+name     = "Local Dev"
+location = "localhost"

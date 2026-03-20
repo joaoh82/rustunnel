@@ -61,7 +61,7 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use models::{Token, TokenWithCount, TunnelLogEntry};
+use models::{Region, Token, TokenWithCount, TunnelLogEntry};
 
 /// Hash a raw token value with SHA-256.
 pub fn hash_token(raw: &str) -> String {
@@ -161,12 +161,13 @@ pub async fn log_tunnel_registered(
     label: &str,
     session_id: &str,
     token_id: Option<&str>,
+    region_id: &str,
 ) -> Result<()> {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO tunnel_log \
-             (id, tunnel_id, protocol, label, session_id, token_id, registered_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (id, tunnel_id, protocol, label, session_id, token_id, registered_at, region_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(&id)
     .bind(tunnel_id)
@@ -175,6 +176,7 @@ pub async fn log_tunnel_registered(
     .bind(session_id)
     .bind(token_id)
     .bind(Utc::now())
+    .bind(region_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -247,6 +249,21 @@ pub async fn list_tunnel_history(
         .fetch_all(pool)
         .await?
     };
+    Ok(rows)
+}
+
+// ── region helpers ────────────────────────────────────────────────────────────
+
+/// Return all active regions ordered by id.
+pub async fn list_regions(pool: &PgPool) -> Result<Vec<Region>> {
+    let rows: Vec<Region> = sqlx::query_as(
+        "SELECT id, name, location, host, control_port, active \
+         FROM regions \
+         WHERE active = true \
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 

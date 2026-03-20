@@ -219,6 +219,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let admin_token = config.auth.admin_token.clone();
         let dashboard_origin = config.server.dashboard_origin.clone();
         let audit_tx = audit_tx.clone();
+        let region = config.region.clone();
         tokio::spawn(async move {
             if let Err(e) = run_dashboard(
                 dashboard_addr,
@@ -228,6 +229,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
                 admin_token,
                 audit_tx,
                 dashboard_origin,
+                region,
             )
             .await
             {
@@ -391,6 +393,12 @@ fn print_banner(config: &ServerConfig) {
     let https_port = config.server.https_port;
     let dash_port = config.server.dashboard_port;
     let dash_url = format!("http://localhost:{dash_port}");
+    let region_id = &config.region.id;
+    let region_loc = if config.region.location.is_empty() {
+        "—".to_string()
+    } else {
+        config.region.location.clone()
+    };
 
     println!();
     println!("  ██████╗ ██╗   ██╗███████╗████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗     ");
@@ -403,6 +411,8 @@ fn print_banner(config: &ServerConfig) {
     println!("  ┌─────────────────────────────────────────────────┐");
     println!("  │  rustunnel-server v{VERSION:<30}│");
     println!("  ├─────────────────────────────────────────────────┤");
+    println!("  │  Region    {region_id:<39}│");
+    println!("  │  Location  {region_loc:<39}│");
     println!("  │  Domain    {domain:<39}│");
     println!("  │  Control   :{ctrl_port:<38}│");
     println!("  │  HTTP      :{http_port:<38}│");

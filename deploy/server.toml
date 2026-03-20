@@ -91,6 +91,16 @@ format = "json"
 # token create/delete, and admin actions.  Comment out to disable.
 audit_log_path = "/var/lib/rustunnel/audit.log"
 
+# ── Region ────────────────────────────────────────────────────────────────────
+# Identity of this server instance within the multi-region fleet.
+# The id must match a row in the `regions` table (seeded by migration 0004).
+# Omit this section entirely for single-server / self-hosted deployments.
+# TODO: set id, name, and location for this server.
+[region]
+id       = "eu"
+name     = "Europe"
+location = "Helsinki, FI"
+
 # ── Limits ────────────────────────────────────────────────────────────────────
 [limits]
 # Maximum tunnels a single authenticated session may hold simultaneously.
