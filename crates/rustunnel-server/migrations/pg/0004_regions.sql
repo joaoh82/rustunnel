@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS regions (
 -- Seed the three planned regions.  INSERT ... ON CONFLICT DO NOTHING so
 -- re-running migrations on an existing database is a no-op.
 INSERT INTO regions (id, name, location, host) VALUES
-    ('eu', 'Europe',       'Falkenstein, DE', 'eu.edge.rustunnel.com'),
-    ('us', 'US East',      'Ashburn, VA',     'us.edge.rustunnel.com'),
-    ('ap', 'Asia Pacific', 'Singapore',       'ap.edge.rustunnel.com')
+    ('eu', 'Europe',       'Helsinki, FI',  'eu.edge.rustunnel.com'),
+    ('us', 'US East',      'Ashburn, VA',   'us.edge.rustunnel.com'),
+    ('ap', 'Asia Pacific', 'Singapore',     'ap.edge.rustunnel.com')
 ON CONFLICT (id) DO NOTHING;

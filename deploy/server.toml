@@ -99,7 +99,7 @@ audit_log_path = "/var/lib/rustunnel/audit.log"
 [region]
 id       = "eu"
 name     = "Europe"
-location = "Falkenstein, DE"
+location = "Helsinki, FI"
 
 # ── Limits ────────────────────────────────────────────────────────────────────
 [limits]
