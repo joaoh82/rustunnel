@@ -14,7 +14,7 @@ COPY dashboard-ui/ ./
 RUN npx next build
 
 # ── Stage 2: build Rust server ────────────────────────────────────────────────
-FROM rust:slim-bookworm AS builder
+FROM rust:1.94.0-slim-bookworm AS builder
 
 WORKDIR /build
 
