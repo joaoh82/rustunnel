@@ -452,6 +452,7 @@ where
                                 &sub,
                                 &session_id.to_string(),
                                 db_token_id.as_deref(),
+                                &config.region.id,
                             )
                             .await;
                             send_frame(
@@ -494,6 +495,7 @@ where
                             &port_str,
                             &session_id.to_string(),
                             db_token_id.as_deref(),
+                            &config.region.id,
                         )
                         .await;
                         send_frame(

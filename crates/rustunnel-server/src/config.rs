@@ -11,6 +11,9 @@ pub struct ServerConfig {
     pub database: DatabaseSection,
     pub logging: LoggingSection,
     pub limits: LimitsSection,
+    /// Region identity for this server instance.
+    #[serde(default)]
+    pub region: RegionSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +102,39 @@ pub struct DatabaseSection {
 
 fn default_captured_db_path() -> String {
     "/var/lib/rustunnel/captured.db".to_string()
+}
+
+/// Identity of this server instance within the multi-region fleet.
+///
+/// Optional — omit the `[region]` section entirely for single-server deployments.
+/// When present the `id` is stamped on every `tunnel_log` row and returned in
+/// `GET /api/status` and `GET /api/regions` so the dashboard can route
+/// captured-request queries back to the correct regional server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegionSection {
+    /// Short identifier matching a row in the `regions` table (e.g. `"eu"`).
+    #[serde(default = "default_region_id")]
+    pub id: String,
+    /// Human-readable region name (e.g. `"Europe"`).
+    #[serde(default)]
+    pub name: String,
+    /// Data-centre location (e.g. `"Falkenstein, DE"`).
+    #[serde(default)]
+    pub location: String,
+}
+
+fn default_region_id() -> String {
+    "default".to_string()
+}
+
+impl Default for RegionSection {
+    fn default() -> Self {
+        Self {
+            id: default_region_id(),
+            name: String::new(),
+            location: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -193,6 +229,11 @@ impl Default for ServerConfig {
                 ip_rate_limit_rps: 1000,
                 request_body_max_bytes: 10 * 1024 * 1024,
                 tcp_port_range: [20000, 20099],
+            },
+            region: RegionSection {
+                id: "test".to_string(),
+                name: "Test Region".to_string(),
+                location: "localhost".to_string(),
             },
         }
     }

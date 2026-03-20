@@ -67,6 +67,17 @@ pub struct TunnelLogEntry {
     pub unregistered_at: Option<DateTime<Utc>>,
 }
 
+/// A row from the `regions` table.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Region {
+    pub id: String,
+    pub name: String,
+    pub location: String,
+    pub host: String,
+    pub control_port: i32,
+    pub active: bool,
+}
+
 /// A single captured HTTP request/response pair.
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct CapturedRequest {

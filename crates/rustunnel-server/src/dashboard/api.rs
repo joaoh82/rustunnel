@@ -33,6 +33,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
 use crate::audit::{AuditEvent, AuditTx};
+use crate::config::RegionSection;
 use crate::core::TunnelCore;
 use crate::dashboard::capture::{load_requests_from_db, CaptureStore};
 use crate::db::{self, Db};
@@ -46,6 +47,7 @@ pub struct ApiState {
     pub capture: CaptureStore,
     pub admin_token: String,
     pub audit_tx: AuditTx,
+    pub region: RegionSection,
 }
 
 // ── router ────────────────────────────────────────────────────────────────────
@@ -59,6 +61,7 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         // public
         .route("/api/status", get(status_handler))
+        .route("/api/regions", get(regions_handler))
         .route("/api/openapi.json", get(openapi_spec))
         // authenticated
         .route("/api/tunnels", get(list_tunnels))
@@ -134,8 +137,16 @@ fn not_found(msg: &str) -> (StatusCode, Json<ErrBody>) {
 // ── handlers ──────────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
+struct RegionInfo {
+    id: String,
+    name: String,
+    location: String,
+}
+
+#[derive(Serialize)]
 struct StatusResponse {
     ok: bool,
+    region: RegionInfo,
     active_sessions: usize,
     active_tunnels: usize,
 }
@@ -143,9 +154,36 @@ struct StatusResponse {
 async fn status_handler(State(state): State<ApiState>) -> impl IntoResponse {
     Json(StatusResponse {
         ok: true,
+        region: RegionInfo {
+            id: state.region.id.clone(),
+            name: state.region.name.clone(),
+            location: state.region.location.clone(),
+        },
         active_sessions: state.core.sessions.len(),
         active_tunnels: state.core.http_routes.len() + state.core.tcp_routes.len(),
     })
+}
+
+// ── regions ───────────────────────────────────────────────────────────────────
+
+/// `GET /api/regions` — list all active regions from the shared database.
+///
+/// No authentication required: the region list is used by the client for
+/// auto-select before a token has been obtained.
+async fn regions_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    match db::list_regions(&state.db.pg).await {
+        Ok(regions) => Json(regions).into_response(),
+        Err(e) => {
+            warn!("failed to list regions: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrBody {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ── tunnels ───────────────────────────────────────────────────────────────────
