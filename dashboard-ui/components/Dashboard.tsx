@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import type { Tunnel, CapturedRequest } from '@/lib/types';
 import { makeApi } from '@/lib/api';
 import { useServerStatus } from '@/hooks/useServerStatus';
@@ -24,7 +24,7 @@ export default function Dashboard() {
     setToken(localStorage.getItem('rt_token'));
   }, []);
 
-  const api = makeApi(token);
+  const api = useMemo(() => makeApi(token), [token]);
   const status = useServerStatus();
   const { tunnels, error: tunnelErr, refresh: refreshTunnels } = useTunnels(api, !!token);
   const [selectedTunnel, setSelectedTunnel] = useState<Tunnel | null>(null);

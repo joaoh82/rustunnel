@@ -14,7 +14,7 @@ COPY dashboard-ui/ ./
 RUN npx next build
 
 # ── Stage 2: build Rust server ────────────────────────────────────────────────
-FROM rust:1.83-slim-bookworm AS builder
+FROM rust:slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -30,16 +30,22 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/rustunnel-protocol/Cargo.toml crates/rustunnel-protocol/
 COPY crates/rustunnel-server/Cargo.toml   crates/rustunnel-server/
 COPY crates/rustunnel-client/Cargo.toml   crates/rustunnel-client/
+COPY crates/rustunnel-mcp/Cargo.toml     crates/rustunnel-mcp/
+COPY tests/Cargo.toml                    tests/
 
 # Stub sources so cargo can resolve and compile all dependencies.
 RUN mkdir -p \
         crates/rustunnel-protocol/src \
         crates/rustunnel-server/src \
-        crates/rustunnel-client/src && \
+        crates/rustunnel-client/src \
+        crates/rustunnel-mcp/src \
+        tests/integration && \
+    printf '// stub' > tests/integration/stub.rs && \
     echo "pub fn _stub() {}" > crates/rustunnel-protocol/src/lib.rs && \
     echo "pub fn _stub() {}" > crates/rustunnel-server/src/lib.rs  && \
     printf 'fn main() {}' > crates/rustunnel-server/src/main.rs    && \
-    printf 'fn main() {}' > crates/rustunnel-client/src/main.rs
+    printf 'fn main() {}' > crates/rustunnel-client/src/main.rs    && \
+    printf 'fn main() {}' > crates/rustunnel-mcp/src/main.rs
 
 RUN cargo build --release -p rustunnel-server
 
