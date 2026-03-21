@@ -199,13 +199,8 @@ async fn run_start(args: StartArgs) -> error::Result<()> {
 
     // Apply region from config (no CLI --region flag for `start`).
     if cfg.region.is_some() {
-        cfg.server = regions::resolve_server(
-            &cfg.server,
-            None,
-            cfg.region.as_deref(),
-            cfg.insecure,
-        )
-        .await;
+        cfg.server =
+            regions::resolve_server(&cfg.server, None, cfg.region.as_deref(), cfg.insecure).await;
     }
 
     cfg.validate()?;

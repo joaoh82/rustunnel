@@ -91,7 +91,10 @@ fn load_cache() -> Option<Vec<RegionInfo>> {
 
 fn save_cache(regions: &[RegionInfo]) {
     let Some(path) = cache_path() else { return };
-    let cache = RegionCache { fetched_at: Utc::now(), regions: regions.to_vec() };
+    let cache = RegionCache {
+        fetched_at: Utc::now(),
+        regions: regions.to_vec(),
+    };
     if let Ok(json) = serde_json::to_string_pretty(&cache) {
         let _ = std::fs::write(path, json);
     }
