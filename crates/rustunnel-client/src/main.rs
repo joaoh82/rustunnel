@@ -12,6 +12,7 @@ mod display;
 mod error;
 mod proxy;
 mod reconnect;
+mod regions;
 
 use std::path::PathBuf;
 
@@ -73,6 +74,11 @@ struct TunnelArgs {
     /// Local hostname to forward to
     #[arg(long, default_value = "localhost")]
     local_host: String,
+
+    /// Region to connect to: eu, us, ap, or auto (probe nearest).
+    /// Ignored if --server is specified.
+    #[arg(long)]
+    region: Option<String>,
 
     /// Disable automatic reconnection on failure
     #[arg(long)]
@@ -146,7 +152,28 @@ async fn run(cli: Cli) -> error::Result<()> {
 
 async fn run_tunnel(proto: &str, args: TunnelArgs) -> error::Result<()> {
     let mut cfg = ClientConfig::load_default()?;
-    cfg.apply_overrides(args.server, args.token, args.insecure);
+
+    // Token and insecure apply unconditionally.
+    if let Some(t) = args.token {
+        cfg.auth_token = Some(t);
+    }
+    if args.insecure {
+        cfg.insecure = true;
+    }
+
+    // Server resolution: explicit --server wins; otherwise use region logic.
+    if let Some(explicit) = args.server {
+        cfg.server = explicit;
+    } else {
+        cfg.server = regions::resolve_server(
+            &cfg.server,
+            args.region.as_deref(),
+            cfg.region.as_deref(),
+            cfg.insecure,
+        )
+        .await;
+    }
+
     cfg.validate()?;
 
     let tunnels = vec![TunnelDef::from_cli(
@@ -165,10 +192,17 @@ async fn run_tunnel(proto: &str, args: TunnelArgs) -> error::Result<()> {
 }
 
 async fn run_start(args: StartArgs) -> error::Result<()> {
-    let cfg = match args.config {
+    let mut cfg = match args.config {
         Some(path) => ClientConfig::load_from(&path)?,
         None => ClientConfig::load_default()?,
     };
+
+    // Apply region from config (no CLI --region flag for `start`).
+    if cfg.region.is_some() {
+        cfg.server =
+            regions::resolve_server(&cfg.server, None, cfg.region.as_deref(), cfg.insecure).await;
+    }
+
     cfg.validate()?;
 
     if cfg.tunnels.is_empty() {
@@ -243,6 +277,14 @@ async fn run_setup() -> error::Result<()> {
     let token_input = term.read_line()?;
     let auth_token = token_input.trim().to_string();
 
+    // Region prompt
+    term.write_line("Region [auto / eu / us / ap] (default: auto): ")?;
+    let region_input = term.read_line()?;
+    let region = match region_input.trim() {
+        "" | "auto" => "auto".to_string(),
+        r => r.to_string(),
+    };
+
     // Build config file contents
     let auth_token_line = if auth_token.is_empty() {
         "# auth_token: your-token-here".to_string()
@@ -256,6 +298,7 @@ async fn run_setup() -> error::Result<()> {
 
 server: {server}
 {auth_token_line}
+region: {region}
 
 # tunnels:
 #   web:
