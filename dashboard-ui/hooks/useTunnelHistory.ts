@@ -5,20 +5,41 @@ import type { ApiClient, TunnelLogEntry } from '@/lib/types';
 
 const PAGE_SIZE = 25;
 
-export function useTunnelHistory(api: ApiClient, enabled: boolean) {
+export type SortBy = 'started' | 'duration' | 'protocol';
+export type SortDir = 'asc' | 'desc';
+export type ActiveFilter = 'all' | 'active' | 'closed';
+export type ProtocolFilter = 'all' | 'http' | 'tcp';
+
+interface Options {
+  /** Lock the hook to a specific token ID — used for token drill-down. */
+  tokenId?: string;
+}
+
+export function useTunnelHistory(api: ApiClient, enabled: boolean, options: Options = {}) {
   const [entries, setEntries] = useState<TunnelLogEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
-  const [protocol, setProtocol] = useState<'all' | 'http' | 'tcp'>('all');
+  const [protocol, setProtocol] = useState<ProtocolFilter>('all');
+  const [activeFilter, setActiveFilter] = useState<ActiveFilter>('all');
+  const [sortBy, setSortBy] = useState<SortBy>('started');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const { tokenId } = options;
+
   // Keep a ref to avoid stale closures in the interval.
-  const stateRef = useRef({ offset, protocol });
-  stateRef.current = { offset, protocol };
+  const stateRef = useRef({ offset, protocol, activeFilter, sortBy, sortDir });
+  stateRef.current = { offset, protocol, activeFilter, sortBy, sortDir };
 
   const fetch = useCallback(
-    async (nextOffset: number, nextProtocol: 'all' | 'http' | 'tcp') => {
+    async (
+      nextOffset: number,
+      nextProtocol: ProtocolFilter,
+      nextActive: ActiveFilter,
+      nextSortBy: SortBy,
+      nextSortDir: SortDir,
+    ) => {
       if (!enabled) return;
       setLoading(true);
       setError(null);
@@ -26,8 +47,13 @@ export function useTunnelHistory(api: ApiClient, enabled: boolean) {
         const params = new URLSearchParams({
           limit: String(PAGE_SIZE),
           offset: String(nextOffset),
+          sort_by: nextSortBy,
+          sort_dir: nextSortDir,
         });
         if (nextProtocol !== 'all') params.set('protocol', nextProtocol);
+        if (nextActive === 'active') params.set('active', 'true');
+        if (nextActive === 'closed') params.set('active', 'false');
+        if (tokenId) params.set('token_id', tokenId);
 
         const data = (await api.get(`/api/history?${params}`)) as {
           entries: TunnelLogEntry[];
@@ -41,19 +67,20 @@ export function useTunnelHistory(api: ApiClient, enabled: boolean) {
         setLoading(false);
       }
     },
-    [api, enabled],
+    [api, enabled, tokenId],
   );
 
-  // Re-fetch when offset or protocol changes.
+  // Re-fetch when any filter/sort changes.
   useEffect(() => {
-    fetch(offset, protocol);
-  }, [fetch, offset, protocol]);
+    fetch(offset, protocol, activeFilter, sortBy, sortDir);
+  }, [fetch, offset, protocol, activeFilter, sortBy, sortDir]);
 
   // Polling: re-fetch the current page every 10 s.
   useEffect(() => {
     if (!enabled) return;
     const id = setInterval(() => {
-      fetch(stateRef.current.offset, stateRef.current.protocol);
+      const s = stateRef.current;
+      fetch(s.offset, s.protocol, s.activeFilter, s.sortBy, s.sortDir);
     }, 10_000);
     return () => clearInterval(id);
   }, [fetch, enabled]);
@@ -66,8 +93,23 @@ export function useTunnelHistory(api: ApiClient, enabled: boolean) {
     setOffset((o) => o + PAGE_SIZE);
   }
 
-  function changeProtocol(p: 'all' | 'http' | 'tcp') {
+  function changeProtocol(p: ProtocolFilter) {
     setProtocol(p);
+    setOffset(0);
+  }
+
+  function changeActiveFilter(a: ActiveFilter) {
+    setActiveFilter(a);
+    setOffset(0);
+  }
+
+  function toggleSort(col: SortBy) {
+    if (sortBy === col) {
+      setSortDir((d) => (d === 'desc' ? 'asc' : 'desc'));
+    } else {
+      setSortBy(col);
+      setSortDir('desc');
+    }
     setOffset(0);
   }
 
@@ -81,6 +123,11 @@ export function useTunnelHistory(api: ApiClient, enabled: boolean) {
     error,
     protocol,
     changeProtocol,
+    activeFilter,
+    changeActiveFilter,
+    sortBy,
+    sortDir,
+    toggleSort,
     page,
     totalPages,
     prevPage,

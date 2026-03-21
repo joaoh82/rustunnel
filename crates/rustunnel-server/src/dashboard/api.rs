@@ -686,12 +686,30 @@ struct HistoryQuery {
     limit: i64,
     #[serde(default)]
     offset: i64,
-    /// Optional filter: "http" or "tcp".
+    /// Filter by protocol: "http" or "tcp".
     protocol: Option<String>,
+    /// Filter by API token ID.
+    token_id: Option<String>,
+    /// Filter by status: true = active (open), false = closed.
+    active: Option<bool>,
+    /// Sort column: "started" (default), "duration", or "protocol".
+    #[serde(default = "default_sort_by")]
+    sort_by: String,
+    /// Sort direction: "desc" (default) or "asc".
+    #[serde(default = "default_sort_dir")]
+    sort_dir: String,
 }
 
 fn default_history_limit() -> i64 {
     50
+}
+
+fn default_sort_by() -> String {
+    "started".to_string()
+}
+
+fn default_sort_dir() -> String {
+    "desc".to_string()
 }
 
 #[derive(Serialize)]
@@ -710,10 +728,20 @@ async fn tunnel_history(
     }
 
     let proto = q.protocol.as_deref();
+    let token_id = q.token_id.as_deref();
 
     let (entries, total) = tokio::join!(
-        db::list_tunnel_history(&state.db.pg, q.limit, q.offset, proto),
-        db::count_tunnel_history(&state.db.pg, proto),
+        db::list_tunnel_history(
+            &state.db.pg,
+            q.limit,
+            q.offset,
+            proto,
+            token_id,
+            q.active,
+            &q.sort_by,
+            &q.sort_dir,
+        ),
+        db::count_tunnel_history(&state.db.pg, proto, token_id, q.active),
     );
 
     match (entries, total) {
