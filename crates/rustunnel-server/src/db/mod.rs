@@ -211,44 +211,54 @@ pub async fn log_tunnel_unregistered(pool: &PgPool, tunnel_id: &str) -> Result<(
 
 // ── tunnel history helpers ────────────────────────────────────────────────────
 
-/// Return a page of tunnel history rows, newest first.
+/// Return a page of tunnel history rows.
+///
+/// Filters: `protocol` ("http"/"tcp"), `token_id`, `active` (true = open, false = closed).
+/// Sorting: `sort_by` ("started"/"duration"/"protocol") × `sort_dir` ("asc"/"desc").
+///
+/// The ORDER BY clause is built from validated match arms — not raw user input —
+/// so format! here does not introduce SQL injection risk.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_tunnel_history(
     pool: &PgPool,
     limit: i64,
     offset: i64,
     protocol: Option<&str>,
+    token_id: Option<&str>,
+    active: Option<bool>,
+    sort_by: &str,
+    sort_dir: &str,
 ) -> Result<Vec<TunnelLogEntry>> {
-    let rows: Vec<TunnelLogEntry> = if let Some(proto) = protocol {
-        sqlx::query_as(
-            "SELECT tl.id, tl.tunnel_id, tl.protocol, tl.label, tl.session_id, \
-                    tl.token_id, t.label AS token_label, \
-                    tl.registered_at, tl.unregistered_at \
-             FROM tunnel_log tl \
-             LEFT JOIN tokens t ON t.id = tl.token_id \
-             WHERE tl.protocol = $1 \
-             ORDER BY tl.registered_at DESC \
-             LIMIT $2 OFFSET $3",
-        )
-        .bind(proto)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT tl.id, tl.tunnel_id, tl.protocol, tl.label, tl.session_id, \
-                    tl.token_id, t.label AS token_label, \
-                    tl.registered_at, tl.unregistered_at \
-             FROM tunnel_log tl \
-             LEFT JOIN tokens t ON t.id = tl.token_id \
-             ORDER BY tl.registered_at DESC \
-             LIMIT $1 OFFSET $2",
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?
+    let order_col = match sort_by {
+        "duration" => "COALESCE(tl.unregistered_at, now()) - tl.registered_at",
+        "protocol" => "tl.protocol",
+        _ => "tl.registered_at", // "started" is the default
     };
+    let order_dir = if sort_dir == "asc" { "ASC" } else { "DESC" };
+
+    let sql = format!(
+        "SELECT tl.id, tl.tunnel_id, tl.protocol, tl.label, tl.session_id, \
+                tl.token_id, t.label AS token_label, \
+                tl.registered_at, tl.unregistered_at \
+         FROM tunnel_log tl \
+         LEFT JOIN tokens t ON t.id = tl.token_id \
+         WHERE ($1::text IS NULL OR tl.protocol = $1) \
+           AND ($2::text IS NULL OR tl.token_id = $2) \
+           AND ($3::boolean IS NULL \
+                OR ($3 = true  AND tl.unregistered_at IS NULL) \
+                OR ($3 = false AND tl.unregistered_at IS NOT NULL)) \
+         ORDER BY {order_col} {order_dir} \
+         LIMIT $4 OFFSET $5"
+    );
+
+    let rows: Vec<TunnelLogEntry> = sqlx::query_as(&sql)
+        .bind(protocol)
+        .bind(token_id)
+        .bind(active)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
@@ -267,17 +277,25 @@ pub async fn list_regions(pool: &PgPool) -> Result<Vec<Region>> {
     Ok(rows)
 }
 
-/// Total number of tunnel_log rows matching an optional protocol filter.
-pub async fn count_tunnel_history(pool: &PgPool, protocol: Option<&str>) -> Result<i64> {
-    let count: (i64,) = if let Some(proto) = protocol {
-        sqlx::query_as("SELECT COUNT(*) FROM tunnel_log WHERE protocol = $1")
-            .bind(proto)
-            .fetch_one(pool)
-            .await?
-    } else {
-        sqlx::query_as("SELECT COUNT(*) FROM tunnel_log")
-            .fetch_one(pool)
-            .await?
-    };
+/// Total number of tunnel_log rows matching the given filters.
+pub async fn count_tunnel_history(
+    pool: &PgPool,
+    protocol: Option<&str>,
+    token_id: Option<&str>,
+    active: Option<bool>,
+) -> Result<i64> {
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM tunnel_log tl \
+         WHERE ($1::text IS NULL OR tl.protocol = $1) \
+           AND ($2::text IS NULL OR tl.token_id = $2) \
+           AND ($3::boolean IS NULL \
+                OR ($3 = true  AND tl.unregistered_at IS NULL) \
+                OR ($3 = false AND tl.unregistered_at IS NOT NULL))",
+    )
+    .bind(protocol)
+    .bind(token_id)
+    .bind(active)
+    .fetch_one(pool)
+    .await?;
     Ok(count.0)
 }
