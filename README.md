@@ -54,15 +54,17 @@ You can self-host or use our managed service.
 
 ## Hosted service
 
-You can use rustunnel without running your own server. We operate a public edge server at **`edge.rustunnel.com`** that you can connect to immediately.
+You can use rustunnel without running your own server. We operate a global fleet of public edge servers that you can connect to immediately.
 
-### Available servers
+### Available regions
 
-| Server | Region | Control plane | Status |
-|--------|--------|---------------|--------|
-| `edge.rustunnel.com` | Europe (Helsinki) | `:4040` | Live |
+| Region ID | Server | Location | Control plane | Status |
+|-----------|--------|----------|---------------|--------|
+| `eu` | `eu.edge.rustunnel.com` | Helsinki, FI | `:4040` | Live |
+| `us` | `us.edge.rustunnel.com` | Hillsboro, OR | `:4040` | Live |
+| `ap` | `ap.edge.rustunnel.com` | Singapore | `:4040` | Live |
 
-More regions are coming — follow the project for updates.
+The client auto-selects the nearest region by default. Use `--region <id>` to connect to a specific one. The legacy address `edge.rustunnel.com` is a CNAME to `eu.edge.rustunnel.com` and will continue to work for backward compatibility.
 
 ### Getting an auth token
 
@@ -80,15 +82,19 @@ Once you have a token, run the setup wizard:
 
 ```bash
 rustunnel setup
-# Server address [edge.rustunnel.com:4040]: (press Enter)
+# Tunnel server address [edge.rustunnel.com:4040]: (press Enter)
 # Auth token: <paste your token>
+# Region [auto / eu / us / ap] (default: auto): (press Enter)
 ```
 
 Then expose a local service:
 
 ```bash
-# HTTP tunnel — get a public HTTPS URL for your local port 3000
+# HTTP tunnel — auto-selects the nearest region
 rustunnel http 3000
+
+# Connect to a specific region
+rustunnel http 3000 --region eu
 
 # Custom subdomain
 rustunnel http 3000 --subdomain myapp
@@ -100,7 +106,8 @@ rustunnel tcp 5432
 The client prints the public URL as soon as the tunnel is established:
 
 ```
-✓ tunnel open  https://abc123.edge.rustunnel.com
+  Selecting nearest region… eu 12ms · us 143ms · ap 311ms → eu (Helsinki, FI) 12ms
+✓ tunnel open  https://abc123.eu.edge.rustunnel.com
 ```
 
 ---
@@ -656,13 +663,14 @@ The easiest way to create your config file is the interactive setup wizard:
 rustunnel setup
 ```
 
-It prompts for your server address (default: `edge.rustunnel.com:4040`) and auth token, then writes `~/.rustunnel/config.yml` with a commented `tunnels:` example section.
+It prompts for your server address, auth token, and region preference, then writes `~/.rustunnel/config.yml` with a commented `tunnels:` example section.
 
 ```
 rustunnel setup — create ~/.rustunnel/config.yml
 
 Tunnel server address [edge.rustunnel.com:4040]:
 Auth token (leave blank to skip): rt_live_abc123...
+Region [auto / eu / us / ap] (default: auto):
 
 Created: /Users/you/.rustunnel/config.yml
 Run `rustunnel start` to connect using this config.
@@ -673,24 +681,29 @@ After running setup, use `rustunnel start` to connect with all tunnels defined i
 ### Quick start (CLI flags)
 
 ```bash
-# Expose a local HTTP service on port 3000
+# Expose a local HTTP service on port 3000 (auto-selects nearest region)
+rustunnel http 3000 \
+  --token YOUR_AUTH_TOKEN
+
+# Connect to a specific region
+rustunnel http 3000 --region eu --token YOUR_AUTH_TOKEN
+
+# Use an explicit server address (bypasses region selection)
 rustunnel http 3000 \
   --server edge.rustunnel.com:4040 \
   --token YOUR_AUTH_TOKEN
 
 # Expose a local service with a custom subdomain
 rustunnel http 3000 \
-  --server edge.rustunnel.com:4040 \
   --token YOUR_AUTH_TOKEN \
   --subdomain myapp
 
 # Expose a local TCP service (e.g. a PostgreSQL database)
 rustunnel tcp 5432 \
-  --server edge.rustunnel.com:4040 \
   --token YOUR_AUTH_TOKEN
 
 # Disable automatic reconnection
-rustunnel http 3000 --server edge.rustunnel.com:4040 --no-reconnect
+rustunnel http 3000 --no-reconnect
 ```
 
 ### Config file
@@ -705,6 +718,10 @@ server: edge.rustunnel.com:4040
 
 # Auth token (from server admin_token or a token created via the dashboard)
 auth_token: YOUR_AUTH_TOKEN
+
+# Region preference: auto (probe & pick nearest), or eu / us / ap.
+# Omit for self-hosted / single-server setups.
+region: auto
 
 # Named tunnels started with `rustunnel start`
 tunnels:
@@ -790,6 +807,9 @@ curl -s -X POST http://edge.rustunnel.com:8443/api/tokens \
 | `limits.ip_rate_limit_rps` | u32 | `100` | Per-source-IP rate cap (req/s); `0` = disabled |
 | `limits.request_body_max_bytes` | usize | — | Max proxied request body size (bytes) |
 | `limits.tcp_port_range` | [u16, u16] | — | Inclusive `[low, high]` TCP tunnel port range |
+| `region.id` | string | `"default"` | Region identifier recorded in tunnel history (e.g. `"eu"`, `"us"`, `"ap"`) |
+| `region.name` | string | `"Default"` | Human-readable region name shown in the dashboard |
+| `region.location` | string | `""` | Physical location label (e.g. `"Helsinki, FI"`) |
 
 ---
 

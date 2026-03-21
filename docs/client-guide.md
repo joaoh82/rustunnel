@@ -16,11 +16,12 @@
    - [start — Multi-tunnel mode](#start--multi-tunnel-mode)
    - [token create — API token management](#token-create--api-token-management)
 5. [Flags Reference](#flags-reference)
-6. [Reconnection Behavior](#reconnection-behavior)
-7. [Terminal Output](#terminal-output)
-8. [Environment Variables](#environment-variables)
-9. [Error Reference](#error-reference)
-10. [Troubleshooting](#troubleshooting)
+6. [Region Selection](#region-selection)
+7. [Reconnection Behavior](#reconnection-behavior)
+8. [Terminal Output](#terminal-output)
+9. [Environment Variables](#environment-variables)
+10. [Error Reference](#error-reference)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -88,13 +89,17 @@ The client reads `~/.rustunnel/config.yml` automatically. CLI flags always overr
 
 ```yaml
 # Tunnel server address (required)
-server: tunnel.example.com:9000
+server: edge.rustunnel.com:4040
 
 # Authentication token (required)
 auth_token: rt_live_abc123...
 
 # Skip TLS certificate verification — local dev ONLY, never use in production
 insecure: false
+
+# Region preference: auto (probe & pick nearest), or eu / us / ap.
+# Omit for self-hosted / single-server setups.
+region: auto
 
 # Named tunnel definitions used by `rustunnel start`
 tunnels:
@@ -118,9 +123,10 @@ tunnels:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `server` | string | — | Tunnel server host:port (e.g. `tunnel.example.com:9000`) |
+| `server` | string | — | Tunnel server host:port (e.g. `edge.rustunnel.com:4040`) |
 | `auth_token` | string | — | Authentication token issued by the server |
 | `insecure` | bool | `false` | Skip TLS certificate verification (dev only) |
+| `region` | string | omit | `auto` (probe nearest), `eu`, `us`, `ap`. Omit for self-hosted setups. |
 | `tunnels` | map | `{}` | Named tunnel definitions (used by `rustunnel start`) |
 | `tunnels.<name>.proto` | string | — | `http` or `tcp` |
 | `tunnels.<name>.local_port` | integer | — | Local port to forward |
@@ -145,6 +151,7 @@ rustunnel setup
 |--------|---------|-------------|
 | Server address | `edge.rustunnel.com:4040` | The control-plane host:port to connect to |
 | Auth token | _(blank)_ | Token issued by the server; leave empty to fill in later |
+| Region | `auto` | `auto` (probe nearest), `eu`, `us`, or `ap` |
 
 **Behaviour:**
 
@@ -160,6 +167,7 @@ rustunnel setup — create ~/.rustunnel/config.yml
 
 Tunnel server address [edge.rustunnel.com:4040]:
 Auth token (leave blank to skip): rt_live_abc123xyz
+Region [auto / eu / us / ap] (default: auto):
 
 Created: /Users/alice/.rustunnel/config.yml
 Run `rustunnel start` to connect using this config.
@@ -173,6 +181,7 @@ Run `rustunnel start` to connect using this config.
 
 server: edge.rustunnel.com:4040
 auth_token: rt_live_abc123xyz
+region: auto
 
 # tunnels:
 #   web:
@@ -209,18 +218,22 @@ rustunnel http <port> [options]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--subdomain <name>` | auto-assigned | Request a specific subdomain (e.g. `myapp` → `myapp.tunnel.example.com`) |
-| `--server <host:port>` | from config | Override the server address |
+| `--subdomain <name>` | auto-assigned | Request a specific subdomain (e.g. `myapp` → `myapp.eu.edge.rustunnel.com`) |
+| `--server <host:port>` | from config | Override the server address (bypasses region selection) |
 | `--token <token>` | from config | Override the auth token |
 | `--local-host <host>` | `localhost` | Local hostname to forward to |
+| `--region <id>` | from config | Region to connect to: `eu`, `us`, `ap`, or `auto`. Ignored if `--server` is set. |
 | `--no-reconnect` | off | Exit instead of reconnecting on failure |
 | `--insecure` | off | Skip TLS verification (dev only) |
 
 **Examples:**
 
 ```bash
-# Expose port 3000 with an auto-assigned subdomain
+# Expose port 3000 — auto-selects the nearest region
 rustunnel http 3000
+
+# Connect to a specific region
+rustunnel http 3000 --region eu
 
 # Request a specific subdomain
 rustunnel http 3000 --subdomain myapp
@@ -231,7 +244,7 @@ rustunnel http 8080 --local-host 192.168.1.10
 # One-shot connection (exit on disconnect instead of reconnecting)
 rustunnel http 3000 --no-reconnect
 
-# Use a different server and token without a config file
+# Use an explicit server address (bypasses region selection)
 rustunnel http 3000 --server tunnel.example.com:9000 --token rt_live_abc123
 ```
 
@@ -251,7 +264,7 @@ rustunnel tcp <port> [options]
 |----------|-------------|
 | `<port>` | Local TCP port to forward |
 
-**Options:** Same as `http` except `--subdomain` has no effect for TCP tunnels.
+**Options:** Same as `http` except `--subdomain` has no effect for TCP tunnels. `--region` still works.
 
 **Examples:**
 
@@ -339,10 +352,11 @@ This table summarises all flags across all commands:
 
 | Flag | Commands | Description |
 |------|----------|-------------|
-| `--server <host:port>` | http, tcp | Tunnel server address |
+| `--server <host:port>` | http, tcp | Tunnel server address (bypasses region selection) |
 | `--token <token>` | http, tcp | Auth token (overrides config) |
 | `--subdomain <name>` | http | Requested HTTP subdomain |
 | `--local-host <host>` | http, tcp | Local hostname (default: `localhost`) |
+| `--region <id>` | http, tcp | Region: `eu`, `us`, `ap`, or `auto`. Ignored if `--server` is set. |
 | `--no-reconnect` | http, tcp | Exit on failure instead of reconnecting |
 | `--insecure` | http, tcp | Skip TLS certificate verification |
 | `-c, --config <path>` | start | Config file path |
@@ -352,6 +366,39 @@ This table summarises all flags across all commands:
 | `--help` | all | Print help and exit |
 
 `setup` takes no flags — all input is collected interactively.
+
+---
+
+## Region Selection
+
+rustunnel can connect to multiple edge servers in different geographic regions. The region selection logic follows this priority order:
+
+1. **`--server <host:port>`** — explicit server address always wins; region logic is skipped entirely.
+2. **`--region <id>`** — connect directly to the named region without probing.
+3. **`region: auto`** (config file or `--region auto`) — probe all regions in parallel and pick the nearest.
+4. **No region preference** — use `server:` from config as-is (backward compatible with self-hosted setups).
+
+### Available regions (hosted service)
+
+| Region ID | Location | Server |
+|-----------|----------|--------|
+| `eu` | Helsinki, FI | `eu.edge.rustunnel.com:4040` |
+| `us` | Hillsboro, OR | `us.edge.rustunnel.com:4040` |
+| `ap` | Singapore | `ap.edge.rustunnel.com:4040` |
+
+### Auto-select output
+
+When `region: auto` is active, the client probes all regions by TCP connect time and prints:
+
+```
+  Selecting nearest region… eu 12ms · us 143ms · ap 311ms → eu (Helsinki, FI) 12ms
+```
+
+Unreachable regions time out after 3 seconds and are assigned a 10-second penalty so they never win the selection.
+
+### Region list refresh
+
+The region list is cached at `~/.rustunnel/regions.json` for 24 hours. On expiry the client fetches a fresh list from `GET https://<host>:8443/api/regions`; if that fails it falls back to the hardcoded list compiled into the binary.
 
 ---
 
