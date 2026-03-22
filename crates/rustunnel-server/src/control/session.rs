@@ -15,11 +15,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::future::poll_fn;
 use futures_util::io::AsyncWriteExt;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
 use uuid::Uuid;
 
 use rustunnel_protocol::{decode_frame, encode_frame, ControlFrame, TunnelProtocol};
@@ -36,6 +36,8 @@ use crate::error::{Error, Result};
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_DEADLINE: Duration = Duration::from_secs(10);
+const DATA_PING_INTERVAL: Duration = Duration::from_secs(20);
+const DATA_PONG_DEADLINE: Duration = Duration::from_secs(10);
 const CTRL_CHANNEL_SIZE: usize = 64;
 
 // ── session context ───────────────────────────────────────────────────────────
@@ -132,8 +134,13 @@ where
             tokio::select! {
                 req = open_rx.recv() => {
                     let conn_id = match req { None => break, Some(id) => id };
-                    match poll_fn(|cx| conn.poll_new_outbound(cx)).await {
-                        Ok(mut stream) => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        poll_fn(|cx| conn.poll_new_outbound(cx)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(mut stream)) => {
                             // Spawn a separate task to write the conn_id bytes and
                             // hand the stream to the waiting edge task. This returns
                             // the driver loop to poll_next_inbound immediately so
@@ -157,7 +164,15 @@ where
                                 }
                             });
                         }
-                        Err(e) => tracing::warn!(%conn_id, "yamux open_stream: {e}"),
+                        Ok(Err(e)) => tracing::warn!(%conn_id, "yamux open_stream: {e}"),
+                        Err(_) => {
+                            // poll_new_outbound blocked — likely a yamux flow-control
+                            // deadlock (window exhausted while poll_next_inbound is not
+                            // being called). Break the deadlock and return a fast error
+                            // to the waiting edge task.
+                            tracing::warn!(%conn_id, "yamux open_stream timed out — breaking potential deadlock");
+                            core_for_driver.cancel_pending_conn(&conn_id);
+                        }
                     }
                 }
 
@@ -173,6 +188,13 @@ where
                     }
                 }
             }
+        }
+        // Drain any connection requests that arrived while the driver was
+        // exiting.  Each waiting edge task holds a oneshot receiver; removing
+        // the sender here causes RecvError immediately, so edge tasks get a
+        // fast 502 instead of waiting out the full STREAM_TIMEOUT.
+        while let Ok(conn_id) = open_rx.try_recv() {
+            core_for_driver.cancel_pending_conn(&conn_id);
         }
     });
 
@@ -380,7 +402,14 @@ where
                         // Ask the yamux driver task to open an outbound stream,
                         // write the conn_id bytes (forcing SYN), and hand the
                         // stream to the waiting edge task.
-                        let _ = open_tx.send(conn_id).await;
+                        if open_tx.send(conn_id).await.is_err() {
+                            // The driver exited (data WebSocket dropped). Cancel
+                            // the pending conn so the edge task gets a fast 502
+                            // instead of waiting out the full STREAM_TIMEOUT.
+                            tracing::warn!(%session_id, "yamux driver exited — terminating session");
+                            ctx.core.cancel_pending_conn(&conn_id);
+                            return Err(Error::Mux("yamux driver exited".into()));
+                        }
                         // Notify the client so it can correlate the arriving
                         // yamux stream with the local service to proxy.
                         send_frame(ws, &ControlFrame::NewConnection {
@@ -621,19 +650,86 @@ pub async fn handle_data_connection<S>(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    let Some(mut pipe) = pipe else {
+    let Some(pipe) = pipe else {
         tracing::warn!(%session_id, "data connection arrived but no pipe found (session unknown?)");
         return;
     };
 
     tracing::info!(%session_id, "data WebSocket connected, bridging to yamux session");
 
-    // Convert the WebSocket (message-oriented) to a byte-stream then to
-    // tokio AsyncRead+AsyncWrite, then copy bidirectionally with the pipe.
-    let mut ws_bytes = crate::control::mux::WsCompat::new(ws).compat();
+    // Bridge the WebSocket to the yamux pipe with WS-level keepalive pings.
+    // We drive the copy manually (instead of copy_bidirectional) so that we
+    // can inject periodic WebSocket Ping frames to keep NAT / load-balancer
+    // connections alive and detect silent drops within DATA_PONG_DEADLINE.
+    let (mut ws_sink, mut ws_stream) = ws.split();
+    let (mut pipe_read, mut pipe_write) = tokio::io::split(pipe);
 
-    if let Err(e) = tokio::io::copy_bidirectional(&mut ws_bytes, &mut pipe).await {
-        tracing::debug!(%session_id, "data bridge closed: {e}");
+    let mut ping_interval = tokio::time::interval(DATA_PING_INTERVAL);
+    ping_interval.tick().await; // skip the immediate first tick
+
+    let mut last_pong = tokio::time::Instant::now();
+    let mut awaiting_pong = false;
+    let mut buf = vec![0u8; 65536];
+
+    loop {
+        tokio::select! {
+            // ── data WebSocket → yamux pipe ──────────────────────────────
+            msg = ws_stream.next() => {
+                match msg {
+                    None => {
+                        tracing::debug!(%session_id, "data WebSocket closed by peer");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        tracing::debug!(%session_id, "data WebSocket error: {e}");
+                        break;
+                    }
+                    Some(Ok(Message::Binary(data))) => {
+                        if pipe_write.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        awaiting_pong = false;
+                        last_pong = tokio::time::Instant::now();
+                        tracing::trace!(%session_id, "data WS pong received");
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        tracing::debug!(%session_id, "data WebSocket close frame received");
+                        break;
+                    }
+                    Some(Ok(_)) => {} // ignore other frame types (text, ping)
+                }
+            }
+
+            // ── yamux pipe → data WebSocket ──────────────────────────────
+            n = pipe_read.read(&mut buf) => {
+                match n {
+                    Ok(0) | Err(_) => {
+                        tracing::debug!(%session_id, "yamux pipe closed");
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        if ws_sink.send(Message::Binary(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // ── keepalive ping ───────────────────────────────────────────
+            _ = ping_interval.tick() => {
+                if awaiting_pong && last_pong.elapsed() > DATA_PONG_DEADLINE {
+                    tracing::warn!(%session_id, "data WebSocket keepalive timeout — closing bridge");
+                    break;
+                }
+                if ws_sink.send(Message::Ping(vec![])).await.is_err() {
+                    break;
+                }
+                awaiting_pong = true;
+            }
+        }
     }
 
     tracing::debug!(%session_id, "data WebSocket bridge ended");

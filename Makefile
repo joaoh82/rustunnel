@@ -1,6 +1,6 @@
 .PHONY: build build-full test fmt lint check install-hooks release release-server release-client \
         release-mcp docker-build docker-run docker-run-monitoring docker-stop docker-logs \
-        deploy deploy-client update-server db-start db-stop clean help
+        deploy deploy-client update-server db-start db-stop dev-setup clean help
 
 # ── configuration ─────────────────────────────────────────────────────────────
 
@@ -23,6 +23,16 @@ build-full: ui-build
 ## test         Run the full test suite (unit + integration). Requires make db-start first.
 test:
 	TEST_DATABASE_URL=postgres://rustunnel:test@localhost:5432/rustunnel_test cargo test --workspace
+
+## dev-setup    Create /tmp/rustunnel-dev with a self-signed TLS cert (re-run after reboot).
+dev-setup:
+	mkdir -p /tmp/rustunnel-dev
+	openssl req -x509 -newkey rsa:2048 \
+	    -keyout /tmp/rustunnel-dev/key.pem \
+	    -out    /tmp/rustunnel-dev/cert.pem \
+	    -days 365 -nodes -subj "/CN=localhost" 2>/dev/null
+	@echo "Dev environment ready. Start the server with:"
+	@echo "  cargo run -p rustunnel-server -- --config deploy/local/server.toml"
 
 ## db-start     Start the local PostgreSQL container for development and testing.
 db-start:
