@@ -1,11 +1,12 @@
 'use client';
 
 import { useState, useEffect, useMemo } from 'react';
-import type { Tunnel, CapturedRequest } from '@/lib/types';
+import type { Tunnel, CapturedRequest, Region } from '@/lib/types';
 import { makeApi } from '@/lib/api';
-import { useServerStatus } from '@/hooks/useServerStatus';
+import { loadRegions, regionApiUrl } from '@/lib/regions';
 import { useTunnels } from '@/hooks/useTunnels';
 import { useRequests } from '@/hooks/useRequests';
+import { useRegionHealth } from '@/hooks/useRegionHealth';
 import { AuthGate } from './AuthGate';
 import { Header } from './Header';
 import { Panel } from './Panel';
@@ -18,21 +19,46 @@ import { useTokens } from '@/hooks/useTokens';
 
 export default function Dashboard() {
   const [token, setToken] = useState<string | null>(null);
+  const [regions, setRegions] = useState<Region[]>([]);
 
   // Read token from localStorage on mount (avoids SSR mismatch).
   useEffect(() => {
     setToken(localStorage.getItem('rt_token'));
   }, []);
 
-  const api = useMemo(() => makeApi(token), [token]);
-  const status = useServerStatus();
-  const { tunnels, error: tunnelErr, refresh: refreshTunnels } = useTunnels(api, !!token);
+  // Load region list once on mount.
+  useEffect(() => {
+    loadRegions().then(setRegions);
+  }, []);
+
+  // One API client per region, keyed by region ID.
+  const regionApis = useMemo(
+    () => regions.map((r) => ({ regionId: r.id, api: makeApi(token, regionApiUrl(r)) })),
+    [regions, token]
+  );
+
+  // Fallback single-region API (used for history, tokens, replay).
+  const primaryApi = useMemo(() => makeApi(token), [token]);
+
+  // Per-region health polling.
+  const regionHealth = useRegionHealth(regions);
+
+  // Active tunnels — fanned out across all regions.
+  const { tunnels, error: tunnelErr, refresh: refreshTunnels } = useTunnels(regionApis, !!token);
+
   const [selectedTunnel, setSelectedTunnel] = useState<Tunnel | null>(null);
   const [selectedRequest, setSelectedRequest] = useState<CapturedRequest | null>(null);
   const [replayResult, setReplayResult] = useState<string | null>(null);
 
-  const { requests } = useRequests(api, selectedTunnel?.tunnel_id ?? null);
-  const { tokens, error: tokenErr, refresh: refreshTokens } = useTokens(api, !!token);
+  // API client for the selected tunnel's region (for request inspector and replay).
+  const selectedTunnelApi = useMemo(() => {
+    if (!selectedTunnel?.region_id) return primaryApi;
+    const match = regionApis.find((r) => r.regionId === selectedTunnel.region_id);
+    return match?.api ?? primaryApi;
+  }, [selectedTunnel, regionApis, primaryApi]);
+
+  const { requests } = useRequests(selectedTunnelApi, selectedTunnel?.tunnel_id ?? null);
+  const { tokens, error: tokenErr, refresh: refreshTokens } = useTokens(primaryApi, !!token);
 
   // Deselect tunnel if it disappears.
   useEffect(() => {
@@ -43,6 +69,8 @@ export default function Dashboard() {
   }, [tunnels, selectedTunnel]);
 
   async function handleClose(tunnel: Tunnel) {
+    // Route the delete to the correct regional server.
+    const api = regionApis.find((r) => r.regionId === tunnel.region_id)?.api ?? primaryApi;
     try {
       await api.del(`/api/tunnels/${tunnel.tunnel_id}`);
       if (selectedTunnel?.tunnel_id === tunnel.tunnel_id) {
@@ -57,7 +85,9 @@ export default function Dashboard() {
 
   async function handleReplay(req: CapturedRequest) {
     try {
-      await api.post(`/api/tunnels/${selectedTunnel!.tunnel_id}/replay/${req.id}`);
+      await selectedTunnelApi.post(
+        `/api/tunnels/${selectedTunnel!.tunnel_id}/replay/${req.id}`
+      );
       setReplayResult(req.id);
       setTimeout(() => setReplayResult(null), 3000);
     } catch (e) {
@@ -72,14 +102,12 @@ export default function Dashboard() {
 
   // Show auth gate until we know the token (or it's null after mount).
   if (token === null) {
-    // token is null both before mount (SSR) and when unauthenticated.
-    // AuthGate handles the sign-in flow.
     return <AuthGate onAuth={setToken} />;
   }
 
   return (
     <>
-      <Header status={status} onSignOut={signOut} />
+      <Header regions={regions} regionHealth={regionHealth} onSignOut={signOut} />
 
       <main
         style={{
@@ -173,14 +201,14 @@ export default function Dashboard() {
 
         {/* API token management */}
         <TokensPanel
-          api={api}
+          api={primaryApi}
           tokens={tokens}
           error={tokenErr}
           refresh={refreshTokens}
         />
 
-        {/* Tunnel history */}
-        <TunnelHistoryPanel api={api} enabled={!!token} />
+        {/* Tunnel history — uses primary API (shared PostgreSQL returns all regions) */}
+        <TunnelHistoryPanel api={primaryApi} enabled={!!token} />
       </main>
     </>
   );

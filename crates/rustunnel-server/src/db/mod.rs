@@ -239,7 +239,7 @@ pub async fn list_tunnel_history(
     let sql = format!(
         "SELECT tl.id, tl.tunnel_id, tl.protocol, tl.label, tl.session_id, \
                 tl.token_id, t.label AS token_label, \
-                tl.registered_at, tl.unregistered_at \
+                tl.registered_at, tl.unregistered_at, tl.region_id \
          FROM tunnel_log tl \
          LEFT JOIN tokens t ON t.id = tl.token_id \
          WHERE ($1::text IS NULL OR tl.protocol = $1) \

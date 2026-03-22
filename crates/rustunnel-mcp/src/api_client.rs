@@ -59,6 +59,16 @@ impl ApiClient {
         Ok(resp.status().as_u16())
     }
 
+    /// Fetch the active region list from `GET /api/regions` (no auth required).
+    pub async fn list_regions(&self) -> reqwest::Result<Value> {
+        self.client
+            .get(format!("{}/api/regions", self.base_url))
+            .send()
+            .await?
+            .json()
+            .await
+    }
+
     pub async fn get_history(
         &self,
         token: &str,

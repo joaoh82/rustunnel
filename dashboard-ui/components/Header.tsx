@@ -1,15 +1,23 @@
 'use client';
 
-import type { ServerStatus } from '@/lib/types';
+import type { Region } from '@/lib/types';
+import type { RegionHealth } from '@/hooks/useRegionHealth';
 import { Dot } from './ui/Dot';
 
 interface HeaderProps {
-  status: ServerStatus | null;
+  regions: Region[];
+  regionHealth: RegionHealth;
   onSignOut: () => void;
 }
 
-export function Header({ status, onSignOut }: HeaderProps) {
-  const ok = status?.ok === true;
+export function Header({ regions, regionHealth, onSignOut }: HeaderProps) {
+  const totalSessions = Array.from(regionHealth.values())
+    .filter(Boolean)
+    .reduce((sum, s) => sum + (s?.active_sessions ?? 0), 0);
+  const totalTunnels = Array.from(regionHealth.values())
+    .filter(Boolean)
+    .reduce((sum, s) => sum + (s?.active_tunnels ?? 0), 0);
+
   return (
     <header
       style={{
@@ -30,19 +38,39 @@ export function Header({ status, onSignOut }: HeaderProps) {
         Rustunnel Dashboard
       </span>
 
-      {status && (
+      {/* Per-region health dots */}
+      {regions.length > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {regions.map((r) => {
+            const status = regionHealth.get(r.id);
+            const ok = status?.ok === true;
+            const unknown = status === undefined;
+            const color = unknown ? 'var(--muted)' : ok ? 'var(--green)' : 'var(--red)';
+            const label = unknown ? 'connecting…' : ok ? 'healthy' : 'offline';
+            return (
+              <div
+                key={r.id}
+                title={`${r.id.toUpperCase()} (${r.location}) — ${label}`}
+                style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'default' }}
+              >
+                <Dot color={color} pulse={ok} />
+                <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>
+                  {r.id.toUpperCase()}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Aggregate stats */}
+      {regionHealth.size > 0 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 14, color: 'var(--muted)', fontSize: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <Dot color={ok ? 'var(--green)' : 'var(--red)'} pulse={ok} />
-            <span style={{ color: ok ? 'var(--green)' : 'var(--red)' }}>
-              {ok ? 'Healthy' : 'Offline'}
-            </span>
-          </div>
-          <span title="Active sessions">
-            {status.active_sessions} session{status.active_sessions !== 1 ? 's' : ''}
+          <span title="Total active sessions across all regions">
+            {totalSessions} session{totalSessions !== 1 ? 's' : ''}
           </span>
-          <span title="Active tunnels">
-            {status.active_tunnels} tunnel{status.active_tunnels !== 1 ? 's' : ''}
+          <span title="Total active tunnels across all regions">
+            {totalTunnels} tunnel{totalTunnels !== 1 ? 's' : ''}
           </span>
         </div>
       )}

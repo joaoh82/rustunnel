@@ -200,6 +200,8 @@ struct TunnelSummary {
     request_count: u64,
     /// Remote address of the client that owns this tunnel.
     client_addr: String,
+    /// Region ID of the server hosting this tunnel (e.g. "eu", "us").
+    region_id: String,
 }
 
 /// Convert an `Instant` recorded at tunnel creation into an ISO-8601 UTC string.
@@ -241,6 +243,7 @@ async fn list_tunnels(headers: HeaderMap, State(state): State<ApiState>) -> impl
             connected_since: instant_to_iso(info.created_at),
             request_count: info.request_count.load(Ordering::Relaxed),
             client_addr,
+            region_id: state.region.id.clone(),
         });
     }
 
@@ -260,6 +263,7 @@ async fn list_tunnels(headers: HeaderMap, State(state): State<ApiState>) -> impl
             connected_since: instant_to_iso(info.created_at),
             request_count: info.request_count.load(Ordering::Relaxed),
             client_addr,
+            region_id: state.region.id.clone(),
         });
     }
 
@@ -311,6 +315,7 @@ async fn get_tunnel(
                 connected_since: instant_to_iso(info.created_at),
                 request_count: info.request_count.load(Ordering::Relaxed),
                 client_addr,
+                region_id: state.region.id.clone(),
             })
             .into_response();
         }
@@ -334,6 +339,7 @@ async fn get_tunnel(
                 connected_since: instant_to_iso(info.created_at),
                 request_count: info.request_count.load(Ordering::Relaxed),
                 client_addr,
+                region_id: state.region.id.clone(),
             })
             .into_response();
         }

@@ -156,6 +156,24 @@ function HistoryRow({ entry, showToken }: { entry: TunnelLogEntry; showToken: bo
         {duration(entry.registered_at, entry.unregistered_at)}
       </td>
       <td>
+        {entry.region_id ? (
+          <span
+            style={{
+              fontFamily: 'var(--mono)',
+              fontSize: 10,
+              color: 'var(--muted)',
+              background: 'var(--surface2)',
+              padding: '1px 5px',
+              borderRadius: 3,
+            }}
+          >
+            {entry.region_id}
+          </span>
+        ) : (
+          <span style={{ color: 'var(--muted)', fontSize: 10 }}>—</span>
+        )}
+      </td>
+      <td>
         <code style={{ fontSize: 10, color: 'var(--muted)' }}>
           {shortId(entry.session_id)}
         </code>
@@ -291,6 +309,7 @@ export function HistoryTable({ api, enabled, tokenId, compact }: HistoryTablePro
               sortDir={sortDir}
               onToggle={toggleSort}
             />
+            <th style={{ padding: '8px', textAlign: 'left', fontWeight: 500, color: 'var(--muted)' }}>Region</th>
             <th style={{ padding: '8px', textAlign: 'left', fontWeight: 500, color: 'var(--muted)' }}>Session</th>
             <th style={{ padding: '8px 16px 8px 8px', textAlign: 'left', fontWeight: 500, color: 'var(--muted)' }}>
               Tunnel ID

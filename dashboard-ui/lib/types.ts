@@ -1,3 +1,12 @@
+export interface Region {
+  id: string;
+  name: string;
+  location: string;
+  host: string;
+  control_port: number;
+  active: boolean;
+}
+
 export interface Tunnel {
   tunnel_id: string;
   protocol: string;
@@ -6,6 +15,8 @@ export interface Tunnel {
   connected_since: string;
   request_count: number;
   client_addr: string | null;
+  /** Region ID of the server hosting this tunnel (e.g. "eu", "us"). */
+  region_id: string;
 }
 
 export interface CapturedRequest {
@@ -25,6 +36,7 @@ export interface CapturedRequest {
 
 export interface ServerStatus {
   ok: boolean;
+  region: { id: string; name: string; location: string };
   active_sessions: number;
   active_tunnels: number;
 }
@@ -55,6 +67,8 @@ export interface TunnelLogEntry {
   token_label: string | null;
   registered_at: string;
   unregistered_at: string | null;
+  /** Region that hosted this tunnel. Null for pre-Phase-3 history rows. */
+  region_id: string | null;
 }
 
 export interface TunnelHistoryResponse {
