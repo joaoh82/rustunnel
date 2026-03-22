@@ -325,11 +325,10 @@ pub async fn connect(config: &ClientConfig, tunnels: &[TunnelDef]) -> Result<()>
     // It reads the 16-byte conn_id prefix the server writes into each stream,
     // then forwards (conn_id, stream) pairs to the main loop via a channel.
     //
-    // Keeping a clone of stream_tx alive prevents the channel from closing
-    // when/if the driver task exits early (e.g. yamux session reset), so the
-    // main loop's select arm blocks instead of spinning.
+    // When the driver exits (yamux error or data WS drop), stream_tx is
+    // dropped and stream_rx.recv() returns None, signalling main_loop to
+    // return an error and trigger reconnect.
     let (stream_tx, stream_rx) = mpsc::channel::<(Uuid, YamuxStream)>(16);
-    let _stream_tx_keep = stream_tx.clone();
 
     if let Some(conn) = data_conn {
         tokio::spawn(drive_client_mux(conn, stream_tx));
@@ -397,14 +396,23 @@ async fn main_loop(
 
             // ── Inbound yamux stream from background driver ───────────────
             pair = stream_rx.recv() => {
-                if let Some((conn_id, stream)) = pair {
-                    if let Some(local_addr) = pending_conns.remove(&conn_id) {
-                        // NewConnection arrived earlier — proxy immediately.
-                        tokio::spawn(proxy::proxy_connection(stream, local_addr, conn_id));
-                    } else {
-                        // NewConnection hasn't arrived yet — stash the stream.
-                        debug!(%conn_id, "stream arrived before NewConnection — buffering");
-                        pending_streams.insert(conn_id, stream);
+                match pair {
+                    Some((conn_id, stream)) => {
+                        if let Some(local_addr) = pending_conns.remove(&conn_id) {
+                            // NewConnection arrived earlier — proxy immediately.
+                            tokio::spawn(proxy::proxy_connection(stream, local_addr, conn_id));
+                        } else {
+                            // NewConnection hasn't arrived yet — stash the stream.
+                            debug!(%conn_id, "stream arrived before NewConnection — buffering");
+                            pending_streams.insert(conn_id, stream);
+                        }
+                    }
+                    None => {
+                        // The yamux driver exited (data WebSocket dropped or
+                        // yamux error). Return an error to trigger reconnect.
+                        return Err(Error::Connection(
+                            "yamux data connection closed".into(),
+                        ));
                     }
                 }
             }
