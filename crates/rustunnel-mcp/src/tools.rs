@@ -59,6 +59,12 @@ pub fn tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "Optional custom subdomain for HTTP tunnels. \
                             Server assigns a random one if omitted."
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "Optional region ID (e.g. 'eu', 'us', 'ap'). \
+                            Omit to let the client auto-select the nearest region by latency. \
+                            Use list_regions to see available regions."
                     }
                 },
                 "required": ["token", "local_port", "protocol"]
@@ -119,9 +125,23 @@ pub fn tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": ["http", "tcp"],
                         "description": "Tunnel protocol"
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "Optional region ID (e.g. 'eu', 'us', 'ap'). \
+                            Omit to let the client auto-select."
                     }
                 },
                 "required": ["token", "local_port", "protocol"]
+            }
+        }),
+        serde_json::json!({
+            "name": "list_regions",
+            "description": "List available tunnel server regions with their IDs, names, \
+                and locations. Use this to pick a specific region for create_tunnel.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
             }
         }),
         serde_json::json!({
@@ -161,6 +181,7 @@ pub async fn dispatch(name: &str, args: &Value, state: &Arc<State>) -> Value {
         "close_tunnel" => close_tunnel(args, state).await,
         "get_connection_info" => get_connection_info(args, state),
         "get_tunnel_history" => get_tunnel_history(args, state).await,
+        "list_regions" => list_regions(state).await,
         _ => tool_err(format!("unknown tool: {name}")),
     }
 }
@@ -177,6 +198,7 @@ async fn create_tunnel(args: &Value, state: &Arc<State>) -> Value {
     };
 
     let subdomain = args.get("subdomain").and_then(Value::as_str);
+    let region = args.get("region").and_then(Value::as_str);
 
     // Snapshot existing tunnel IDs before spawning so we can identify the new one.
     let before_ids: HashSet<String> = match state.api.list_tunnels(token).await {
@@ -202,6 +224,10 @@ async fn create_tunnel(args: &Value, state: &Arc<State>) -> Value {
 
     if let Some(sub) = subdomain {
         cmd.arg("--subdomain").arg(sub);
+    }
+
+    if let Some(r) = region {
+        cmd.arg("--region").arg(r);
     }
 
     let mut child_opt = match cmd.spawn() {
@@ -287,6 +313,7 @@ async fn close_tunnel(args: &Value, state: &Arc<State>) -> Value {
 fn get_connection_info(args: &Value, state: &Arc<State>) -> Value {
     let token = req_str!(args, "token");
     let protocol = req_str!(args, "protocol");
+    let region = args.get("region").and_then(Value::as_str);
 
     let local_port = match args.get("local_port").and_then(Value::as_u64) {
         Some(p) => p,
@@ -297,18 +324,30 @@ fn get_connection_info(args: &Value, state: &Arc<State>) -> Value {
         "rustunnel {protocol} {local_port} --server {} --token {token}",
         state.server_addr
     );
+    if let Some(r) = region {
+        cmd.push_str(&format!(" --region {r}"));
+    }
     if state.insecure {
         cmd.push_str(" --insecure");
     }
 
-    tool_ok(
-        serde_json::to_string_pretty(&serde_json::json!({
-            "cli_command":  cmd,
-            "server":       state.server_addr,
-            "install_url":  "https://github.com/joaoh82/rustunnel/releases/latest"
-        }))
-        .unwrap(),
-    )
+    let mut info = serde_json::json!({
+        "cli_command":  cmd,
+        "server":       state.server_addr,
+        "install_url":  "https://github.com/joaoh82/rustunnel/releases/latest"
+    });
+    if let Some(r) = region {
+        info["region"] = serde_json::Value::String(r.to_string());
+    }
+
+    tool_ok(serde_json::to_string_pretty(&info).unwrap())
+}
+
+async fn list_regions(state: &Arc<State>) -> Value {
+    match state.api.list_regions().await {
+        Ok(regions) => tool_ok(serde_json::to_string_pretty(&regions).unwrap()),
+        Err(e) => tool_err(format!("API error: {e}")),
+    }
 }
 
 async fn get_tunnel_history(args: &Value, state: &Arc<State>) -> Value {

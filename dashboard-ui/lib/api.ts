@@ -1,11 +1,19 @@
 import type { ApiClient } from './types';
 
-// Base URL of the rustunnel-server dashboard API.
+// Default base URL of the rustunnel-server dashboard API.
 // Set NEXT_PUBLIC_API_URL in .env.local for dev, and as a Vercel env var for production.
 // Defaults to empty string (same-origin) for local dev when running behind a proxy.
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+const DEFAULT_API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
-export function makeApi(token: string | null): ApiClient {
+/**
+ * Create an API client targeting the given server.
+ *
+ * @param token  Bearer token for authentication (null = unauthenticated).
+ * @param base   Optional override for the API base URL (defaults to NEXT_PUBLIC_API_URL).
+ *               Pass the result of `regionApiUrl(region)` to target a specific regional server.
+ */
+export function makeApi(token: string | null, base?: string): ApiClient {
+  const API_BASE = base ?? DEFAULT_API_BASE;
   const headers: Record<string, string> = token
     ? { Authorization: `Bearer ${token}` }
     : {};

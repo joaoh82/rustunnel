@@ -40,7 +40,7 @@ export function TunnelTable({ tunnels, selected, onSelect, onClose }: TunnelTabl
       >
         <thead>
           <tr style={{ borderBottom: '1px solid var(--border)', color: 'var(--muted)' }}>
-            {['Protocol', 'Public URL', 'Client', 'Connected', 'Requests', ''].map((h) => (
+            {['Protocol', 'Public URL', 'Region', 'Client', 'Connected', 'Requests', ''].map((h) => (
               <th
                 key={h}
                 style={{
@@ -94,6 +94,20 @@ export function TunnelTable({ tunnels, selected, onSelect, onClose }: TunnelTabl
                     }}
                   >
                     {t.public_url}
+                  </span>
+                </td>
+                <td style={{ padding: '10px 14px' }}>
+                  <span
+                    style={{
+                      fontFamily: 'var(--mono)',
+                      fontSize: 11,
+                      color: 'var(--muted)',
+                      background: 'var(--surface2)',
+                      padding: '1px 5px',
+                      borderRadius: 3,
+                    }}
+                  >
+                    {t.region_id || '—'}
                   </span>
                 </td>
                 <td style={{ padding: '10px 14px', color: 'var(--muted)' }}>

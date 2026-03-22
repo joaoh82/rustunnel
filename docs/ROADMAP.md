@@ -121,15 +121,17 @@ Items below are not committed to any release timeline. They represent directions
 - [ ] Config file hot-reload (SIGHUP) without restarting the server
 - [ ] Health check / heartbeat endpoint for load balancer probing
 
-### Multi-region (Phase 5 — unified dashboard)
-- [ ] Dashboard fan-out queries — aggregate tunnel history and active sessions across all regions
-- [ ] Region health indicators in the dashboard
-- [ ] Region column in tunnel history table
-- [ ] Cross-region token validation (tokens issued on one region accepted by all)
+### Multi-region (Phase 5 — unified dashboard) ✅ Complete
+- [x] Dashboard fan-out queries — active tunnels aggregated across all regions via parallel API calls
+- [x] Per-region health indicators in the dashboard header (one dot per region)
+- [x] Region column in active tunnels table and tunnel history table
+- [x] Region-aware request inspector — routes to the correct regional server via `region_id`
+- [ ] Cross-region token validation (tokens issued on one region accepted by all — already works via shared PostgreSQL)
 
-### Multi-region (Phase 6 — MCP region support)
-- [ ] `list_regions` MCP tool — exposes region list and latencies to AI agents
-- [ ] `region` parameter on `create_tunnel` MCP tool
+### Multi-region (Phase 6 — MCP region support) ✅ Complete
+- [x] `list_regions` MCP tool — calls `GET /api/regions`, returns region list to the agent
+- [x] `region` parameter on `create_tunnel` MCP tool — passes `--region <id>` to CLI subprocess
+- [x] `region` parameter on `get_connection_info` — included in the CLI command string and JSON response
 
 ### Long-term / Exploratory
 - [ ] SSH tunnel support (`rustunnel ssh`)
@@ -152,3 +154,4 @@ Items below are not committed to any release timeline. They represent directions
 | 0.3.0 | Tunnel history dashboard page, stale tunnel cleanup on restart, MCP server (Phase 1), OpenAPI spec |
 | 0.3.1 | Multi-region server infrastructure — `regions` table, `region_id` on tunnel log, `GET /api/regions`, `[region]` server config |
 | 0.3.2 | Multi-region client — `--region` flag, `region:` config field, parallel latency probing, auto-select, 3-tier region discovery |
+| 0.3.6 | Unified dashboard — per-region health dots, region column in tunnels + history, region-aware request inspector; MCP `list_regions` tool + `region` param on `create_tunnel` |

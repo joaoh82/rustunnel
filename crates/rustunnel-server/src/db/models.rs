@@ -65,6 +65,8 @@ pub struct TunnelLogEntry {
     pub token_label: Option<String>,
     pub registered_at: DateTime<Utc>,
     pub unregistered_at: Option<DateTime<Utc>>,
+    /// Region that hosted this tunnel (e.g. "eu", "us"). `None` for pre-Phase-3 rows.
+    pub region_id: Option<String>,
 }
 
 /// A row from the `regions` table.
