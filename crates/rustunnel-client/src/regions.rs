@@ -58,7 +58,7 @@ fn builtin_regions() -> Vec<RegionInfo> {
         RegionInfo {
             id: "us".into(),
             name: "US East".into(),
-            location: "Ashburn, VA".into(),
+            location: "Hillsboro, OR".into(),
             host: "us.edge.rustunnel.com".into(),
             control_port: 4040,
         },
@@ -216,14 +216,14 @@ pub async fn resolve_server(
     match effective {
         // Explicit region ID: connect directly, skip probing
         Some(r) if r != "auto" => {
-            let regions = builtin_regions();
+            let host = extract_host(config_server);
+            let regions = load_regions(host, insecure).await;
             if let Some(info) = regions.iter().find(|ri| ri.id == r) {
                 eprintln!("  Region: {} ({})", info.name, info.location);
                 return format!("{}:{}", info.host, info.control_port);
             }
             // Unknown ID — warn and fall back to auto-select
             eprintln!("  Unknown region '{r}', falling back to auto-select");
-            let host = extract_host(config_server);
             auto_select(host, insecure).await
         }
 

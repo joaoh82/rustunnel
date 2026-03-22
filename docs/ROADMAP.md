@@ -65,7 +65,19 @@ This document tracks the features that have already shipped and ideas planned fo
 - [x] Pre-push git hook mirroring CI checks (`make install-hooks`)
 - [x] Local development config (`deploy/local/server.toml`) and self-signed cert setup instructions
 - [x] Pre-built release binaries for Linux (x86_64, aarch64) and macOS via GitHub Releases
-- [x] `rustunnel setup` — interactive wizard that creates `~/.rustunnel/config.yml` with prompted server and auth token values
+- [x] `rustunnel setup` — interactive wizard that creates `~/.rustunnel/config.yml` with prompted server, auth token, and region values
+
+### Multi-region infrastructure
+- [x] PostgreSQL-backed `regions` table with region metadata (id, name, location, host, control_port, active)
+- [x] `region_id` column on `tunnel_log` for per-region tunnel attribution
+- [x] `[region]` section in `server.toml` — each instance declares its own region identity
+- [x] `GET /api/regions` endpoint — returns active region list for client discovery
+- [x] `--region <id>` CLI flag for `rustunnel http` / `rustunnel tcp` (`eu`, `us`, `ap`, `auto`)
+- [x] `region:` field in `~/.rustunnel/config.yml`
+- [x] Parallel TCP latency probing across all regions — auto-selects nearest on `region: auto`
+- [x] Three-tier region list resolution: local cache → API fetch → hardcoded fallback compiled into binary
+- [x] 24-hour region list cache at `~/.rustunnel/regions.json`
+- [x] Global edge fleet: EU (Helsinki), US (Hillsboro, OR), AP (Singapore)
 
 ### AI agent integration (Phase 1)
 - [x] `rustunnel-mcp` binary — MCP server with stdio transport
@@ -109,13 +121,22 @@ Items below are not committed to any release timeline. They represent directions
 - [ ] Config file hot-reload (SIGHUP) without restarting the server
 - [ ] Health check / heartbeat endpoint for load balancer probing
 
+### Multi-region (Phase 5 — unified dashboard)
+- [ ] Dashboard fan-out queries — aggregate tunnel history and active sessions across all regions
+- [ ] Region health indicators in the dashboard
+- [ ] Region column in tunnel history table
+- [ ] Cross-region token validation (tokens issued on one region accepted by all)
+
+### Multi-region (Phase 6 — MCP region support)
+- [ ] `list_regions` MCP tool — exposes region list and latencies to AI agents
+- [ ] `region` parameter on `create_tunnel` MCP tool
+
 ### Long-term / Exploratory
 - [ ] SSH tunnel support (`rustunnel ssh`)
 - [ ] Custom domain per tunnel (BYOD — bring your own domain with DNS verification)
 - [ ] Multi-user / team management with role-based access control
 - [ ] Traffic inspector with request replay in the dashboard
 - [ ] Tunnel persistence across server restarts (reconnect to the same subdomain/port)
-- [ ] Geographic routing — multiple server regions behind a single hostname
 - [ ] mTLS client authentication
 - [ ] Plugin / middleware system for request transformation and filtering
 - [ ] Distributed server mode (multiple instances sharing state via a database)
@@ -129,3 +150,5 @@ Items below are not committed to any release timeline. They represent directions
 | 0.1.0 | Initial release — HTTP/TCP tunnels, TLS, admin token auth, dashboard, Prometheus metrics |
 | 0.2.0 | API token management (create/list/delete), tunnel activity log, per-token tunnel counts |
 | 0.3.0 | Tunnel history dashboard page, stale tunnel cleanup on restart, MCP server (Phase 1), OpenAPI spec |
+| 0.3.1 | Multi-region server infrastructure — `regions` table, `region_id` on tunnel log, `GET /api/regions`, `[region]` server config |
+| 0.3.2 | Multi-region client — `--region` flag, `region:` config field, parallel latency probing, auto-select, 3-tier region discovery |
