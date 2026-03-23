@@ -82,14 +82,12 @@ jobs:
       - name: Build binaries (cross)
         if: matrix.use_cross
         run: |
-          cross build --release --target ${{ matrix.target }} -p rustunnel-server
           cross build --release --target ${{ matrix.target }} -p rustunnel-client
           cross build --release --target ${{ matrix.target }} -p rustunnel-mcp
 
       - name: Build binaries (cargo)
         if: "!matrix.use_cross"
         run: |
-          cargo build --release --target ${{ matrix.target }} -p rustunnel-server
           cargo build --release --target ${{ matrix.target }} -p rustunnel-client
           cargo build --release --target ${{ matrix.target }} -p rustunnel-mcp
 
@@ -100,23 +98,21 @@ jobs:
           TARGET="${{ matrix.target }}"
           SUFFIX="${{ matrix.binary_suffix }}"
 
-          SERVER_BIN="rustunnel-server${SUFFIX}"
           CLIENT_BIN="rustunnel${SUFFIX}"
           MCP_BIN="rustunnel-mcp${SUFFIX}"
           ARCHIVE="rustunnel-${TAG}-${TARGET}.tar.gz"
 
           mkdir -p dist
 
-          cp "target/${TARGET}/release/${SERVER_BIN}" dist/
           cp "target/${TARGET}/release/${CLIENT_BIN}" dist/
           cp "target/${TARGET}/release/${MCP_BIN}" dist/
 
           cd dist
           if [[ "${SUFFIX}" == ".exe" ]]; then
-            7z a "../${ARCHIVE%.tar.gz}.zip" "${SERVER_BIN}" "${CLIENT_BIN}" "${MCP_BIN}"
+            7z a "../${ARCHIVE%.tar.gz}.zip" "${CLIENT_BIN}" "${MCP_BIN}"
             echo "ASSET=${ARCHIVE%.tar.gz}.zip" >> "$GITHUB_ENV"
           else
-            tar czf "../${ARCHIVE}" "${SERVER_BIN}" "${CLIENT_BIN}" "${MCP_BIN}"
+            tar czf "../${ARCHIVE}" "${CLIENT_BIN}" "${MCP_BIN}"
             echo "ASSET=${ARCHIVE}" >> "$GITHUB_ENV"
           fi
 
@@ -137,9 +133,53 @@ jobs:
             ${{ env.ASSET }}.sha256
           retention-days: 1
 
+  build-server:
+    name: Build rustunnel-server (Linux x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-x86_64-unknown-linux-gnu-server-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-x86_64-unknown-linux-gnu-server-cargo-
+
+      - name: Build rustunnel-server
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p rustunnel-server
+
+      - name: Rename binary
+        run: |
+          cp target/x86_64-unknown-linux-gnu/release/rustunnel-server rustunnel-server-linux-x86_64
+
+      - name: Compute SHA256
+        run: sha256sum rustunnel-server-linux-x86_64 > rustunnel-server-linux-x86_64.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-linux-x86_64
+          path: |
+            rustunnel-server-linux-x86_64
+            rustunnel-server-linux-x86_64.sha256
+          retention-days: 1
+
   publish:
     name: Create GitHub Release
-    needs: build
+    needs: [build, build-server]
     runs-on: ubuntu-latest
     permissions:
       contents: write
