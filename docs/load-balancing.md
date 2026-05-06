@@ -84,6 +84,7 @@ tunnels:
 | `health_check.timeout_secs` | no | `3` | Per-probe deadline. |
 | `health_check.max_failed` | no | `3` | Consecutive failures before reporting `TunnelUnhealthy`. |
 | `health_check.expect_2xx` | no | `true` | When `false`, any HTTP response counts as healthy. |
+| `health_check.alert_webhook` | no | — | Per-tenant URL the server POSTs to when *this group* transitions to 0 healthy members. See [Webhook alerts](#webhook-alerts) below. |
 
 ### Behaviour rules
 
@@ -126,6 +127,102 @@ Probe state is reported only on **edges**:
 A member with no `health_check` is permanently healthy. A member *with* a
 spec starts unhealthy and only joins dispatch after the first successful
 probe.
+
+---
+
+## Webhook alerts
+
+When a load-balancing group transitions to **0 healthy members** (every
+backend is unhealthy or has disconnected), public traffic to that
+subdomain or port starts returning 502. The server can POST a JSON alert
+to one or more URLs at the moment of that transition so an operator or
+tenant can react.
+
+There are **two distinct destinations**, each addressing a different
+audience:
+
+### 1. Operator URL — `[load_balancing] alert_webhook_url` in `server.toml`
+
+Set on the **edge**. Fires for every group on that edge that goes 0/N,
+regardless of which tenant owns the group. Useful for self-hosted
+deployments and for ops awareness on a managed multi-tenant edge.
+
+```toml
+[load_balancing]
+enabled = true
+alert_webhook_url = "https://hooks.slack.com/services/operator-channel/..."
+```
+
+### 2. Per-tenant URL — `health_check.alert_webhook` in the client config
+
+Set on the **client**. Fires only when the group containing this tunnel
+goes 0/N. Each tenant points it at *their* Slack / PagerDuty / email
+gateway. The URL is sent on the wire as part of `HealthCheckSpec` and
+stored on the affected `GroupMember`; only the server holds it (the URL
+is never returned by `/api/groups` — dashboards see a presence-only flag).
+
+```yaml
+tunnels:
+  a:
+    proto: http
+    local_port: 3000
+    subdomain: pool
+    group: web
+    group_key: shared-secret-for-this-pool
+    health_check:
+      type: tcp
+      alert_webhook: "https://hooks.slack.com/services/my-team/..."
+```
+
+Both destinations can be configured independently. Both fire on the same
+0/N transition. The server collects unique URLs from the affected group's
+members (so two members of one tenant pointing at the same URL receive a
+**single** POST per transition, not two), then fans out to each unique
+URL plus the operator URL.
+
+### Payload
+
+Same JSON body sent to every destination:
+
+```json
+{
+  "event": "group_zero_healthy",
+  "region_id": "eu",
+  "protocol": "http",
+  "label": "pool",
+  "group_name": "web",
+  "key_hash_short": "deadbeef",
+  "member_count": 2,
+  "at": "2026-05-06T13:24:55+00:00"
+}
+```
+
+`key_hash_short` is the first 8 hex chars of the group's SHA-256 key
+hash — stable across reconnects, useful for correlating alerts when a
+single team runs multiple pools with the same `group_name`.
+
+### Debounce
+
+The server tracks a per-group `zero_healthy_alerted` flag. Once an alert
+fires, **subsequent `TunnelUnhealthy` frames against the same already-down
+group do not re-fire**. The flag resets the moment any member becomes
+healthy again — the next 0/N transition then fires fresh.
+
+In practice: if your pool flaps badly (down → up → down → up), each
+*downward edge* generates one alert per destination. Steady-state
+"everyone is still down" generates none.
+
+### Delivery
+
+Best-effort. The server uses a 5-second per-request timeout, no retry,
+no queue. If your webhook receiver is down at the moment of the
+transition, the alert is lost. (For high-stakes paging, point the URL at
+something durable — a queueing alertmanager, or a service like
+Pushover with retry — rather than relying on the rustunnel server for
+delivery guarantees.)
+
+The fire happens in a detached `tokio::spawn`, so a slow webhook
+receiver never blocks the server's frame-handling hot path.
 
 ---
 
