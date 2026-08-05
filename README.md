@@ -1,5 +1,7 @@
 # rustunnel
 
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.joaoh82%2Frustunnel.svg)](https://mcptoplist.com/server/io.github.joaoh82%2Frustunnel)
+
 [![CI](https://github.com/joaoh82/rustunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/joaoh82/rustunnel/actions/workflows/ci.yml)
 [![License: AGPLv3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.76%2B-orange.svg)](https://www.rust-lang.org)
