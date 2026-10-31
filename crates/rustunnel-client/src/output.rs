@@ -217,11 +217,11 @@ mod tests {
     #[test]
     fn notice_event_shape() {
         let ev = Event::Notice {
-            message: "Hobby plan: 80% of the 1 GB monthly bandwidth is used.".into(),
+            message: "Hobby plan: 80% of 1 GB/mo used. Pay-as-you-go is $0.10/GB ($3/mo min).\nUpgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_campaign=hobby_limit&utm_content=bandwidth".into(),
         };
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
-            r#"{"event":"notice","message":"Hobby plan: 80% of the 1 GB monthly bandwidth is used."}"#
+            r#"{"event":"notice","message":"Hobby plan: 80% of 1 GB/mo used. Pay-as-you-go is $0.10/GB ($3/mo min).\nUpgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_campaign=hobby_limit&utm_content=bandwidth"}"#
         );
     }
 

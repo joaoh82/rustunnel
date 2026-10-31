@@ -44,8 +44,9 @@ use uuid::Uuid;
 use crate::config::PlatformSection;
 use crate::error::Result;
 
-/// Decimal gigabyte. Matches the "$0.10/GB" price, not 1024^3.
-const BYTES_PER_GB: i64 = 1_000_000_000;
+/// Binary gigabyte (1024^3). Same unit billing and platform-api use for
+/// Hobby bandwidth caps.
+const BYTES_PER_GB: i64 = 1_073_741_824;
 const BANDWIDTH_WARN_PERCENT: u128 = 80;
 
 const UPGRADE_ORIGIN: &str = "https://rustunnel.com/dashboard/billing?upgrade=1";
@@ -123,9 +124,20 @@ impl HobbyReason {
             HobbyReason::CustomSubdomain => format!(
                 "Hobby plan limit: custom subdomains need Pay-as-you-go ($3/mo min, $0.10/GB).\nUpgrade: {upgrade}"
             ),
-            HobbyReason::Bandwidth { percent, limit_gb } => format!(
-                "Hobby plan: {percent}% of the {limit_gb} GB monthly bandwidth is used. Pay-as-you-go is $3/mo min, credited at $0.10/GB.\nUpgrade: {upgrade}"
-            ),
+            HobbyReason::Bandwidth { percent, limit_gb } => {
+                // Matches platform-api `usage_cli_notice`. At 100% and above
+                // this is still a notice: bandwidth is not a hard stop.
+                let body = if *percent >= 100 {
+                    format!(
+                        "Hobby plan: {limit_gb} GB/mo included bandwidth used. Pay-as-you-go is $0.10/GB ($3/mo min)."
+                    )
+                } else {
+                    format!(
+                        "Hobby plan: {percent}% of {limit_gb} GB/mo used. Pay-as-you-go is $0.10/GB ($3/mo min)."
+                    )
+                };
+                format!("{body}\nUpgrade: {upgrade}")
+            }
         }
     }
 }
@@ -158,7 +170,8 @@ pub fn blocking_limit(
     None
 }
 
-/// `Some` when `used_bytes` is at least 80% of `limit_gb` decimal gigabytes.
+/// `Some` when `used_bytes` is at least 80% of `limit_gb` GiB (1024^3).
+/// Percent is integer floor division.
 pub fn bandwidth_warning(used_bytes: i64, limit_gb: Option<i32>) -> Option<HobbyReason> {
     let limit_gb = limit_gb.filter(|gb| *gb > 0)?;
     if used_bytes <= 0 {
@@ -178,18 +191,56 @@ pub fn bandwidth_warning(used_bytes: i64, limit_gb: Option<i32>) -> Option<Hobby
     })
 }
 
+/// Apply Hobby gates only when `billing_model` is exactly `"free"`.
+///
+/// A future metered or subscription plan may carry numeric caps. Those caps
+/// must not produce a Hobby nudge or a bandwidth notice.
+fn gate_for_plan(
+    billing_model: &str,
+    max_tunnels: Option<i32>,
+    open_tunnels: i64,
+    allow_custom_subdomains: bool,
+    requested_subdomain: Option<&str>,
+    used_bytes: i64,
+    bandwidth_limit_gb: Option<i32>,
+) -> HobbyGate {
+    if billing_model != "free" {
+        return HobbyGate::default();
+    }
+    let block = blocking_limit(
+        max_tunnels,
+        open_tunnels,
+        allow_custom_subdomains,
+        requested_subdomain,
+    );
+    if block.is_some() {
+        return HobbyGate {
+            block,
+            notice: None,
+        };
+    }
+    HobbyGate {
+        block: None,
+        notice: bandwidth_warning(used_bytes, bandwidth_limit_gb),
+    }
+}
+
 /// Load the active plan and decide the block / bandwidth notice.
 ///
 /// No active subscription means no Hobby gate. That is the same branch the
 /// edge has always used: direct, admin, and legacy tokens, and any user
 /// row without `subscriptions.status = 'active'`, are not capped here.
+///
+/// Only `plans.billing_model = 'free'` is gated. Anything else returns
+/// immediately, before the open-tunnel count and the byte sum.
 pub async fn evaluate_hobby_limits(
     pool: &PgPool,
     user_id: Uuid,
     requested_subdomain: Option<&str>,
 ) -> Result<HobbyGate> {
-    let plan = sqlx::query_as::<_, (Option<i32>, bool, Option<i32>)>(
-        "SELECT p.max_tunnels, p.allow_custom_subdomains, p.bandwidth_limit_gb \
+    let plan = sqlx::query_as::<_, (Option<i32>, bool, Option<i32>, String)>(
+        "SELECT p.max_tunnels, p.allow_custom_subdomains, p.bandwidth_limit_gb, \
+                p.billing_model \
          FROM subscriptions s \
          JOIN plans p ON p.id = s.plan_id \
          WHERE s.user_id = $1 AND s.status = 'active' \
@@ -199,9 +250,14 @@ pub async fn evaluate_hobby_limits(
     .fetch_optional(pool)
     .await?;
 
-    let Some((max_tunnels, allow_custom_subdomains, bandwidth_limit_gb)) = plan else {
+    let Some((max_tunnels, allow_custom_subdomains, bandwidth_limit_gb, billing_model)) = plan
+    else {
         return Ok(HobbyGate::default());
     };
+
+    if billing_model != "free" {
+        return Ok(HobbyGate::default());
+    }
 
     let open_tunnels: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM tunnel_log \
@@ -224,22 +280,27 @@ pub async fn evaluate_hobby_limits(
         });
     }
 
-    let notice = if bandwidth_limit_gb.is_some() {
+    let used_bytes = if bandwidth_limit_gb.is_some() {
         match month_bytes_proxied(pool, user_id).await {
-            Ok(used) => bandwidth_warning(used, bandwidth_limit_gb),
+            Ok(used) => used,
             Err(e) => {
                 tracing::warn!(error = %e, %user_id, "bandwidth usage lookup failed");
-                None
+                0
             }
         }
     } else {
-        None
+        0
     };
 
-    Ok(HobbyGate {
-        block: None,
-        notice,
-    })
+    Ok(gate_for_plan(
+        &billing_model,
+        max_tunnels,
+        open_tunnels.0,
+        allow_custom_subdomains,
+        requested_subdomain,
+        used_bytes,
+        bandwidth_limit_gb,
+    ))
 }
 
 /// Bytes recorded on tunnels that closed during the current UTC month.
@@ -390,11 +451,23 @@ Upgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_ca
         assert_eq!(blocking_limit(None, 99, true, None), None);
     }
 
+    const BANDWIDTH_URL: &str = "https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_campaign=hobby_limit&utm_content=bandwidth";
+
+    fn bandwidth_notice(percent_line: &str) -> String {
+        format!("{percent_line}\nUpgrade: {BANDWIDTH_URL}")
+    }
+
     #[test]
-    fn bandwidth_warning_starts_at_80_percent() {
-        assert_eq!(bandwidth_warning(799_999_999, Some(1)), None);
+    fn bandwidth_warning_starts_at_80_percent_of_a_gib() {
+        // Floor division: 80% of 1 GiB is 858_993_460 bytes. One byte less is 79%.
+        const UNDER_80: i64 = 858_993_459;
+        const AT_80: i64 = 858_993_460;
+        const AT_99: i64 = 1_073_741_823;
+        const AT_100: i64 = BYTES_PER_GB;
+
+        assert_eq!(bandwidth_warning(UNDER_80, Some(1)), None);
         assert_eq!(
-            bandwidth_warning(800_000_000, Some(1)),
+            bandwidth_warning(AT_80, Some(1)),
             Some(HobbyReason::Bandwidth {
                 percent: 80,
                 limit_gb: 1,
@@ -402,12 +475,83 @@ Upgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_ca
         );
         assert_eq!(bandwidth_warning(0, Some(1)), None);
         assert_eq!(bandwidth_warning(50_000_000_000, None), None);
-        let msg = bandwidth_warning(800_000_000, Some(1))
+
+        let at_80 = bandwidth_warning(AT_80, Some(1))
             .unwrap()
             .message(Surface::Cli);
-        assert!(msg.contains("80% of the 1 GB monthly bandwidth"));
-        assert!(msg.contains("utm_content=bandwidth"));
-        assert!(msg.contains("utm_source=cli"));
+        assert_eq!(
+            at_80,
+            bandwidth_notice(
+                "Hobby plan: 80% of 1 GB/mo used. Pay-as-you-go is $0.10/GB ($3/mo min)."
+            )
+        );
+
+        let at_99 = bandwidth_warning(AT_99, Some(1)).unwrap();
+        assert_eq!(
+            at_99,
+            HobbyReason::Bandwidth {
+                percent: 99,
+                limit_gb: 1,
+            }
+        );
+        assert_eq!(
+            at_99.message(Surface::Cli),
+            bandwidth_notice(
+                "Hobby plan: 99% of 1 GB/mo used. Pay-as-you-go is $0.10/GB ($3/mo min)."
+            )
+        );
+
+        let at_100 = bandwidth_warning(AT_100, Some(1)).unwrap();
+        assert_eq!(
+            at_100,
+            HobbyReason::Bandwidth {
+                percent: 100,
+                limit_gb: 1
+            }
+        );
+        let included = bandwidth_notice(
+            "Hobby plan: 1 GB/mo included bandwidth used. Pay-as-you-go is $0.10/GB ($3/mo min).",
+        );
+        assert_eq!(at_100.message(Surface::Cli), included);
+        // Past the included amount the sentence stays a notice, not a hard stop.
+        let over = bandwidth_warning(AT_100.saturating_mul(2), Some(1))
+            .unwrap()
+            .message(Surface::Cli);
+        assert_eq!(over, included);
+        assert!(!over.to_ascii_lowercase().contains("limit reached"));
+        assert!(!over.to_ascii_lowercase().contains("stopped"));
+    }
+
+    #[test]
+    fn non_free_plans_are_not_nudged_even_with_numeric_caps() {
+        let over_bytes = BYTES_PER_GB.saturating_mul(3);
+        for model in ["metered", "subscription", "FREE", ""] {
+            let gate = gate_for_plan(model, Some(2), 5, false, Some("myapp"), over_bytes, Some(1));
+            assert_eq!(gate.block, None, "{model}");
+            assert_eq!(gate.notice, None, "{model}");
+        }
+
+        let free = gate_for_plan(
+            "free",
+            Some(2),
+            5,
+            false,
+            Some("myapp"),
+            over_bytes,
+            Some(1),
+        );
+        assert_eq!(free.block, Some(HobbyReason::TunnelLimit { limit: 2 }));
+        assert_eq!(free.notice, None);
+
+        let notice = gate_for_plan("free", Some(2), 0, true, None, 858_993_460, Some(1));
+        assert_eq!(notice.block, None);
+        assert_eq!(
+            notice.notice,
+            Some(HobbyReason::Bandwidth {
+                percent: 80,
+                limit_gb: 1,
+            })
+        );
     }
 
     #[tokio::test]
