@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod auth;
+pub mod billing;
 pub mod config;
 pub mod control;
 pub mod core;

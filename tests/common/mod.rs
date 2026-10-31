@@ -405,6 +405,7 @@ impl TestServer {
             testing: rustunnel_server::config::TestingSection {
                 override_server_version: server_version_override.clone(),
             },
+            platform: rustunnel_server::config::PlatformSection::default(),
         });
 
         // Database.
@@ -718,6 +719,7 @@ impl TestClient {
             group: Some(group_name.to_string()),
             group_key_hash: Some(group_key_hash.to_string()),
             health_check,
+            client_surface: None,
         })
         .await?;
         match self.recv_timeout(Duration::from_secs(5)).await? {
@@ -759,6 +761,7 @@ impl TestClient {
             group: Some(group_name.to_string()),
             group_key_hash: Some(group_key_hash.to_string()),
             health_check: None,
+            client_surface: None,
         })
         .await?;
 
@@ -797,6 +800,7 @@ impl TestClient {
             group: None,
             group_key_hash: None,
             health_check: None,
+            client_surface: None,
         })
         .await?;
 
@@ -840,6 +844,7 @@ impl TestClient {
             group: Some(group_name.to_string()),
             group_key_hash: Some(group_key_hash.to_string()),
             health_check: None,
+            client_surface: None,
         })
         .await?;
 
@@ -870,6 +875,7 @@ impl TestClient {
             group: None,
             group_key_hash: None,
             health_check: None,
+            client_surface: None,
         })
         .await?;
 
@@ -900,6 +906,7 @@ impl TestClient {
             group: None,
             group_key_hash: None,
             health_check: None,
+            client_surface: None,
         })
         .await?;
 
@@ -934,6 +941,7 @@ impl TestClient {
             group: None,
             group_key_hash: None,
             health_check: None,
+            client_surface: None,
         })
         .await?;
 

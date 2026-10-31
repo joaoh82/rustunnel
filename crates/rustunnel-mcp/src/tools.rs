@@ -573,9 +573,15 @@ async fn create_tunnel(args: &Value, state: &Arc<State>) -> Value {
     let cli = resolve_cli_path();
     let mut cmd = tokio::process::Command::new(&cli);
     cmd.args(&plan.args)
-        // Suppress CLI output so it doesn't interfere with MCP stdio.
+        // The edge stamps utm_source from this. Released CLIs ignore it and
+        // still print the cli URL; we rewrite that below.
+        .env("RUSTUNNEL_SURFACE", "mcp")
+        // Suppress CLI stdout so it doesn't interfere with MCP stdio.
+        // stderr is captured so a Hobby-limit rejection becomes the tool error
+        // instead of a generic timeout.
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
 
     let mut child_opt = match cmd.spawn() {
         Ok(c) => Some(c),
@@ -590,8 +596,44 @@ async fn create_tunnel(args: &Value, state: &Arc<State>) -> Value {
         }
     };
 
+    let stderr_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_task = child_opt.as_mut().and_then(|child| {
+        let stderr = child.stderr.take()?;
+        let buf = Arc::clone(&stderr_buf);
+        Some(tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let mut guard = buf.lock().unwrap_or_else(|p| p.into_inner());
+                        if guard.len() < 8 * 1024 {
+                            guard.push_str(&line);
+                        }
+                    }
+                }
+            }
+        }))
+    });
+
     // Poll the API for up to 15 seconds waiting for the new tunnel to appear.
+    // A fast CLI exit (Hobby limit, bad token) ends the wait immediately.
+    let mut cli_exited = false;
     for _ in 0..30 {
+        if let Some(child) = child_opt.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    cli_exited = true;
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("failed to poll rustunnel process: {e}"),
+            }
+        }
+
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         match state.api.list_tunnels(&token).await {
@@ -627,16 +669,80 @@ async fn create_tunnel(args: &Value, state: &Arc<State>) -> Value {
         }
     }
 
-    // Timeout — kill the subprocess and remove the temp config to avoid leaks.
+    // Timeout or CLI exit. Kill a still-running subprocess and drop the temp config.
     if let Some(mut child) = child_opt {
-        let _ = child.start_kill();
+        if !cli_exited {
+            let _ = child.start_kill();
+        }
+        let _ = child.wait().await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
     cleanup_temp(&plan.temp_config);
+
+    let collected = stderr_buf.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if cli_exited {
+        return tool_err(cli_exit_tool_error(&collected));
+    }
+    if let Some(text) = upgrade_text_from_cli_output(&collected) {
+        return tool_err(text);
+    }
 
     tool_err(
         "timeout: tunnel did not appear within 15 seconds. \
         Check that the server address and token are correct.",
     )
+}
+
+/// Pull the Hobby upgrade copy out of CLI stderr and stamp `utm_source=mcp`.
+///
+/// Released CLIs print `error: tunnel error: {server message}`. The server
+/// message already contains the full upgrade URL with `utm_source=cli`.
+fn upgrade_text_from_cli_output(raw: &str) -> Option<String> {
+    let text = raw.replace("\r\n", "\n");
+    let start = text.find("Hobby plan")?;
+    let mut lines: Vec<String> = Vec::new();
+    for (i, line) in text[start..].lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            if !lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if i > 0 && !line.starts_with("Upgrade:") && !line.starts_with("https://") {
+            break;
+        }
+        lines.push(line.to_string());
+        if line.starts_with("Upgrade:") || line.starts_with("https://") {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut msg = lines.join("\n");
+    if let Some(idx) = msg.find("Hobby plan") {
+        msg = msg[idx..].to_string();
+    }
+    Some(msg.replace("utm_source=cli", "utm_source=mcp"))
+}
+
+/// Tool error when the CLI process exits before a tunnel is registered.
+fn cli_exit_tool_error(stderr: &str) -> String {
+    if let Some(text) = upgrade_text_from_cli_output(stderr) {
+        return text;
+    }
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|l| l.contains("error:"))
+        .map(str::trim);
+    match line {
+        Some(line) => format!("rustunnel exited before the tunnel was registered.\n{line}"),
+        None => "rustunnel exited before the tunnel was registered.".into(),
+    }
 }
 
 fn cleanup_temp(path: &Option<PathBuf>) {
@@ -952,5 +1058,42 @@ mod tests {
             };
             assert!(p.ends_with(name));
         }
+    }
+
+    #[test]
+    fn upgrade_text_rewrites_released_cli_stderr_to_mcp() {
+        let raw = "\
+some tracing line\n\
+error: tunnel error: Hobby plan limit: 2 concurrent tunnels. Pay-as-you-go removes the cap ($3/mo min).\n\
+Upgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_campaign=hobby_limit&utm_content=tunnel_limit\n";
+        let text = upgrade_text_from_cli_output(raw).unwrap();
+        assert!(text.starts_with("Hobby plan limit: 2 concurrent tunnels."));
+        assert!(text.contains("utm_source=mcp"));
+        assert!(text.contains("utm_content=tunnel_limit"));
+        assert!(!text.contains("error: tunnel error:"));
+        assert!(!text.contains("utm_source=cli"));
+        assert_eq!(cli_exit_tool_error(raw), text);
+    }
+
+    #[test]
+    fn upgrade_text_keeps_a_new_cli_message_and_rewrites_subdomain() {
+        let raw = "\
+Hobby plan limit: custom subdomains need Pay-as-you-go ($3/mo min, $0.10/GB).\n\
+Upgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_campaign=hobby_limit&utm_content=subdomain\n";
+        let text = upgrade_text_from_cli_output(raw).unwrap();
+        assert!(text.starts_with("Hobby plan limit: custom subdomains"));
+        assert!(text.contains("utm_source=mcp"));
+        assert!(text.contains("utm_content=subdomain"));
+    }
+
+    #[test]
+    fn upgrade_text_ignores_unrelated_cli_errors() {
+        assert!(upgrade_text_from_cli_output(
+            "error: tunnel error: subdomain 'x' is already in use\n"
+        )
+        .is_none());
+        let msg = cli_exit_tool_error("error: tunnel error: subdomain 'x' is already in use\n");
+        assert!(msg.contains("subdomain 'x' is already in use"));
+        assert!(msg.contains("exited before"));
     }
 }

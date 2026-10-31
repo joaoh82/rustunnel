@@ -329,6 +329,7 @@ pub async fn connect(
 
     // 3. Register tunnels —————————————————————————————————————————————————
     let mut registered: Vec<(TunnelDef, String)> = Vec::new();
+    let mut notices: Vec<String> = Vec::new();
 
     for tunnel in tunnels {
         // P2P subscribers don't register a tunnel — they send P2pConnect instead.
@@ -391,6 +392,7 @@ pub async fn connect(
                 group: effective_group,
                 group_key_hash: effective_group_key_hash,
                 health_check: effective_health_check,
+                client_surface: client_surface_from_env(),
             },
         )
         .await?;
@@ -399,9 +401,13 @@ pub async fn connect(
             ControlFrame::TunnelRegistered {
                 public_url,
                 tunnel_id,
+                notice,
                 ..
             } => {
                 info!(%public_url, %tunnel_id, "tunnel registered");
+                if let Some(notice) = notice.filter(|n| !n.is_empty()) {
+                    notices.push(notice);
+                }
                 // Store tunnel_id on the TunnelDef for later use (P2P NAT info).
                 let mut tdef = tunnel.clone();
                 tdef.registered_tunnel_id = Some(tunnel_id);
@@ -587,6 +593,22 @@ pub async fn connect(
         }
     }
 
+    // Bandwidth (and any future) notices ride on TunnelRegistered. Released
+    // clients ignore the field. Print the server text as-is.
+    for notice in &notices {
+        if output::json_mode() {
+            output::emit(&output::Event::Notice {
+                message: notice.clone(),
+            });
+        } else {
+            inspector.push_log(notice.clone());
+            if !crate::tui::active() {
+                eprintln!("{notice}");
+                eprintln!();
+            }
+        }
+    }
+
     // 6. Spawn health-probe tasks for tunnels with a health_check ─────────
     //    Each probe task writes `TunnelHealthy` / `TunnelUnhealthy` frames
     //    into `outbound_frame_tx`; main_loop drains that channel and writes
@@ -641,6 +663,17 @@ pub async fn connect(
         inspector,
     )
     .await
+}
+
+/// `RUSTUNNEL_SURFACE=mcp` is set by the MCP server. Anything else, including
+/// an unset variable, stays off the wire so released-CLI payloads are unchanged.
+fn client_surface_from_env() -> Option<String> {
+    client_surface_from_value(std::env::var("RUSTUNNEL_SURFACE").ok().as_deref())
+}
+
+fn client_surface_from_value(raw: Option<&str>) -> Option<String> {
+    raw.filter(|s| s.trim().eq_ignore_ascii_case("mcp"))
+        .map(|_| "mcp".to_string())
 }
 
 /// Display name for a tunnel: its subdomain, P2P name, or a generic fallback.
@@ -1187,4 +1220,24 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_surface_from_value;
+
+    #[test]
+    fn client_surface_is_sent_only_for_mcp() {
+        assert_eq!(client_surface_from_value(None), None);
+        assert_eq!(client_surface_from_value(Some("cli")), None);
+        assert_eq!(client_surface_from_value(Some("")), None);
+        assert_eq!(
+            client_surface_from_value(Some("mcp")).as_deref(),
+            Some("mcp")
+        );
+        assert_eq!(
+            client_surface_from_value(Some(" MCP ")).as_deref(),
+            Some("mcp")
+        );
+    }
 }
