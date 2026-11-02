@@ -1,6 +1,6 @@
 [package]
 name = "rustunnel-mcp"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 description = "MCP (Model Context Protocol) server for rustunnel. Lets AI agents (Claude Code, Cursor, Windsurf) create and manage public tunnels to local services from inside an agent session."
 keywords = ["mcp", "tunnel", "claude", "ai-agent", "webhook"]

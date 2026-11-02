@@ -1,6 +1,6 @@
 [package]
 name = "rustunnel-protocol"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 description = "Shared protocol types for rustunnel — the open-source secure tunnel server. Used by rustunnel-server, rustunnel-client, and rustunnel-mcp."
 keywords = ["tunnel", "ngrok", "protocol", "rustunnel"]
