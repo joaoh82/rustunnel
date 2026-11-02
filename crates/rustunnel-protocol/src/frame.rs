@@ -107,6 +107,10 @@ pub enum ControlFrame {
         /// probes its local service and reports `TunnelHealthy`/`TunnelUnhealthy`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         health_check: Option<HealthCheckSpec>,
+        /// Who is driving this registration. `"mcp"` selects the MCP upgrade
+        /// URL. Omitted by released CLIs; the server treats absence as `cli`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_surface: Option<String>,
     },
     TunnelRegistered {
         request_id: String,
@@ -116,6 +120,10 @@ pub enum ControlFrame {
         /// The assigned P2P tunnel name (P2P publisher only).
         #[serde(skip_serializing_if = "Option::is_none")]
         p2p_tunnel_name: Option<String>,
+        /// Optional notice, currently the Hobby bandwidth warning at >= 80%.
+        /// Released clients ignore the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
     },
     TunnelError {
         request_id: String,
@@ -233,11 +241,13 @@ mod tests {
                 group,
                 group_key_hash,
                 health_check,
+                client_surface,
                 ..
             } => {
                 assert!(group.is_none());
                 assert!(group_key_hash.is_none());
                 assert!(health_check.is_none());
+                assert!(client_surface.is_none());
             }
             other => panic!("unexpected frame: {other:?}"),
         }
@@ -247,6 +257,7 @@ mod tests {
         assert!(!reencoded.contains("\"group\""));
         assert!(!reencoded.contains("\"group_key_hash\""));
         assert!(!reencoded.contains("\"health_check\""));
+        assert!(!reencoded.contains("\"client_surface\""));
     }
 
     #[test]
@@ -269,6 +280,7 @@ mod tests {
                 http_expect_2xx: true,
                 alert_webhook_url: Some("https://hooks.example.com/tenant-A".into()),
             }),
+            client_surface: None,
         };
         let bytes = encode_frame(&frame);
         let decoded = decode_frame(&bytes).expect("decode round-trip");
@@ -320,5 +332,33 @@ mod tests {
             r#"{"type":"tunnel_healthy","tunnel_id":"00000000-0000-0000-0000-000000000000"}"#;
         let frame = decode_frame(payload.as_bytes()).expect("decode tunnel_healthy");
         assert!(matches!(frame, ControlFrame::TunnelHealthy { .. }));
+    }
+
+    /// An old edge omits `notice`. New clients must still decode the frame.
+    #[test]
+    fn tunnel_registered_without_notice_decodes() {
+        let payload = r#"{"type":"tunnel_registered","request_id":"r","tunnel_id":"00000000-0000-0000-0000-000000000000","public_url":"https://x.example","assigned_port":null}"#;
+        let frame = decode_frame(payload.as_bytes()).expect("decode tunnel_registered");
+        match frame {
+            ControlFrame::TunnelRegistered {
+                notice, public_url, ..
+            } => {
+                assert!(notice.is_none());
+                assert_eq!(public_url, "https://x.example");
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_tunnel_client_surface_round_trip() {
+        let payload = r#"{"type":"register_tunnel","request_id":"req-1","protocol":"http","subdomain":"foo","local_addr":"127.0.0.1:3000","client_surface":"mcp"}"#;
+        let frame = decode_frame(payload.as_bytes()).expect("decode");
+        match frame {
+            ControlFrame::RegisterTunnel { client_surface, .. } => {
+                assert_eq!(client_surface.as_deref(), Some("mcp"));
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
     }
 }

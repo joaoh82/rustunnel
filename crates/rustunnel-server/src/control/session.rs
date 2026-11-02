@@ -517,6 +517,7 @@ where
             group,
             group_key_hash,
             health_check,
+            client_surface,
         } => {
             tracing::debug!(%session_id, %request_id, ?protocol, "register tunnel");
 
@@ -560,6 +561,12 @@ where
                 _ => None,
             };
 
+            // Released CLIs print `TunnelError.message` and ignore new frame
+            // fields, so Hobby upgrade copy is that string. `client_surface`
+            // is omitted by those CLIs and means `cli`.
+            let surface = crate::billing::Surface::parse(client_surface.as_deref());
+            let mut registration_notice: Option<String> = None;
+
             // ── Token limit enforcement ────────────────────────────────────
             // status is always checked; limit/expiry checks are skipped for
             // unlimited tokens and for tokens with no user_id (direct/admin/legacy tokens).
@@ -591,60 +598,44 @@ where
                             return Ok(());
                         }
                     }
-                    // Enforce the user's plan tunnel limit globally across all their tokens.
-                    // Bypassed for tokens with no user_id (direct/admin/legacy tokens).
+                    // Plan limits are per user, not per token, so extra tokens
+                    // cannot raise the cap. Tokens with no user_id (direct,
+                    // admin, legacy) skip the check.
                     if let Some(user_id) = token.user_id {
-                        let plan = sqlx::query_as::<_, (Option<i32>, bool)>(
-                            "SELECT p.max_tunnels, p.allow_custom_subdomains \
-                             FROM subscriptions s \
-                             JOIN plans p ON p.id = s.plan_id \
-                             WHERE s.user_id = $1 AND s.status = 'active' \
-                             ORDER BY s.created_at DESC LIMIT 1",
+                        let gate = crate::billing::evaluate_hobby_limits(
+                            &db.pg,
+                            user_id,
+                            subdomain.as_deref(),
                         )
-                        .bind(user_id)
-                        .fetch_optional(&db.pg)
                         .await?;
-
-                        if let Some((max_tunnels, allow_custom_subdomains)) = plan {
-                            // Tunnel count limit.
-                            if let Some(limit) = max_tunnels {
-                                let row: (i64,) = sqlx::query_as(
-                                    "SELECT COUNT(*) FROM tunnel_log \
-                                     WHERE user_id = $1 AND unregistered_at IS NULL",
-                                )
-                                .bind(user_id)
-                                .fetch_one(&db.pg)
-                                .await?;
-                                if row.0 >= limit as i64 {
-                                    send_frame(
-                                        ws,
-                                        &ControlFrame::TunnelError {
-                                            request_id,
-                                            message: format!("tunnel limit of {limit} reached"),
-                                        },
-                                    )
-                                    .await?;
-                                    return Ok(());
-                                }
-                            }
-
-                            // Custom subdomain gate — only HTTP/HTTPS tunnels use subdomains.
-                            if !allow_custom_subdomains {
-                                if let Some(ref requested) = subdomain {
-                                    if !requested.is_empty() {
-                                        send_frame(
-                                            ws,
-                                            &ControlFrame::TunnelError {
-                                                request_id,
-                                                message: "custom subdomains require a paid plan"
-                                                    .into(),
-                                            },
-                                        )
-                                        .await?;
-                                        return Ok(());
-                                    }
-                                }
-                            }
+                        if let Some(block) = gate.block {
+                            let message = block.message(surface);
+                            crate::billing::spawn_hobby_limit_report(
+                                &config.platform,
+                                &config.region.id,
+                                user_id,
+                                &block,
+                                surface,
+                            );
+                            send_frame(
+                                ws,
+                                &ControlFrame::TunnelError {
+                                    request_id,
+                                    message,
+                                },
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        if let Some(warning) = gate.notice {
+                            crate::billing::spawn_hobby_limit_report(
+                                &config.platform,
+                                &config.region.id,
+                                user_id,
+                                &warning,
+                                surface,
+                            );
+                            registration_notice = Some(warning.message(surface));
                         }
                     }
                 }
@@ -695,6 +686,7 @@ where
                                     public_url,
                                     assigned_port: None,
                                     p2p_tunnel_name: None,
+                                    notice: registration_notice.clone(),
                                 },
                             )
                             .await?;
@@ -742,6 +734,7 @@ where
                                 public_url,
                                 assigned_port: Some(port),
                                 p2p_tunnel_name: None,
+                                notice: registration_notice.clone(),
                             },
                         )
                         .await?;
@@ -788,6 +781,7 @@ where
                                 public_url,
                                 assigned_port: Some(port),
                                 p2p_tunnel_name: None,
+                                notice: registration_notice.clone(),
                             },
                         )
                         .await?;
@@ -874,6 +868,7 @@ where
                                     public_url,
                                     assigned_port: None,
                                     p2p_tunnel_name: Some(name),
+                                    notice: registration_notice.clone(),
                                 },
                             )
                             .await?;

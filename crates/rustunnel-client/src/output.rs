@@ -79,6 +79,9 @@ pub enum Event {
     },
     /// A reconnect attempt succeeded; fresh `tunnel_ready` events follow.
     Reconnected,
+    /// Server-attached notice. Today this is the Hobby bandwidth warning
+    /// printed when month-to-date usage is at least 80% of the plan cap.
+    Notice { message: String },
     /// Fatal error — the process exits with code 1 after this line.
     Error {
         code: String,
@@ -208,6 +211,17 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
             r#"{"event":"inspector_ready","url":"http://127.0.0.1:4040"}"#
+        );
+    }
+
+    #[test]
+    fn notice_event_shape() {
+        let ev = Event::Notice {
+            message: "Hobby plan: 80% of 1 GB/mo used. Pay-as-you-go is $0.10/GB ($3/mo min).\nUpgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_campaign=hobby_limit&utm_content=bandwidth".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"event":"notice","message":"Hobby plan: 80% of 1 GB/mo used. Pay-as-you-go is $0.10/GB ($3/mo min).\nUpgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_campaign=hobby_limit&utm_content=bandwidth"}"#
         );
     }
 

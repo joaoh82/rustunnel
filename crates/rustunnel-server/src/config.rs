@@ -28,6 +28,50 @@ pub struct ServerConfig {
     /// not honoured. Flip per region during the EU → US → AP rollout.
     #[serde(default)]
     pub load_balancing: LoadBalancingSection,
+    /// platform-api base URL and shared secret for Hobby-limit reports.
+    /// Absent on self-hosted configs: reporting stays off.
+    #[serde(default)]
+    pub platform: PlatformSection,
+}
+
+/// Where the edge reports Hobby-limit hits so platform-api can dedupe and
+/// emit `payg_nudge_shown`. Both fields empty (the default) disables the call.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PlatformSection {
+    /// Base URL of platform-api, for example `https://api.rustunnel.com`.
+    #[serde(default)]
+    pub api_url: String,
+    /// Bearer token platform-api expects on `POST /internal/hobby-limit`.
+    #[serde(default)]
+    pub internal_token: String,
+}
+
+impl PlatformSection {
+    /// True only when a report would actually be sent.
+    pub fn reporting_enabled(&self) -> bool {
+        !self.api_url.trim().is_empty() && !self.internal_token.trim().is_empty()
+    }
+
+    /// `POST` target. Trailing slashes on `api_url` are stripped.
+    pub fn hobby_limit_url(&self) -> String {
+        format!(
+            "{}/internal/hobby-limit",
+            self.api_url.trim().trim_end_matches('/')
+        )
+    }
+}
+
+fn apply_platform_env_overrides(platform: &mut PlatformSection) {
+    if let Ok(url) = std::env::var("RUSTUNNEL_PLATFORM_API_URL") {
+        if !url.trim().is_empty() {
+            platform.api_url = url;
+        }
+    }
+    if let Ok(token) = std::env::var("RUSTUNNEL_PLATFORM_INTERNAL_TOKEN") {
+        if !token.trim().is_empty() {
+            platform.internal_token = token;
+        }
+    }
 }
 
 /// Test-only knobs. Adding a `[testing]` section to `server.toml` is a
@@ -316,7 +360,10 @@ impl ServerConfig {
             ))
         })?;
 
-        toml::from_str(&raw).map_err(|e| Error::Config(format!("invalid config TOML: {e}")))
+        let mut cfg: Self =
+            toml::from_str(&raw).map_err(|e| Error::Config(format!("invalid config TOML: {e}")))?;
+        apply_platform_env_overrides(&mut cfg.platform);
+        Ok(cfg)
     }
 }
 
@@ -379,6 +426,7 @@ impl Default for ServerConfig {
             p2p: P2pSection::default(),
             load_balancing: LoadBalancingSection::default(),
             testing: TestingSection::default(),
+            platform: PlatformSection::default(),
         }
     }
 }

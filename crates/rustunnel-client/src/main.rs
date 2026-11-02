@@ -252,11 +252,11 @@ async fn main() {
             // Machine-readable fatal error: one JSON line on stdout, exit 1.
             output::emit(&output::Event::Error {
                 code: e.code().to_string(),
-                message: e.to_string(),
+                message: e.public_message(),
                 hint: e.hint().map(str::to_string),
             });
         } else {
-            eprintln!("error: {e}");
+            eprintln!("{}", e.rendered());
         }
         std::process::exit(1);
     }

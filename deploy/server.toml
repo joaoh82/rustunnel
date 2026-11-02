@@ -166,3 +166,14 @@ stun_servers = ["stun.l.google.com:19302", "stun1.l.google.com:19302"]
 # Hole punch timeout in milliseconds. If probes don't succeed within
 # this window, the connection falls back to relay.
 punch_timeout_ms = 5000
+
+# ── Platform API (Hobby-limit analytics) ──────────────────────────────────────
+# When both values are set, the edge POSTs Hobby-limit hits to platform-api
+# (`POST /internal/hobby-limit`) so it can dedupe and emit payg_nudge_shown.
+# An empty internal_token disables the call. Self-hosted servers should
+# leave this section out. Environment overrides:
+#   RUSTUNNEL_PLATFORM_API_URL
+#   RUSTUNNEL_PLATFORM_INTERNAL_TOKEN
+[platform]
+api_url = "https://api.rustunnel.com"
+internal_token = ""
