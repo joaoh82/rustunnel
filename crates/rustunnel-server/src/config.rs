@@ -37,6 +37,43 @@ pub struct ServerConfig {
     /// turns the periodic task off. Shutdown still flushes.
     #[serde(default)]
     pub metering: MeteringSection,
+    /// How often `usage_daily` is recomputed from `tunnel_log`.
+    /// Absent section keeps the 10 minute default. `interval_secs = 0`
+    /// turns the timer off. Historical backfill is a separate CLI command
+    /// and does not run from this timer.
+    #[serde(default)]
+    pub usage_rollup: UsageRollupSection,
+}
+
+/// Daily usage rollup (`usage_daily`) recomputed from `tunnel_log`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageRollupSection {
+    /// Seconds between recomputes of the recent UTC window. `0` disables
+    /// the timer. Default is 600 (10 minutes).
+    #[serde(default = "default_usage_rollup_interval_secs")]
+    pub interval_secs: u64,
+    /// How many UTC days, ending today, the timer recomputes. Values below
+    /// 2 are raised to 2 so yesterday is always refreshed. Values above 90
+    /// are capped. Default is 2. The backfill command is not capped by this.
+    #[serde(default = "default_usage_rollup_lookback_days")]
+    pub lookback_days: u32,
+}
+
+fn default_usage_rollup_interval_secs() -> u64 {
+    600
+}
+
+fn default_usage_rollup_lookback_days() -> u32 {
+    2
+}
+
+impl Default for UsageRollupSection {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_usage_rollup_interval_secs(),
+            lookback_days: default_usage_rollup_lookback_days(),
+        }
+    }
 }
 
 /// Live byte and request counter persistence.
@@ -455,6 +492,7 @@ impl Default for ServerConfig {
             testing: TestingSection::default(),
             platform: PlatformSection::default(),
             metering: MeteringSection::default(),
+            usage_rollup: UsageRollupSection::default(),
         }
     }
 }

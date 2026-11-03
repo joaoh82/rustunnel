@@ -407,6 +407,7 @@ impl TestServer {
             },
             platform: rustunnel_server::config::PlatformSection::default(),
             metering: rustunnel_server::config::MeteringSection::default(),
+            usage_rollup: rustunnel_server::config::UsageRollupSection::default(),
         });
 
         // Database.

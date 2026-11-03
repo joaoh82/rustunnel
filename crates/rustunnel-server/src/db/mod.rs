@@ -6,10 +6,17 @@
 
 mod metering;
 pub mod models;
+mod usage_rollup;
 
 pub use metering::{
     close_stale_tunnels, flush_and_close_live_meters, flush_live_meters, flush_tunnel_meters,
     log_tunnel_unregistered,
+};
+pub use usage_rollup::{
+    rollup_recent, rollup_usage_between, token_usage_stats, usage_bandwidth_series, usage_by_token,
+    usage_by_user, usage_daily_series, usage_leaderboard, LeaderboardSort, RollupOutcome,
+    TokenUsageStats, UsageBandwidthPoint, UsageByToken, UsageByUser, UsageDailyPoint,
+    UsageLeaderboardEntry,
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
