@@ -1,6 +1,6 @@
 [package]
 name = "rustunnel-server"
-version = "0.8.6"
+version = "0.8.7"
 edition = "2021"
 description = "Self-hosted, secure tunnel server in Rust. Exposes local HTTP/HTTPS/TCP/UDP services via TLS-encrypted WebSocket. Open-source ngrok alternative with multi-region and Prometheus metrics."
 keywords = ["tunnel", "ngrok", "self-hosted", "reverse-proxy", "webhook"]
