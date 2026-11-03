@@ -49,6 +49,11 @@ pub async fn run_dashboard(
     dashboard_origin: String,
     region: RegionSection,
 ) -> Result<()> {
+    // Bind before building the router so the port is taken before any
+    // slower setup, and a conflict fails the task immediately.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(%addr, "dashboard listening");
+
     let capture_store = start_capture_service(capture_rx, db.local.clone());
 
     let state = ApiState {
@@ -87,9 +92,6 @@ pub async fn run_dashboard(
             axum::http::header::HeaderName::from_static("x-frame-options"),
             HeaderValue::from_static("DENY"),
         ));
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "dashboard listening");
 
     // `ConnectInfo` is required by the failed-auth throttle (`api::auth_throttle`).
     axum::serve(

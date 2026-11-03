@@ -109,11 +109,73 @@ pub fn insecure_client_tls() -> Arc<ClientConfig> {
 // ── port selection ────────────────────────────────────────────────────────────
 
 /// Bind port 0 to let the OS assign a free port, then release it.
-/// There is a small TOCTOU window; acceptable for single-use ports (control,
-/// http, https, dashboard) that are bound within the same runtime tick.
+///
+/// The number can be taken by another test before the real listener binds.
+/// `TestServer` does not use this for its own listeners: it holds the
+/// sockets in `PortHolds` until each task is about to bind.
 pub fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
     l.local_addr().unwrap().port()
+}
+
+/// Listening sockets kept open so parallel tests cannot claim the same
+/// ephemeral port while `init_db` runs. Dropped inside the task that binds
+/// the real server socket.
+struct PortHolds {
+    control: std::net::TcpListener,
+    http: std::net::TcpListener,
+    https: std::net::TcpListener,
+    dashboard: std::net::TcpListener,
+}
+
+impl PortHolds {
+    fn ephemeral() -> Self {
+        fn grab() -> std::net::TcpListener {
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
+        }
+        Self {
+            control: grab(),
+            http: grab(),
+            https: grab(),
+            dashboard: grab(),
+        }
+    }
+
+    fn bind_exact(control: u16, http: u16, https: u16, dashboard: u16) -> Self {
+        fn grab(port: u16) -> std::net::TcpListener {
+            std::net::TcpListener::bind(("127.0.0.1", port))
+                .unwrap_or_else(|e| panic!("reserve 127.0.0.1:{port}: {e}"))
+        }
+        Self {
+            control: grab(control),
+            http: grab(http),
+            https: grab(https),
+            dashboard: grab(dashboard),
+        }
+    }
+
+    fn port(listener: &std::net::TcpListener) -> u16 {
+        listener.local_addr().expect("local addr").port()
+    }
+}
+
+/// True when `port` answers an HTTP/1 request. A TLS listener on that port
+/// returns false, so a stolen dashboard port is not treated as ready.
+async fn dashboard_speaks_http(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(mut stream) = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await else {
+        return false;
+    };
+    let req = b"GET /api/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 8];
+    let Ok(n) = stream.read(&mut buf).await else {
+        return false;
+    };
+    buf[..n].starts_with(b"HTTP/")
 }
 
 /// Atomically allocate a block of `count` consecutive TCP port numbers for use
@@ -209,49 +271,41 @@ impl TestServer {
 
     /// Start a server with configurable auth settings.
     pub async fn start_with(require_auth: bool, admin_token: &str) -> Self {
-        let control_port = free_port();
-        let http_port = free_port();
-        let https_port = free_port();
-        let dashboard_port = free_port();
-        // Atomically reserve a 10-port range so parallel tests never overlap.
-        let tcp_low = alloc_tcp_port_range(10);
-        let tcp_high = tcp_low + 9;
-        let udp_low = alloc_tcp_port_range(10);
-        let udp_high = udp_low + 9;
-        Self::start_on_ports(
-            control_port,
-            http_port,
-            https_port,
-            dashboard_port,
-            [tcp_low, tcp_high],
-            [udp_low, udp_high],
-            require_auth,
-            admin_token,
-        )
-        .await
+        Self::start_ephemeral(require_auth, admin_token, false).await
     }
 
     /// Start a server with the TUNNEL-7 load-balancing kill switch on.
     /// Used by the Phase 2 / Phase 3 group integration tests.
     pub async fn start_with_load_balancing() -> Self {
-        let control_port = free_port();
-        let http_port = free_port();
-        let https_port = free_port();
-        let dashboard_port = free_port();
+        Self::start_ephemeral(true, "integration-test-token", true).await
+    }
+
+    /// Pick four ephemeral ports and hold the sockets until the server binds.
+    async fn start_ephemeral(
+        require_auth: bool,
+        admin_token: &str,
+        load_balancing_enabled: bool,
+    ) -> Self {
+        let holds = PortHolds::ephemeral();
+        // Atomically reserve a 10-port range so parallel tests never overlap.
         let tcp_low = alloc_tcp_port_range(10);
-        let tcp_high = tcp_low + 9;
         let udp_low = alloc_tcp_port_range(10);
-        let udp_high = udp_low + 9;
-        Self::start_on_ports_with_load_balancing(
-            control_port,
-            http_port,
-            https_port,
-            dashboard_port,
-            [tcp_low, tcp_high],
-            [udp_low, udp_high],
-            true,
-            "integration-test-token",
-            true,
+        Self::start_with_opts_held(
+            TestServerOpts {
+                control_port: PortHolds::port(&holds.control),
+                http_port: PortHolds::port(&holds.http),
+                https_port: PortHolds::port(&holds.https),
+                dashboard_port: PortHolds::port(&holds.dashboard),
+                tcp_port_range: [tcp_low, tcp_low + 9],
+                udp_port_range: [udp_low, udp_low + 9],
+                require_auth,
+                admin_token: admin_token.to_string(),
+                load_balancing_enabled,
+                alert_webhook_url: None,
+                server_version_override: None,
+                plain_http_mode: rustunnel_server::edge::PlainHttpMode::Proxy,
+            },
+            holds,
         )
         .await
     }
@@ -299,20 +353,24 @@ impl TestServer {
         admin_token: &str,
         load_balancing_enabled: bool,
     ) -> Self {
-        Self::start_with_opts(TestServerOpts {
-            control_port,
-            http_port,
-            https_port,
-            dashboard_port,
-            tcp_port_range,
-            udp_port_range,
-            require_auth,
-            admin_token: admin_token.to_string(),
-            load_balancing_enabled,
-            alert_webhook_url: None,
-            server_version_override: None,
-            plain_http_mode: rustunnel_server::edge::PlainHttpMode::Proxy,
-        })
+        let holds = PortHolds::bind_exact(control_port, http_port, https_port, dashboard_port);
+        Self::start_with_opts_held(
+            TestServerOpts {
+                control_port,
+                http_port,
+                https_port,
+                dashboard_port,
+                tcp_port_range,
+                udp_port_range,
+                require_auth,
+                admin_token: admin_token.to_string(),
+                load_balancing_enabled,
+                alert_webhook_url: None,
+                server_version_override: None,
+                plain_http_mode: rustunnel_server::edge::PlainHttpMode::Proxy,
+            },
+            holds,
+        )
         .await
     }
 
@@ -320,6 +378,16 @@ impl TestServer {
     /// webhook, Phase 6 server-version override, …) can be added without
     /// growing the positional-arg list. Existing helpers wrap this.
     pub async fn start_with_opts(opts: TestServerOpts) -> Self {
+        let holds = PortHolds::bind_exact(
+            opts.control_port,
+            opts.http_port,
+            opts.https_port,
+            opts.dashboard_port,
+        );
+        Self::start_with_opts_held(opts, holds).await
+    }
+
+    async fn start_with_opts_held(opts: TestServerOpts, holds: PortHolds) -> Self {
         let TestServerOpts {
             control_port,
             http_port,
@@ -432,6 +500,12 @@ impl TestServer {
 
         let (capture_tx, capture_rx) = mpsc::channel(256);
         let mut task_handles = Vec::new();
+        let PortHolds {
+            control: control_hold,
+            http: http_hold,
+            https: https_hold,
+            dashboard: dashboard_hold,
+        } = holds;
 
         // a) Control plane.
         let control_addr: SocketAddr = format!("127.0.0.1:{control_port}").parse().unwrap();
@@ -441,6 +515,8 @@ impl TestServer {
             let tls_handle = Arc::clone(&tls_handle);
             let db = db.clone();
             async move {
+                // Release the reservation in this task, then bind.
+                drop(control_hold);
                 let _ = rustunnel_server::control::server::run_control_plane(
                     control_addr,
                     core,
@@ -466,6 +542,7 @@ impl TestServer {
                 plain_http_mode: config.server.plain_http_mode,
             };
             async move {
+                drop((http_hold, https_hold));
                 let _ = rustunnel_server::edge::run_http_edge(
                     http_addr,
                     https_addr,
@@ -496,6 +573,7 @@ impl TestServer {
             let db_dash = db.clone();
             let admin_token = config.auth.admin_token.clone();
             async move {
+                drop(dashboard_hold);
                 let _ = rustunnel_server::dashboard::run_dashboard(
                     dashboard_addr,
                     core,
@@ -515,19 +593,16 @@ impl TestServer {
         });
         task_handles.push(h.abort_handle());
 
-        // Wait until every public listener is actually accepting TCP
-        // connections — control plane, HTTP edge, HTTPS edge, dashboard.
-        // A fixed sleep is unreliable on CI; polling eliminates the race.
-        // We poll all four ports because the four background tasks bind
-        // their listeners independently. On a slow runner the test
-        // client can outrun the HTTPS bind and get ECONNREFUSED if we
-        // only wait for the control port.
+        // Wait until every public listener is actually accepting.
+        // A fixed sleep is unreliable on CI. The four background tasks
+        // bind independently, so a slow runner can accept on the control
+        // port before HTTPS is up. The dashboard must answer HTTP, not
+        // merely accept TCP.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         for (label, port) in [
             ("control plane", control_port),
             ("http edge", http_port),
             ("https edge", https_port),
-            ("dashboard", dashboard_port),
         ] {
             loop {
                 if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
@@ -542,6 +617,19 @@ impl TestServer {
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        }
+        // TCP accept is not enough for the dashboard: a stolen port can be
+        // another test's TLS listener, and reqwest then fails parsing the
+        // version. Require an HTTP status line.
+        loop {
+            if dashboard_speaks_http(dashboard_port).await {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dashboard on port {dashboard_port} did not speak HTTP within 10 seconds"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         Self {
