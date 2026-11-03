@@ -82,9 +82,9 @@ This document tracks the features that have already shipped and ideas planned fo
 - [x] Public website at [rustunnel.com](https://rustunnel.com) with marketing page, pricing, and documentation
 - [x] Self-service user registration and email verification — no manual token issuance
 - [x] User dashboard — API key management (create, label, revoke), usage stats, tunnel history
-- [x] Free tier — up to 3 tunnels, TLS/HTTPS termination included
-- [x] Pay-as-you-go plan — unlimited tunnels, custom subdomains, TLS/HTTPS termination
-- [x] Stripe billing integration — $3/month minimum + $0.10/GB overage above 30 GB
+- [x] Hobby (free) tier: 2 concurrent tunnels, random subdomains only, 1 GB, TLS/HTTPS termination included
+- [x] Pay-as-you-go plan: no tunnel cap, custom subdomains, TLS/HTTPS termination
+- [x] Stripe billing integration: $3/month minimum, credited at $0.10/GB
 - [x] Spend cap setting — users can cap their monthly PAYG spend from the dashboard
 - [x] Payment method management via Stripe Customer Portal
 - [x] Invoice history in the user dashboard

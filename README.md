@@ -88,13 +88,13 @@ Sign up for a free account at **[rustunnel.com](https://rustunnel.com)** — no 
 
 **Plans:**
 
-| Plan | Price | Tunnels | Custom subdomains | TLS/HTTPS |
-|------|-------|---------|-------------------|-----------|
-| Free | $0 | Up to 3 | — | ✓ |
-| Pay-as-you-go | $3/mo minimum + $0.10/GB | Unlimited | ✓ | ✓ |
-| Self-host | Free (run your own server) | Unlimited | ✓ | ✓ |
+| Plan | Price | Tunnels | Subdomains | Bandwidth | TLS/HTTPS |
+|------|-------|---------|------------|-----------|-----------|
+| Hobby (free) | $0 | 2 concurrent | Random only | 1 GB | ✓ |
+| Pay-as-you-go | $3/mo minimum, credited at $0.10/GB | No cap | Custom | $0.10/GB | ✓ |
+| Self-host | Free (run your own server) | Unlimited | Custom | Unmetered | ✓ |
 
-The free plan is a great way to get started. Upgrade to pay-as-you-go from your dashboard whenever you need custom subdomains or unlimited tunnels.
+The Hobby (free) plan is a great way to get started: 2 concurrent tunnels, random subdomains only, and 1 GB. Upgrade to pay-as-you-go from your dashboard whenever you need custom subdomains or more tunnels. Pay-as-you-go has no tunnel cap.
 
 ### Quick start with the hosted server
 
