@@ -15,10 +15,11 @@
 //! Byte rule, so a recompute is idempotent without a snapshot table:
 //! a closed tunnel's counters land on the UTC day of its last open
 //! microsecond (`unregistered_at` minus 1us, so a close at exactly
-//! midnight stays on the day that had the session). An open tunnel's
-//! flushed counters land on the UTC day of `now` minus 1us. Tunnel
-//! seconds always use the overlap with the UTC day, and an open row
-//! counts only up to `now`. Requests follow the byte rule.
+//! midnight stays on the day that had the session). An open tunnel
+//! contributes tunnel-seconds up to `now`, and no bytes or requests,
+//! until it closes. Requests follow the byte rule. `usage_events` is
+//! not the byte source: this server does not write slices there, and
+//! the table has no `token_id` or `protocol` to fill this grain.
 //!
 //! Legacy rows (before directional columns) have `bytes_in = 0`,
 //! `bytes_out = 0`, and `bytes_proxied > 0`. That total is stored as
@@ -645,14 +646,8 @@ clipped AS (
         GREATEST(tl.registered_at, b.start_at) AS overlap_start,
         LEAST(COALESCE(tl.unregistered_at, $3), b.end_at, $3) AS overlap_end,
         (
-            (
-                tl.unregistered_at IS NOT NULL
-                AND ((tl.unregistered_at - interval '1 microsecond') AT TIME ZONE 'UTC')::date = b.day
-            )
-            OR (
-                tl.unregistered_at IS NULL
-                AND (($3 - interval '1 microsecond') AT TIME ZONE 'UTC')::date = b.day
-            )
+            tl.unregistered_at IS NOT NULL
+            AND ((tl.unregistered_at - interval '1 microsecond') AT TIME ZONE 'UTC')::date = b.day
         ) AS attribute_bytes,
         tl.bytes_in,
         tl.bytes_out,
@@ -1023,7 +1018,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Open across the boundary. Seconds stop at `now`. Bytes land on today.
+        // Open across the boundary. Seconds stop at `now`. Bytes and
+        // requests stay off the rollup until the tunnel closes.
         let open_id = insert_log(
             &pool,
             Some(user_a),
@@ -1126,7 +1122,13 @@ mod tests {
         assert_eq!(http.sessions, 2);
         assert_eq!(http.tunnel_seconds, 7_200 + 3_600);
         assert_eq!(
-            http.bytes_proxied, 0,
+            (
+                http.bytes_in,
+                http.bytes_out,
+                http.bytes_proxied,
+                http.requests
+            ),
+            (0, 0, 0, 0),
             "open and not-yet-closed bytes wait for the close day"
         );
         assert_eq!(http.peak_concurrent_tunnels, 2);
@@ -1156,13 +1158,14 @@ mod tests {
         let day2 = slices(&pool, to, user_a).await;
         assert_eq!(day2.len(), 1);
         assert_eq!(day2[0].sessions, 2);
-        // Open tunnel: 00:00 to 06:30. Closed tunnel: 00:00 to 01:00.
+        // Open tunnel: 00:00 to 06:30 (seconds and a session, no bytes).
+        // Closed tunnel: 00:00 to 01:00, and its counters land on this day.
         assert_eq!(day2[0].tunnel_seconds, 23_400 + 3_600);
-        assert_eq!(day2[0].bytes_in, 110);
-        assert_eq!(day2[0].bytes_out, 29);
-        assert_eq!(day2[0].bytes_proxied, 139);
+        assert_eq!(day2[0].bytes_in, 100);
+        assert_eq!(day2[0].bytes_out, 25);
+        assert_eq!(day2[0].bytes_proxied, 125);
         assert_eq!(day2[0].bytes_direction_unknown, 0);
-        assert_eq!(day2[0].requests, 7);
+        assert_eq!(day2[0].requests, 5);
         assert_eq!(day2[0].peak_concurrent_tunnels, 2);
 
         let both = slices(&pool, from, user_c).await;
@@ -1534,6 +1537,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{daily}");
         assert_eq!(daily["days"], 7);
         assert_eq!(daily["exclude_test"], true);
+        assert_eq!(daily["note"], "Today's bytes include only closed tunnels.");
         let series = daily["series"].as_array().unwrap();
         assert_eq!(series.len(), 7);
         let today_row = series
@@ -1584,6 +1588,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{bw}");
+        assert_eq!(bw["note"], "Today's bytes include only closed tunnels.");
         assert_eq!(bw["series"].as_array().unwrap().len(), 90);
         let legacy = bw["series"]
             .as_array()
@@ -1622,6 +1627,7 @@ mod tests {
         let (status, tokens) =
             json_get(&app, "/api/admin/usage/tokens?days=7", "test-admin-token").await;
         assert_eq!(status, StatusCode::OK, "{tokens}");
+        assert!(tokens.get("note").is_none(), "{tokens}");
         assert_eq!(tokens["created_per_day"].as_array().unwrap().len(), 7);
         assert!(tokens.get("total").is_some());
         assert!(tokens.get("active_last_7_days").is_some());
@@ -1693,6 +1699,10 @@ mod tests {
         let (status, by_user) =
             json_get(&app, "/api/admin/usage/by-user?days=7", "test-admin-token").await;
         assert_eq!(status, StatusCode::OK, "{by_user}");
+        assert_eq!(
+            by_user["note"],
+            "Today's bytes include only closed tunnels."
+        );
         let entries = by_user["entries"].as_array().unwrap();
         assert_eq!(by_user["total"], 3);
         let user_a = entries
@@ -1741,6 +1751,10 @@ mod tests {
         let (status, by_token) =
             json_get(&app, "/api/admin/usage/by-token?days=7", "test-admin-token").await;
         assert_eq!(status, StatusCode::OK, "{by_token}");
+        assert_eq!(
+            by_token["note"],
+            "Today's bytes include only closed tunnels."
+        );
         let token_entries = by_token["entries"].as_array().unwrap();
         assert!(token_entries.iter().any(|e| e["token_id"] == tok_a));
         assert!(token_entries.iter().any(|e| e["token_id"] == tok_b));
@@ -1776,6 +1790,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{by_bw}");
+        assert_eq!(by_bw["note"], "Today's bytes include only closed tunnels.");
         let board = by_bw["entries"].as_array().unwrap();
         assert_eq!(board[0]["user_id"], real_a.to_string());
         assert_eq!(board[0]["bytes_total"], 500);

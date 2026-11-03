@@ -1770,6 +1770,23 @@ async fn admin_list_user_tokens(
 // scan `tunnel_log`. `exclude_test` defaults to true and drops users whose
 // email matches `joaoh82+%` or `joao.silva@carv.com`, case-insensitively.
 // System tokens (`tokens.system`) are always left out.
+//
+// Daily bytes count a tunnel on the UTC day it closes. When the window
+// includes today, the byte-bearing responses carry `note` so a reader
+// can see that an open tunnel is missing from today's bytes.
+
+/// Shown when a usage window includes today (UTC). Open tunnels have no
+/// byte row until they close, so today's bandwidth is a partial day.
+const CLOSED_TUNNEL_BYTE_NOTE: &str = "Today's bytes include only closed tunnels.";
+
+fn usage_byte_note(from: chrono::NaiveDate, to: chrono::NaiveDate) -> Option<&'static str> {
+    let today = chrono::Utc::now().date_naive();
+    if from <= today && today <= to {
+        Some(CLOSED_TUNNEL_BYTE_NOTE)
+    } else {
+        None
+    }
+}
 
 #[derive(Deserialize)]
 struct UsageWindowQuery {
@@ -1873,6 +1890,7 @@ async fn admin_usage_daily(
         Ok(series) => Json(serde_json::json!({
             "days": days,
             "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
             "series": series,
         }))
         .into_response(),
@@ -1899,6 +1917,7 @@ async fn admin_usage_bandwidth(
         Ok(series) => Json(serde_json::json!({
             "days": days,
             "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
             "series": series,
         }))
         .into_response(),
@@ -1955,6 +1974,7 @@ async fn admin_usage_by_user(
         Ok((entries, total)) => Json(serde_json::json!({
             "days": days,
             "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
             "total": total,
             "entries": entries,
         }))
@@ -1983,6 +2003,7 @@ async fn admin_usage_by_token(
         Ok((entries, total)) => Json(serde_json::json!({
             "days": days,
             "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
             "total": total,
             "entries": entries,
         }))
@@ -2017,6 +2038,7 @@ async fn admin_usage_leaderboard(
             "days": q.days,
             "sort": q.sort,
             "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
             "entries": entries,
         }))
         .into_response(),
