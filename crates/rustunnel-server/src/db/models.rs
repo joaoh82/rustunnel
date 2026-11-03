@@ -125,7 +125,11 @@ pub struct AdminTunnelEntry {
     pub registered_at: DateTime<Utc>,
     pub unregistered_at: Option<DateTime<Utc>>,
     pub region_id: Option<String>,
+    /// Combined total. Equal to `bytes_in + bytes_out` for rows written by
+    /// the meter flush. Older rows may have this set and the split at 0.
     pub bytes_proxied: i64,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
     pub request_count: i64,
     pub user_id: Option<Uuid>,
 }

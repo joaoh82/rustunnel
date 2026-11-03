@@ -32,6 +32,70 @@ pub struct ServerConfig {
     /// Absent on self-hosted configs: reporting stays off.
     #[serde(default)]
     pub platform: PlatformSection,
+    /// How often live tunnel counters are written to Postgres.
+    /// Absent section keeps the 60s default. `flush_interval_secs = 0`
+    /// turns the periodic task off. Shutdown still flushes.
+    #[serde(default)]
+    pub metering: MeteringSection,
+    /// How often `usage_daily` is recomputed from `tunnel_log`.
+    /// Absent section keeps the 10 minute default. `interval_secs = 0`
+    /// turns the timer off. Historical backfill is a separate CLI command
+    /// and does not run from this timer.
+    #[serde(default)]
+    pub usage_rollup: UsageRollupSection,
+}
+
+/// Daily usage rollup (`usage_daily`) recomputed from `tunnel_log`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageRollupSection {
+    /// Seconds between recomputes of the recent UTC window. `0` disables
+    /// the timer. Default is 600 (10 minutes).
+    #[serde(default = "default_usage_rollup_interval_secs")]
+    pub interval_secs: u64,
+    /// How many UTC days, ending today, the timer recomputes. Values below
+    /// 2 are raised to 2 so yesterday is always refreshed. Values above 90
+    /// are capped. Default is 2. The backfill command is not capped by this.
+    #[serde(default = "default_usage_rollup_lookback_days")]
+    pub lookback_days: u32,
+}
+
+fn default_usage_rollup_interval_secs() -> u64 {
+    600
+}
+
+fn default_usage_rollup_lookback_days() -> u32 {
+    2
+}
+
+impl Default for UsageRollupSection {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_usage_rollup_interval_secs(),
+            lookback_days: default_usage_rollup_lookback_days(),
+        }
+    }
+}
+
+/// Live byte and request counter persistence.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeteringSection {
+    /// Seconds between flushes of in-memory counters onto open `tunnel_log`
+    /// rows. A crash loses at most one interval. `0` disables the periodic
+    /// task. Default is 60.
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+}
+
+fn default_flush_interval_secs() -> u64 {
+    60
+}
+
+impl Default for MeteringSection {
+    fn default() -> Self {
+        Self {
+            flush_interval_secs: default_flush_interval_secs(),
+        }
+    }
 }
 
 /// Where the edge reports Hobby-limit hits so platform-api can dedupe and
@@ -427,6 +491,8 @@ impl Default for ServerConfig {
             load_balancing: LoadBalancingSection::default(),
             testing: TestingSection::default(),
             platform: PlatformSection::default(),
+            metering: MeteringSection::default(),
+            usage_rollup: UsageRollupSection::default(),
         }
     }
 }

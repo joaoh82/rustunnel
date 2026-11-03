@@ -17,9 +17,9 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::response::Response;
 use axum::{routing::get, Router};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use rustunnel_server::audit;
 use rustunnel_server::config::ServerConfig;
@@ -54,8 +54,25 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 )]
 struct Cli {
     /// Path to the server TOML configuration file.
-    #[arg(short, long)]
-    config: std::path::PathBuf,
+    #[arg(short, long, global = true)]
+    config: Option<std::path::PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Recompute usage_daily for a UTC date range, then exit.
+    /// Does not start the server and is never run on startup.
+    Backfill {
+        /// First UTC day, inclusive (YYYY-MM-DD).
+        #[arg(long)]
+        from: chrono::NaiveDate,
+        /// Last UTC day, inclusive (YYYY-MM-DD). Defaults to today UTC.
+        #[arg(long)]
+        to: Option<chrono::NaiveDate>,
+    },
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -69,14 +86,18 @@ async fn main() {
         .expect("failed to install rustls ring provider");
 
     let cli = Cli::parse();
+    let Some(config_path) = cli.config else {
+        eprintln!("fatal: --config is required");
+        std::process::exit(1);
+    };
 
     // Load config before tracing is initialised so we can eprintln! on error.
-    let config = match ServerConfig::from_file(&cli.config) {
+    let config = match ServerConfig::from_file(&config_path) {
         Ok(c) => Arc::new(c),
         Err(e) => {
             eprintln!(
                 "fatal: failed to load config '{}': {e}",
-                cli.config.display()
+                config_path.display()
             );
             std::process::exit(1);
         }
@@ -88,10 +109,55 @@ async fn main() {
 
     init_tracing(&config);
 
+    if let Some(CliCommand::Backfill { from, to }) = cli.command {
+        if let Err(e) = backfill_usage(config, from, to).await {
+            error!("usage backfill failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(e) = run(config).await {
         error!("server exited with error: {e}");
         std::process::exit(1);
     }
+}
+
+/// One-shot historical recompute. Not called from [`run`], so a normal
+/// start or deploy never backfills. Retries a few times if a live edge
+/// holds the rollup lock for a single tick.
+async fn backfill_usage(
+    config: Arc<ServerConfig>,
+    from: chrono::NaiveDate,
+    to: Option<chrono::NaiveDate>,
+) -> Result<()> {
+    let to = to.unwrap_or_else(|| chrono::Utc::now().date_naive());
+    if from > to {
+        return Err(rustunnel_server::error::Error::Config(format!(
+            "backfill --from {from} is after --to {to}"
+        )));
+    }
+    info!(%from, %to, "usage backfill starting");
+    let db = db::init_db(&config.database).await?;
+    for attempt in 1..=5 {
+        match db::rollup_usage_between(&db.pg, from, to, chrono::Utc::now()).await? {
+            db::RollupOutcome::Applied(applied) => {
+                info!(
+                    days = applied.days,
+                    rows = applied.rows,
+                    "usage backfill complete"
+                );
+                return Ok(());
+            }
+            db::RollupOutcome::SkippedBusy => {
+                warn!(attempt, "usage rollup lock is busy, retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    Err(rustunnel_server::error::Error::Config(
+        "usage backfill skipped: another rollup holds the advisory lock".into(),
+    ))
 }
 
 // ── main async body ───────────────────────────────────────────────────────────
@@ -101,11 +167,12 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
 
     info!(url = %config.database.url, "connecting to PostgreSQL");
     let db = db::init_db(&config.database).await?;
-    let stale = db::close_stale_tunnels(&db.pg).await?;
+    let stale = db::close_stale_tunnels(&db.pg, &config.region.id).await?;
     if stale > 0 {
         info!(
             count = stale,
-            "closed stale tunnel_log rows from previous run"
+            region = %config.region.id,
+            "closed stale tunnel_log rows from previous run in this region"
         );
     }
     info!("database ready");
@@ -236,6 +303,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let dashboard_origin = config.server.dashboard_origin.clone();
         let audit_tx = audit_tx.clone();
         let region = config.region.clone();
+        let db = db.clone();
         tokio::spawn(async move {
             if let Err(e) = run_dashboard(
                 dashboard_addr,
@@ -270,11 +338,80 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
 
     Arc::clone(&cert_manager).start_renewal_task();
 
+    // ── task g: periodic meter flush ──────────────────────────────────────────
+    //
+    // Writes absolute counters onto open tunnel_log rows so a crash loses at
+    // most one interval. `0` disables the task. Shutdown flushes either way.
+
+    let h_meter = {
+        let core = Arc::clone(&core);
+        let db = db.clone();
+        let interval = Duration::from_secs(config.metering.flush_interval_secs);
+        tokio::spawn(async move {
+            if interval.is_zero() {
+                info!("periodic tunnel meter flush disabled");
+                return;
+            }
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // the first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                match db::flush_live_meters(&db.pg, &core).await {
+                    Ok(n) if n > 0 => debug!(count = n, "flushed live tunnel meters"),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "periodic tunnel meter flush failed"),
+                }
+            }
+        })
+    };
+
+    // ── task h: usage_daily rollup ────────────────────────────────────────────
+    //
+    // One edge wins the advisory lock and recomputes today and yesterday.
+    // The others skip. `interval_secs = 0` disables the timer. Historical
+    // days are only filled by the `backfill` subcommand.
+
+    let h_rollup = {
+        let db = db.clone();
+        let interval_secs = config.usage_rollup.interval_secs;
+        let lookback_days = config.usage_rollup.lookback_days;
+        tokio::spawn(async move {
+            if interval_secs == 0 {
+                info!("usage rollup timer disabled");
+                return;
+            }
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match db::rollup_recent(&db.pg, lookback_days, chrono::Utc::now()).await {
+                    Ok(db::RollupOutcome::Applied(applied)) => {
+                        info!(
+                            days = applied.days,
+                            rows = applied.rows,
+                            "usage rollup applied"
+                        );
+                    }
+                    Ok(db::RollupOutcome::SkippedBusy) => {
+                        debug!("usage rollup skipped; another edge holds the lock");
+                    }
+                    Err(e) => warn!(error = %e, "usage rollup failed"),
+                }
+            }
+        })
+    };
+
     // ── wait for shutdown signal ──────────────────────────────────────────────
 
     wait_for_shutdown_signal().await;
 
-    info!("shutdown signal received — draining active sessions");
+    info!("shutdown signal received, flushing tunnel meters before close");
+    if let Err(e) = db::flush_live_meters(&db.pg, &core).await {
+        warn!(error = %e, "shutdown meter flush failed");
+    }
+
+    info!("draining active sessions");
 
     // Notify every active session so it can close cleanly.
     let session_count = core.sessions.len();
@@ -293,6 +430,8 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         h_udp.abort_handle(),
         h_dashboard.abort_handle(),
         h_metrics.abort_handle(),
+        h_meter.abort_handle(),
+        h_rollup.abort_handle(),
     ];
 
     // Allow up to 30 s for tasks to complete, then abort stragglers.
@@ -303,13 +442,22 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let _ = h_udp.await;
         let _ = h_dashboard.await;
         let _ = h_metrics.await;
+        let _ = h_meter.await;
+        let _ = h_rollup.await;
     })
     .await;
+
+    // Sessions that exited wrote their own close. Anything still registered
+    // is flushed again and closed here, so bytes gathered during the drain
+    // are not left only in memory.
+    if let Err(e) = db::flush_and_close_live_meters(&db.pg, &core).await {
+        warn!(error = %e, "final shutdown meter close failed");
+    }
 
     match drain_result {
         Ok(_) => info!("all tasks finished cleanly"),
         Err(_) => {
-            warn!("shutdown timeout exceeded — aborting remaining tasks");
+            warn!("shutdown timeout exceeded, aborting remaining tasks");
             for handle in &abort_handles {
                 handle.abort();
             }

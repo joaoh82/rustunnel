@@ -9,6 +9,7 @@
 //! before this module. When month-to-date `tunnel_log.bytes_proxied` is at
 //! least 80% of that cap, registration still succeeds and
 //! `TunnelRegistered.notice` carries a warning the new CLI prints.
+//! `bytes_proxied` is the combined total (`bytes_in + bytes_out`).
 //!
 //! # platform-api contract
 //!
@@ -37,6 +38,7 @@
 //! the upgrade URL uses `utm_content=subdomain`, which is the public link
 //! parameter, not the event name.
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -303,17 +305,48 @@ pub async fn evaluate_hobby_limits(
     ))
 }
 
-/// Bytes recorded on tunnels that closed during the current UTC month.
+/// Bytes recorded against the current UTC month.
 ///
-/// `tunnel_log.bytes_proxied` is written when a tunnel unregisters, so
-/// in-flight tunnels are not in this sum until they close.
-async fn month_bytes_proxied(pool: &PgPool, user_id: Uuid) -> Result<i64> {
+/// The summed column is `bytes_proxied` (kept equal to `bytes_in + bytes_out`
+/// by the meter flush). Each `tunnel_log` row counts in exactly one month,
+/// the same close-day attribution the usage_daily rollup uses:
+///
+/// - an open row (`unregistered_at IS NULL`) counts in the current UTC month,
+///   whatever `registered_at` is, so a flush is visible before close
+/// - a closed row counts in the UTC month of `unregistered_at`
+///
+/// A tunnel that stays open across a month boundary is not also attributed
+/// to its registration month, and that same cumulative total is not added
+/// again when the row later closes in a different month. The only filter
+/// besides the month rule is `user_id`.
+pub(crate) async fn month_bytes_proxied(pool: &PgPool, user_id: Uuid) -> Result<i64> {
+    month_bytes_proxied_at(pool, user_id, Utc::now()).await
+}
+
+/// Same sum as [`month_bytes_proxied`], with `at` as the clock.
+///
+/// Tests pass a fixed timestamp so the month does not depend on the real date.
+pub(crate) async fn month_bytes_proxied_at(
+    pool: &PgPool,
+    user_id: Uuid,
+    at: DateTime<Utc>,
+) -> Result<i64> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COALESCE(SUM(bytes_proxied), 0)::bigint FROM tunnel_log \
          WHERE user_id = $1 \
-           AND unregistered_at >= date_trunc('month', (now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC'",
+           AND ( \
+                unregistered_at IS NULL \
+                OR ( \
+                    unregistered_at >= date_trunc('month', ($2 AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' \
+                    AND unregistered_at < ( \
+                        (date_trunc('month', ($2 AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC') \
+                        + interval '1 month' \
+                    ) \
+                ) \
+           )",
     )
     .bind(user_id)
+    .bind(at)
     .fetch_one(pool)
     .await?;
     Ok(row.0)
@@ -613,5 +646,141 @@ Upgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_ca
             json["upgrade_url"],
             "https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_campaign=hobby_limit&utm_content=tunnel_limit"
         );
+    }
+
+    fn ts(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    async fn pool() -> PgPool {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://rustunnel:test@localhost:5432/rustunnel_test".to_string()
+        });
+        let db = crate::db::init_db(&crate::config::DatabaseSection {
+            url,
+            captured_path: ":memory:".into(),
+        })
+        .await
+        .expect("init_db");
+        db.pg
+    }
+
+    async fn insert_user(pool: &PgPool) -> Uuid {
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user_id)
+            .bind(format!("month-{user_id}@example.com"))
+            .execute(pool)
+            .await
+            .unwrap();
+        user_id
+    }
+
+    async fn insert_tunnel(
+        pool: &PgPool,
+        user_id: Uuid,
+        registered_at: DateTime<Utc>,
+        unregistered_at: Option<DateTime<Utc>>,
+        bytes_proxied: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO tunnel_log \
+                (id, tunnel_id, protocol, label, session_id, registered_at, \
+                 unregistered_at, region_id, user_id, bytes_proxied) \
+             VALUES ($1, $2, 'http', 'month-attr', $3, $4, $5, 'month-test', $6, $7)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(Uuid::new_v4().to_string())
+        .bind(Uuid::new_v4().to_string())
+        .bind(registered_at)
+        .bind(unregistered_at)
+        .bind(user_id)
+        .bind(bytes_proxied)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn cleanup(pool: &PgPool, user_id: Uuid) {
+        sqlx::query("DELETE FROM tunnel_log WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    const NOW_THIS_MONTH: &str = "2026-11-15T12:00:00Z";
+    const NOW_LAST_MONTH: &str = "2026-10-15T12:00:00Z";
+
+    #[tokio::test]
+    async fn open_cross_month_tunnel_counts_in_the_current_month_once() {
+        let pool = pool().await;
+        let user_id = insert_user(&pool).await;
+        // Registered in October, still open in November. 100 must not become 200.
+        insert_tunnel(&pool, user_id, ts("2026-10-20T08:00:00Z"), None, 100).await;
+
+        let current = month_bytes_proxied_at(&pool, user_id, ts(NOW_THIS_MONTH))
+            .await
+            .unwrap();
+        assert_eq!(current, 100);
+
+        cleanup(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn closed_this_month_counts_once_and_not_in_the_previous_month() {
+        let pool = pool().await;
+        let user_id = insert_user(&pool).await;
+        insert_tunnel(
+            &pool,
+            user_id,
+            ts("2026-10-20T08:00:00Z"),
+            Some(ts("2026-11-03T09:00:00Z")),
+            200,
+        )
+        .await;
+
+        let this_month = month_bytes_proxied_at(&pool, user_id, ts(NOW_THIS_MONTH))
+            .await
+            .unwrap();
+        let last_month = month_bytes_proxied_at(&pool, user_id, ts(NOW_LAST_MONTH))
+            .await
+            .unwrap();
+        assert_eq!(this_month, 200);
+        assert_eq!(last_month, 0);
+
+        cleanup(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn closed_last_month_does_not_count_this_month() {
+        let pool = pool().await;
+        let user_id = insert_user(&pool).await;
+        insert_tunnel(
+            &pool,
+            user_id,
+            ts("2026-10-02T08:00:00Z"),
+            Some(ts("2026-10-28T18:00:00Z")),
+            400,
+        )
+        .await;
+
+        let this_month = month_bytes_proxied_at(&pool, user_id, ts(NOW_THIS_MONTH))
+            .await
+            .unwrap();
+        let last_month = month_bytes_proxied_at(&pool, user_id, ts(NOW_LAST_MONTH))
+            .await
+            .unwrap();
+        assert_eq!(this_month, 0);
+        assert_eq!(last_month, 400);
+
+        cleanup(&pool, user_id).await;
     }
 }
