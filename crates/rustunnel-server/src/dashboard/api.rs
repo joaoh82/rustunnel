@@ -93,6 +93,12 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/admin/plans", get(admin_list_plans))
         .route("/api/admin/usage/platform", get(admin_platform_usage))
+        .route("/api/admin/usage/daily", get(admin_usage_daily))
+        .route("/api/admin/usage/bandwidth", get(admin_usage_bandwidth))
+        .route("/api/admin/usage/tokens", get(admin_usage_tokens))
+        .route("/api/admin/usage/by-user", get(admin_usage_by_user))
+        .route("/api/admin/usage/by-token", get(admin_usage_by_token))
+        .route("/api/admin/usage/leaderboard", get(admin_usage_leaderboard))
         .route(
             "/api/admin/metrics/users-over-time",
             get(admin_users_over_time),
@@ -1755,6 +1761,288 @@ async fn admin_list_user_tokens(
             }),
         )
             .into_response(),
+    }
+}
+
+// ── admin usage rollup routes ─────────────────────────────────────────────────
+//
+// These read `usage_daily` (and `tokens` for token counts). They do not
+// scan `tunnel_log`. `exclude_test` defaults to true and drops users whose
+// email matches `joaoh82+%` or `joao.silva@carv.com`, case-insensitively.
+// System tokens (`tokens.system`) are always left out.
+//
+// Daily bytes count a tunnel on the UTC day it closes. When the window
+// includes today, the byte-bearing responses carry `note` so a reader
+// can see that an open tunnel is missing from today's bytes.
+
+/// Shown when a usage window includes today (UTC). Open tunnels have no
+/// byte row until they close, so today's bandwidth is a partial day.
+const CLOSED_TUNNEL_BYTE_NOTE: &str = "Today's bytes include only closed tunnels.";
+
+fn usage_byte_note(from: chrono::NaiveDate, to: chrono::NaiveDate) -> Option<&'static str> {
+    let today = chrono::Utc::now().date_naive();
+    if from <= today && today <= to {
+        Some(CLOSED_TUNNEL_BYTE_NOTE)
+    } else {
+        None
+    }
+}
+
+#[derive(Deserialize)]
+struct UsageWindowQuery {
+    /// Trailing UTC days, 1 through 90. Default 30.
+    #[serde(default = "default_usage_days")]
+    days: i64,
+    /// Drop test-account emails. Default true. Pass `false` to include them.
+    #[serde(default = "default_exclude_test")]
+    exclude_test: bool,
+}
+
+#[derive(Deserialize)]
+struct UsagePageQuery {
+    #[serde(default = "default_usage_days")]
+    days: i64,
+    #[serde(default = "default_exclude_test")]
+    exclude_test: bool,
+    #[serde(default = "default_usage_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+#[derive(Deserialize)]
+struct LeaderboardQuery {
+    /// 7, 30, or 90. Default 30.
+    #[serde(default = "default_usage_days")]
+    days: i64,
+    /// `bandwidth`, `tunnel_hours`, or `peak_concurrent`. Default `bandwidth`.
+    #[serde(default = "default_leaderboard_sort")]
+    sort: String,
+    #[serde(default = "default_exclude_test")]
+    exclude_test: bool,
+    #[serde(default = "default_leaderboard_limit")]
+    limit: i64,
+}
+
+fn default_usage_days() -> i64 {
+    30
+}
+
+fn default_exclude_test() -> bool {
+    true
+}
+
+fn default_usage_limit() -> i64 {
+    100
+}
+
+fn default_leaderboard_sort() -> String {
+    "bandwidth".to_string()
+}
+
+fn default_leaderboard_limit() -> i64 {
+    100
+}
+
+fn bad_request(msg: &str) -> (StatusCode, Json<ErrBody>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrBody {
+            error: msg.to_string(),
+        }),
+    )
+}
+
+fn usage_range(days: i64) -> (chrono::NaiveDate, chrono::NaiveDate) {
+    let days = days.clamp(1, 90);
+    let end = chrono::Utc::now().date_naive();
+    let start = end
+        .checked_sub_days(chrono::Days::new((days as u64).saturating_sub(1)))
+        .unwrap_or(end);
+    (start, end)
+}
+
+fn db_err(e: crate::error::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrBody {
+            error: e.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /api/admin/usage/daily?days=30&exclude_test=true`
+///
+/// One point per UTC day: sessions, tunnel-seconds, tunnel-hours, active
+/// users, and requests. Days with no rows are zeroes.
+async fn admin_usage_daily(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<UsageWindowQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state).await {
+        return e.into_response();
+    }
+    let days = q.days.clamp(1, 90);
+    let (from, to) = usage_range(days);
+    match db::usage_daily_series(&state.db.pg, from, to, q.exclude_test).await {
+        Ok(series) => Json(serde_json::json!({
+            "days": days,
+            "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
+            "series": series,
+        }))
+        .into_response(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// `GET /api/admin/usage/bandwidth?days=30&exclude_test=true`
+///
+/// Daily bytes. `bytes_in` and `bytes_out` are null when the whole day is
+/// legacy `bytes_proxied` with no direction. `bytes_total` is always the
+/// combined total. `bytes_direction_unknown` is the legacy part of that total.
+async fn admin_usage_bandwidth(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<UsageWindowQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state).await {
+        return e.into_response();
+    }
+    let days = q.days.clamp(1, 90);
+    let (from, to) = usage_range(days);
+    match db::usage_bandwidth_series(&state.db.pg, from, to, q.exclude_test).await {
+        Ok(series) => Json(serde_json::json!({
+            "days": days,
+            "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
+            "series": series,
+        }))
+        .into_response(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// `GET /api/admin/usage/tokens?days=30&exclude_test=true`
+///
+/// `total` is every non-system token. `active_last_7_days` counts tokens
+/// whose `last_used_at` is within 7 days (a verify, not a tunnel open).
+/// `created_per_day` covers the `days` window. `days` does not change the
+/// 7-day active count.
+async fn admin_usage_tokens(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<UsageWindowQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state).await {
+        return e.into_response();
+    }
+    let days = q.days.clamp(1, 90);
+    let (from, to) = usage_range(days);
+    match db::token_usage_stats(&state.db.pg, from, to, q.exclude_test).await {
+        Ok(stats) => Json(serde_json::json!({
+            "days": days,
+            "exclude_test": q.exclude_test,
+            "total": stats.total,
+            "active_last_7_days": stats.active_last_7_days,
+            "created_per_day": stats.created_per_day,
+        }))
+        .into_response(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// `GET /api/admin/usage/by-user?days=30&exclude_test=true&limit=100&offset=0`
+///
+/// Sessions, tunnel-hours, bandwidth, requests, and peak concurrent tunnels
+/// per user. Peak is the max daily user-wide overlap in the window.
+async fn admin_usage_by_user(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<UsagePageQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state).await {
+        return e.into_response();
+    }
+    let days = q.days.clamp(1, 90);
+    let limit = q.limit.clamp(1, 500);
+    let offset = q.offset.max(0);
+    let (from, to) = usage_range(days);
+    match db::usage_by_user(&state.db.pg, from, to, q.exclude_test, limit, offset).await {
+        Ok((entries, total)) => Json(serde_json::json!({
+            "days": days,
+            "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
+            "total": total,
+            "entries": entries,
+        }))
+        .into_response(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// `GET /api/admin/usage/by-token?days=30&exclude_test=true&limit=100&offset=0`
+///
+/// Same measures per token. Peak is the max daily overlap for that token
+/// across regions and protocols. System tokens are omitted.
+async fn admin_usage_by_token(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<UsagePageQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state).await {
+        return e.into_response();
+    }
+    let days = q.days.clamp(1, 90);
+    let limit = q.limit.clamp(1, 500);
+    let offset = q.offset.max(0);
+    let (from, to) = usage_range(days);
+    match db::usage_by_token(&state.db.pg, from, to, q.exclude_test, limit, offset).await {
+        Ok((entries, total)) => Json(serde_json::json!({
+            "days": days,
+            "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
+            "total": total,
+            "entries": entries,
+        }))
+        .into_response(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// `GET /api/admin/usage/leaderboard?days=7|30|90&sort=bandwidth|tunnel_hours|peak_concurrent`
+///
+/// Top users. `days` must be 7, 30, or 90. Bandwidth sorts by total bytes
+/// (legacy rows included). Peak sorts by the max daily concurrent tunnels.
+async fn admin_usage_leaderboard(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<LeaderboardQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state).await {
+        return e.into_response();
+    }
+    if !matches!(q.days, 7 | 30 | 90) {
+        return bad_request("days must be 7, 30, or 90").into_response();
+    }
+    let Some(sort) = db::LeaderboardSort::parse(&q.sort) else {
+        return bad_request("sort must be bandwidth, tunnel_hours, or peak_concurrent")
+            .into_response();
+    };
+    let limit = q.limit.clamp(1, 100);
+    let (from, to) = usage_range(q.days);
+    match db::usage_leaderboard(&state.db.pg, from, to, q.exclude_test, sort, limit).await {
+        Ok(entries) => Json(serde_json::json!({
+            "days": q.days,
+            "sort": q.sort,
+            "exclude_test": q.exclude_test,
+            "note": usage_byte_note(from, to),
+            "entries": entries,
+        }))
+        .into_response(),
+        Err(e) => db_err(e),
     }
 }
 

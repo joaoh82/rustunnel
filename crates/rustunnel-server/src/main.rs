@@ -17,7 +17,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::response::Response;
 use axum::{routing::get, Router};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -54,8 +54,25 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 )]
 struct Cli {
     /// Path to the server TOML configuration file.
-    #[arg(short, long)]
-    config: std::path::PathBuf,
+    #[arg(short, long, global = true)]
+    config: Option<std::path::PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Recompute usage_daily for a UTC date range, then exit.
+    /// Does not start the server and is never run on startup.
+    Backfill {
+        /// First UTC day, inclusive (YYYY-MM-DD).
+        #[arg(long)]
+        from: chrono::NaiveDate,
+        /// Last UTC day, inclusive (YYYY-MM-DD). Defaults to today UTC.
+        #[arg(long)]
+        to: Option<chrono::NaiveDate>,
+    },
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -69,14 +86,18 @@ async fn main() {
         .expect("failed to install rustls ring provider");
 
     let cli = Cli::parse();
+    let Some(config_path) = cli.config else {
+        eprintln!("fatal: --config is required");
+        std::process::exit(1);
+    };
 
     // Load config before tracing is initialised so we can eprintln! on error.
-    let config = match ServerConfig::from_file(&cli.config) {
+    let config = match ServerConfig::from_file(&config_path) {
         Ok(c) => Arc::new(c),
         Err(e) => {
             eprintln!(
                 "fatal: failed to load config '{}': {e}",
-                cli.config.display()
+                config_path.display()
             );
             std::process::exit(1);
         }
@@ -88,10 +109,55 @@ async fn main() {
 
     init_tracing(&config);
 
+    if let Some(CliCommand::Backfill { from, to }) = cli.command {
+        if let Err(e) = backfill_usage(config, from, to).await {
+            error!("usage backfill failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(e) = run(config).await {
         error!("server exited with error: {e}");
         std::process::exit(1);
     }
+}
+
+/// One-shot historical recompute. Not called from [`run`], so a normal
+/// start or deploy never backfills. Retries a few times if a live edge
+/// holds the rollup lock for a single tick.
+async fn backfill_usage(
+    config: Arc<ServerConfig>,
+    from: chrono::NaiveDate,
+    to: Option<chrono::NaiveDate>,
+) -> Result<()> {
+    let to = to.unwrap_or_else(|| chrono::Utc::now().date_naive());
+    if from > to {
+        return Err(rustunnel_server::error::Error::Config(format!(
+            "backfill --from {from} is after --to {to}"
+        )));
+    }
+    info!(%from, %to, "usage backfill starting");
+    let db = db::init_db(&config.database).await?;
+    for attempt in 1..=5 {
+        match db::rollup_usage_between(&db.pg, from, to, chrono::Utc::now()).await? {
+            db::RollupOutcome::Applied(applied) => {
+                info!(
+                    days = applied.days,
+                    rows = applied.rows,
+                    "usage backfill complete"
+                );
+                return Ok(());
+            }
+            db::RollupOutcome::SkippedBusy => {
+                warn!(attempt, "usage rollup lock is busy, retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    Err(rustunnel_server::error::Error::Config(
+        "usage backfill skipped: another rollup holds the advisory lock".into(),
+    ))
 }
 
 // ── main async body ───────────────────────────────────────────────────────────
@@ -300,6 +366,42 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         })
     };
 
+    // ── task h: usage_daily rollup ────────────────────────────────────────────
+    //
+    // One edge wins the advisory lock and recomputes today and yesterday.
+    // The others skip. `interval_secs = 0` disables the timer. Historical
+    // days are only filled by the `backfill` subcommand.
+
+    let h_rollup = {
+        let db = db.clone();
+        let interval_secs = config.usage_rollup.interval_secs;
+        let lookback_days = config.usage_rollup.lookback_days;
+        tokio::spawn(async move {
+            if interval_secs == 0 {
+                info!("usage rollup timer disabled");
+                return;
+            }
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match db::rollup_recent(&db.pg, lookback_days, chrono::Utc::now()).await {
+                    Ok(db::RollupOutcome::Applied(applied)) => {
+                        info!(
+                            days = applied.days,
+                            rows = applied.rows,
+                            "usage rollup applied"
+                        );
+                    }
+                    Ok(db::RollupOutcome::SkippedBusy) => {
+                        debug!("usage rollup skipped; another edge holds the lock");
+                    }
+                    Err(e) => warn!(error = %e, "usage rollup failed"),
+                }
+            }
+        })
+    };
+
     // ── wait for shutdown signal ──────────────────────────────────────────────
 
     wait_for_shutdown_signal().await;
@@ -329,6 +431,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         h_dashboard.abort_handle(),
         h_metrics.abort_handle(),
         h_meter.abort_handle(),
+        h_rollup.abort_handle(),
     ];
 
     // Allow up to 30 s for tasks to complete, then abort stragglers.
@@ -340,6 +443,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let _ = h_dashboard.await;
         let _ = h_metrics.await;
         let _ = h_meter.await;
+        let _ = h_rollup.await;
     })
     .await;
 
