@@ -4,7 +4,13 @@
 //!   - `pg`    — PostgreSQL, shared across all regions: tokens, tunnel_log
 //!   - `local` — SQLite, per-region: captured_requests
 
+mod metering;
 pub mod models;
+
+pub use metering::{
+    close_stale_tunnels, flush_and_close_live_meters, flush_live_meters, flush_tunnel_meters,
+    log_tunnel_unregistered,
+};
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -201,41 +207,6 @@ pub async fn log_tunnel_registered(pool: &PgPool, reg: TunnelRegistration<'_>) -
     .bind(Utc::now())
     .bind(reg.region_id)
     .bind(reg.user_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Close all tunnel_log rows that are still open (unregistered_at IS NULL).
-///
-/// Called once on server startup to mark tunnels from previous runs as closed,
-/// since their WebSocket connections no longer exist.
-pub async fn close_stale_tunnels(pool: &PgPool) -> Result<u64> {
-    let rows =
-        sqlx::query("UPDATE tunnel_log SET unregistered_at = $1 WHERE unregistered_at IS NULL")
-            .bind(Utc::now())
-            .execute(pool)
-            .await?
-            .rows_affected();
-    Ok(rows)
-}
-
-/// Close the tunnel_log row for `tunnel_id`, recording final usage counters.
-pub async fn log_tunnel_unregistered(
-    pool: &PgPool,
-    tunnel_id: &str,
-    request_count: u64,
-    bytes_proxied: u64,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE tunnel_log \
-         SET unregistered_at = $1, request_count = $2, bytes_proxied = $3 \
-         WHERE tunnel_id = $4 AND unregistered_at IS NULL",
-    )
-    .bind(Utc::now())
-    .bind(request_count as i64)
-    .bind(bytes_proxied as i64)
-    .bind(tunnel_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -651,7 +622,7 @@ pub async fn list_user_tunnels(
         "SELECT tl.id, tl.tunnel_id, tl.protocol, tl.label, tl.session_id,
                 tl.token_id, t.label AS token_label,
                 tl.registered_at, tl.unregistered_at, tl.region_id,
-                tl.bytes_proxied, tl.request_count, tl.user_id
+                tl.bytes_proxied, tl.bytes_in, tl.bytes_out, tl.request_count, tl.user_id
          FROM tunnel_log tl
          LEFT JOIN tokens t ON t.id::text = tl.token_id
          WHERE tl.user_id = $1

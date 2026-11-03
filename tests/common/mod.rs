@@ -406,6 +406,7 @@ impl TestServer {
                 override_server_version: server_version_override.clone(),
             },
             platform: rustunnel_server::config::PlatformSection::default(),
+            metering: rustunnel_server::config::MeteringSection::default(),
         });
 
         // Database.

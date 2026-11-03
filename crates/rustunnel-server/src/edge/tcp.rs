@@ -202,9 +202,8 @@ async fn proxy_tcp_connection(
                 bytes_up = up, bytes_down = down,
                 "TCP proxy done"
             );
-            tunnel_info
-                .bytes_proxied
-                .fetch_add(up + down, std::sync::atomic::Ordering::Relaxed);
+            // public -> local is inbound, local -> public is outbound.
+            tunnel_info.add_transfer(up, down);
         }
         Err(e) => {
             debug!(%conn_id, "TCP copy error: {e}");

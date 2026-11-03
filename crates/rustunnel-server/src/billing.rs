@@ -9,6 +9,7 @@
 //! before this module. When month-to-date `tunnel_log.bytes_proxied` is at
 //! least 80% of that cap, registration still succeeds and
 //! `TunnelRegistered.notice` carries a warning the new CLI prints.
+//! `bytes_proxied` is the combined total (`bytes_in + bytes_out`).
 //!
 //! # platform-api contract
 //!
@@ -303,15 +304,26 @@ pub async fn evaluate_hobby_limits(
     ))
 }
 
-/// Bytes recorded on tunnels that closed during the current UTC month.
+/// Bytes recorded against the current UTC month.
 ///
-/// `tunnel_log.bytes_proxied` is written when a tunnel unregisters, so
-/// in-flight tunnels are not in this sum until they close.
-async fn month_bytes_proxied(pool: &PgPool, user_id: Uuid) -> Result<i64> {
+/// The summed column is `bytes_proxied` (kept equal to `bytes_in + bytes_out`
+/// by the meter flush). Closed rows count when `unregistered_at` is in this
+/// month, which is the historical rule. Open rows count when they were
+/// registered this month, so a periodic flush is visible to the Hobby cap
+/// before the tunnel closes. A tunnel that is still open from a previous
+/// month is not included: its whole total is attributed to the month it
+/// closes, same as before.
+pub(crate) async fn month_bytes_proxied(pool: &PgPool, user_id: Uuid) -> Result<i64> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COALESCE(SUM(bytes_proxied), 0)::bigint FROM tunnel_log \
          WHERE user_id = $1 \
-           AND unregistered_at >= date_trunc('month', (now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC'",
+           AND ( \
+                unregistered_at >= date_trunc('month', (now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' \
+                OR ( \
+                    unregistered_at IS NULL \
+                    AND registered_at >= date_trunc('month', (now() AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' \
+                ) \
+           )",
     )
     .bind(user_id)
     .fetch_one(pool)

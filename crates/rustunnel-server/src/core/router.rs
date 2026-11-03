@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::seq::IteratorRandom;
 use tokio::io::DuplexStream;
-use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 use yamux::Stream as YamuxStream;
 
@@ -312,17 +312,14 @@ impl TunnelCore {
         };
 
         let tunnel_id = Uuid::new_v4();
-        let info = TunnelInfo {
-            session_id: *session_id,
+        let info = TunnelInfo::new(
+            *session_id,
             tunnel_id,
-            protocol: protocol.clone(),
-            subdomain: Some(subdomain.clone()),
-            assigned_port: None,
-            created_at: std::time::Instant::now(),
-            request_count: Arc::new(AtomicU64::new(0)),
-            bytes_proxied: Arc::new(AtomicU64::new(0)),
-            conn_semaphore: Arc::new(Semaphore::new(self.max_connections_per_tunnel)),
-        };
+            protocol.clone(),
+            Some(subdomain.clone()),
+            None,
+            self.max_connections_per_tunnel,
+        );
 
         // Atomic upsert via the entry API — closes the get-then-insert race
         // that two concurrent first-registrations could otherwise hit (plan
@@ -408,16 +405,15 @@ impl TunnelCore {
         self.check_session_limit(session_id)?;
 
         let tunnel_id = Uuid::new_v4();
-        let build_info = |port: u16| TunnelInfo {
-            session_id: *session_id,
-            tunnel_id,
-            protocol: TunnelProtocol::Tcp,
-            subdomain: None,
-            assigned_port: Some(port),
-            created_at: std::time::Instant::now(),
-            request_count: Arc::new(AtomicU64::new(0)),
-            bytes_proxied: Arc::new(AtomicU64::new(0)),
-            conn_semaphore: Arc::new(Semaphore::new(self.max_connections_per_tunnel)),
+        let build_info = |port: u16| {
+            TunnelInfo::new(
+                *session_id,
+                tunnel_id,
+                TunnelProtocol::Tcp,
+                None,
+                Some(port),
+                self.max_connections_per_tunnel,
+            )
         };
 
         use dashmap::mapref::entry::Entry;
@@ -508,17 +504,14 @@ impl TunnelCore {
             .ok_or(Error::NoPortsAvailable)?;
 
         let tunnel_id = Uuid::new_v4();
-        let info = TunnelInfo {
-            session_id: *session_id,
+        let info = TunnelInfo::new(
+            *session_id,
             tunnel_id,
-            protocol: TunnelProtocol::Udp,
-            subdomain: None,
-            assigned_port: Some(port),
-            created_at: std::time::Instant::now(),
-            request_count: Arc::new(AtomicU64::new(0)),
-            bytes_proxied: Arc::new(AtomicU64::new(0)),
-            conn_semaphore: Arc::new(Semaphore::new(self.max_connections_per_tunnel)),
-        };
+            TunnelProtocol::Udp,
+            None,
+            Some(port),
+            self.max_connections_per_tunnel,
+        );
 
         let group = TunnelGroup::new_solo(port.to_string(), info);
         self.udp_routes.insert(port, group);
@@ -548,17 +541,14 @@ impl TunnelCore {
         }
 
         let tunnel_id = Uuid::new_v4();
-        let info = TunnelInfo {
-            session_id: *session_id,
+        let info = TunnelInfo::new(
+            *session_id,
             tunnel_id,
-            protocol: TunnelProtocol::P2p,
-            subdomain: None,
-            assigned_port: None,
-            created_at: std::time::Instant::now(),
-            request_count: Arc::new(AtomicU64::new(0)),
-            bytes_proxied: Arc::new(AtomicU64::new(0)),
-            conn_semaphore: Arc::new(Semaphore::new(self.max_connections_per_tunnel)),
-        };
+            TunnelProtocol::P2p,
+            None,
+            None,
+            self.max_connections_per_tunnel,
+        );
 
         let publisher = P2pPublisher {
             tunnel_info: info,
@@ -716,6 +706,59 @@ impl TunnelCore {
                 .unwrap_or(0),
             None => 0,
         }
+    }
+
+    /// Absolute counters for `tunnel_id`.
+    ///
+    /// Missing tunnels return zeros so a close can still mark the row. A zero
+    /// snapshot does not decrease counters already flushed, because persistence
+    /// uses `GREATEST`.
+    pub fn tunnel_meter(&self, tunnel_id: &Uuid) -> crate::core::LiveTunnelMeter {
+        let found = match self.tunnel_index.get(tunnel_id).as_deref() {
+            Some(TunnelKey::Http(sub)) => self
+                .http_routes
+                .get(sub)
+                .and_then(|g| g.members.get(tunnel_id).map(|m| m.info.meter_snapshot())),
+            Some(TunnelKey::Tcp(port)) => self
+                .tcp_routes
+                .get(port)
+                .and_then(|g| g.members.get(tunnel_id).map(|m| m.info.meter_snapshot())),
+            Some(TunnelKey::Udp(port)) => self
+                .udp_routes
+                .get(port)
+                .and_then(|g| g.members.get(tunnel_id).map(|m| m.info.meter_snapshot())),
+            Some(TunnelKey::P2p(name)) => self
+                .p2p_tunnels
+                .get(name)
+                .map(|p| p.tunnel_info.meter_snapshot()),
+            None => None,
+        };
+        found.unwrap_or_else(|| crate::core::LiveTunnelMeter::zeros(*tunnel_id))
+    }
+
+    /// Snapshot every live tunnel. Used by the periodic flush and by
+    /// graceful shutdown, before rows are closed.
+    pub fn live_tunnel_meters(&self) -> Vec<crate::core::LiveTunnelMeter> {
+        let mut rows = Vec::new();
+        for group in self.http_routes.iter() {
+            for member in group.members.iter() {
+                rows.push(member.info.meter_snapshot());
+            }
+        }
+        for group in self.tcp_routes.iter() {
+            for member in group.members.iter() {
+                rows.push(member.info.meter_snapshot());
+            }
+        }
+        for group in self.udp_routes.iter() {
+            for member in group.members.iter() {
+                rows.push(member.info.meter_snapshot());
+            }
+        }
+        for entry in self.p2p_tunnels.iter() {
+            rows.push(entry.tunnel_info.meter_snapshot());
+        }
+        rows
     }
 
     /// Return the current bytes-proxied counter for a member.
