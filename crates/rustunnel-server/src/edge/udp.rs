@@ -308,6 +308,8 @@ async fn proxy_udp_session(
                 if upstream.flush().await.is_err() {
                     break;
                 }
+                // Datagram payload only. The 4-byte length prefix is tunnel
+                // framing, and yamux / data-WebSocket framing is below it.
                 bytes_in += data.len() as u64;
             }
 
@@ -318,6 +320,7 @@ async fn proxy_udp_session(
                         if public_socket.send_to(&data, peer).await.is_err() {
                             break;
                         }
+                        // Payload only — `read_framed_datagram` strips the prefix.
                         bytes_out += data.len() as u64;
                     }
                     Err(_) => break,

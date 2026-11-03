@@ -24,9 +24,11 @@
 //! 4. Send `ControlMessage::NewConnection` to the session.
 //! 5. Wait ≤ STREAM_TIMEOUT for the client to open a yamux data stream.
 //! 6. Forward the HTTP request through a hyper/h1 client over the stream.
-//!    Bytes written toward the local service count as `bytes_in` (request
-//!    line, headers, and body). Bytes read back count as `bytes_out`
-//!    (status line, headers, and body).
+//!    `bytes_in` / `bytes_out` count the HTTP/1.1 bytes written to and read
+//!    from that yamux stream (request/status line, headers, body, and chunk
+//!    framing when the body is chunked). The 16-byte conn_id, yamux frames,
+//!    the data-plane WebSocket, TLS, and control pings sit below this and
+//!    are not counted.
 //! 7. Stream the response back to the public caller.
 //! 8. Emit a `CaptureEvent` for the dashboard.
 //!
@@ -511,12 +513,16 @@ async fn proxy_request(
 
 // ── HTTP forwarding via hyper client ─────────────────────────────────────────
 
-/// Counts bytes on the stream between the edge and the local service.
+/// Counts HTTP/1.1 wire bytes on the yamux stream payload.
 ///
-/// Writes travel public → local and increment `bytes_in` (request line,
-/// headers, body). Reads travel local → public and increment `bytes_out`
-/// (status line, headers, body). `TransferMeter::add` keeps `bytes_proxied`
-/// equal to the sum, matching `tunnel_log`.
+/// The edge receives the stream only after the session handler has written
+/// the 16-byte `conn_id`. Writes (public → local) are the request line,
+/// headers, and body hyper sends, including `Transfer-Encoding: chunked`
+/// chunk-size lines. Reads (local → public) are the status line, headers,
+/// and body, including chunk framing. Yamux frame headers, the data-plane
+/// WebSocket frames, TLS records, control messages, and yamux pings are
+/// outside this stream and are not counted. `TransferMeter::add` keeps
+/// `bytes_proxied` equal to `bytes_in + bytes_out`.
 struct DirectionMeter<T> {
     inner: T,
     meter: crate::core::tunnel::TransferMeter,
@@ -656,10 +662,9 @@ async fn forward_http<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Meter the tunnel stream, not Content-Length and not response-body
-    // frames. Those miss request headers (every GET) and any body that
-    // arrives without Content-Length, and they miss the response status
-    // line and headers.
+    // Meter HTTP/1.1 bytes on the yamux stream payload. Content-Length
+    // misses GETs, and response-body frames miss the status line, headers,
+    // and chunk framing.
     let io = TokioIo::new(DirectionMeter::new(upstream, meter));
 
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -1223,6 +1228,201 @@ mod tests {
         assert!(
             bytes_out > bytes_in,
             "response direction belongs in bytes_out (in={bytes_in}, out={bytes_out})"
+        );
+        assert_eq!(bytes_proxied, bytes_in + bytes_out);
+    }
+
+    /// HTTP/1.1 bytes hyper writes on the tunnel stream for this GET.
+    ///
+    /// An empty GET is `is_end_stream`, so hyper sends no `Content-Length`
+    /// and no chunked body. Header order is the caller's `host`, then the
+    /// `X-Forwarded-*` headers the edge appends. Names are lowercase.
+    const GET_REQUEST: &[u8] = b"\
+GET /hook HTTP/1.1\r\n\
+host: app.test\r\n\
+x-forwarded-for: 203.0.113.9\r\n\
+x-forwarded-proto: https\r\n\
+x-forwarded-host: app.test\r\n\
+\r\n";
+
+    const GET_BODY: &[u8] = b"0123456789abcdef";
+
+    /// Status line, `content-length`, and the 16-byte body. No extra headers.
+    const GET_RESPONSE: &[u8] = b"\
+HTTP/1.1 200 OK\r\n\
+content-length: 16\r\n\
+\r\n\
+0123456789abcdef";
+
+    /// Same body as five bytes of decoded data, plus chunk-size lines.
+    /// `bytes_out` must equal this whole message, not `hello.len()`.
+    const CHUNKED_RESPONSE: &[u8] = b"\
+HTTP/1.1 200 OK\r\n\
+transfer-encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+
+    /// Drive one GET through `forward_http` and return the exact bytes the
+    /// local service was written, plus the metered totals and decoded body.
+    async fn proxy_fixed_get(response: &'static [u8]) -> (u64, u64, u64, Vec<u8>, Bytes) {
+        use std::sync::atomic::Ordering;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::core::TunnelInfo;
+
+        let info = TunnelInfo::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            rustunnel_protocol::TunnelProtocol::Http,
+            Some("app".into()),
+            None,
+            8,
+        );
+        let (edge_io, mut local_io) = tokio::io::duplex(64 * 1024);
+        let (public_client, public_server) = tokio::io::duplex(64 * 1024);
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            let read = async {
+                loop {
+                    local_io.read_exact(&mut byte).await?;
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    if buf.len() > 4096 {
+                        break;
+                    }
+                }
+                Ok::<_, std::io::Error>(())
+            };
+            if timeout(Duration::from_secs(3), read).await.is_err() {
+                let _ = captured_tx.send(buf);
+                return;
+            }
+            let _ = local_io.write_all(response).await;
+            let _ = captured_tx.send(buf);
+            // Leave the duplex open so a content-length response ends on
+            // the declared length instead of connection close.
+            std::future::pending::<()>().await;
+        });
+
+        let meter = info.meter();
+        let edge_slot = Arc::new(tokio::sync::Mutex::new(Some(edge_io)));
+        tokio::spawn(async move {
+            let io = TokioIo::new(public_server);
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let edge_slot = Arc::clone(&edge_slot);
+                let meter = meter.clone();
+                async move {
+                    let upstream = edge_slot.lock().await.take().expect("one upstream stream");
+                    let peer: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+                    let resp = forward_http(
+                        req,
+                        upstream,
+                        meter,
+                        peer,
+                        ForwardScheme::Https,
+                        "app.test",
+                        HttpCaptureCtx {
+                            tx: None,
+                            conn_id: Uuid::new_v4(),
+                            tunnel_id: Uuid::new_v4(),
+                            tunnel_label: "app".into(),
+                            method: "GET".into(),
+                            path: "/hook".into(),
+                            request_bytes: 0,
+                            start: Instant::now(),
+                        },
+                    )
+                    .await
+                    .expect("forward_http");
+                    Ok::<_, Infallible>(resp)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
+
+        let io = TokioIo::new(public_client);
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(io)
+            .await
+            .expect("public client handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/hook")
+            .header("host", "app.test")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = timeout(Duration::from_secs(5), sender.send_request(req))
+            .await
+            .expect("proxy timed out")
+            .expect("public response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = timeout(Duration::from_secs(5), resp.into_body().collect())
+            .await
+            .expect("response body timed out")
+            .expect("response body")
+            .to_bytes();
+        drop(sender);
+
+        let captured = timeout(Duration::from_secs(2), captured_rx)
+            .await
+            .expect("capture timed out")
+            .expect("local side dropped the capture");
+
+        let bytes_in = info.bytes_in.load(Ordering::Relaxed);
+        let bytes_out = info.bytes_out.load(Ordering::Relaxed);
+        let bytes_proxied = info.bytes_proxied.load(Ordering::Relaxed);
+        (bytes_in, bytes_out, bytes_proxied, captured, got)
+    }
+
+    #[tokio::test]
+    async fn get_counts_exact_http1_wire_bytes() {
+        let (bytes_in, bytes_out, bytes_proxied, captured, body) =
+            proxy_fixed_get(GET_RESPONSE).await;
+
+        assert_eq!(
+            captured,
+            GET_REQUEST,
+            "upstream request was:\n{}",
+            String::from_utf8_lossy(&captured)
+        );
+        assert_eq!(body.as_ref(), GET_BODY);
+        assert_eq!(bytes_in, GET_REQUEST.len() as u64);
+        assert_eq!(bytes_out, GET_RESPONSE.len() as u64);
+        assert_eq!(bytes_proxied, bytes_in + bytes_out);
+    }
+
+    #[tokio::test]
+    async fn chunked_response_counts_chunk_framing_on_the_wire() {
+        let (bytes_in, bytes_out, bytes_proxied, captured, body) =
+            proxy_fixed_get(CHUNKED_RESPONSE).await;
+
+        assert_eq!(captured, GET_REQUEST);
+        // Decoded body is `hello`. Billing counts the chunk-size lines too.
+        assert_eq!(body.as_ref(), b"hello");
+        assert!(
+            CHUNKED_RESPONSE.len() > b"hello".len(),
+            "fixture must include chunk framing beyond the decoded body"
+        );
+        assert_eq!(bytes_in, GET_REQUEST.len() as u64);
+        assert_eq!(
+            bytes_out,
+            CHUNKED_RESPONSE.len() as u64,
+            "chunked responses are billed as HTTP/1.1 wire bytes, including chunk framing"
         );
         assert_eq!(bytes_proxied, bytes_in + bytes_out);
     }

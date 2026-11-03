@@ -202,7 +202,10 @@ async fn proxy_tcp_connection(
                 bytes_up = up, bytes_down = down,
                 "TCP proxy done"
             );
-            // public -> local is inbound, local -> public is outbound.
+            // Payload on the yamux stream after the 16-byte conn_id.
+            // `up` is public → local (`bytes_in`); `down` is local → public
+            // (`bytes_out`). Yamux frames, the data-plane WebSocket, and
+            // TLS are below this copy and are not included.
             tunnel_info.add_transfer(up, down);
         }
         Err(e) => {
