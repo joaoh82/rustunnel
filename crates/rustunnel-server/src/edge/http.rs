@@ -443,15 +443,8 @@ async fn proxy_request(
 
     // ── 6. WebSocket upgrade fast-path ────────────────────────────────────
     if is_ws {
-        return handle_ws_upgrade(
-            req,
-            yamux_stream,
-            conn_id,
-            &ctx,
-            start,
-            tunnel_info.bytes_proxied.clone(),
-        )
-        .await;
+        return handle_ws_upgrade(req, yamux_stream, conn_id, &ctx, start, tunnel_info.meter())
+            .await;
     }
 
     // ── 7. HTTP proxy ─────────────────────────────────────────────────────
@@ -464,16 +457,16 @@ async fn proxy_request(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let bytes_counter = tunnel_info.bytes_proxied.clone();
-    // Count request bytes up front.
-    bytes_counter.fetch_add(request_bytes, std::sync::atomic::Ordering::Relaxed);
+    let meter = tunnel_info.meter();
+    // Count request bytes up front. Response body bytes are added as they stream.
+    meter.add(request_bytes, 0);
 
     let resp = match timeout(
         PROXY_TIMEOUT,
         forward_http(
             req,
             yamux_stream,
-            bytes_counter,
+            meter,
             peer,
             scheme,
             &host,
@@ -567,7 +560,7 @@ impl Drop for CaptureGuard {
 async fn forward_http(
     req: Request<Incoming>,
     yamux_stream: YamuxStream,
-    bytes_counter: Arc<std::sync::atomic::AtomicU64>,
+    meter: crate::core::tunnel::TransferMeter,
     peer: SocketAddr,
     scheme: ForwardScheme,
     original_host: &str,
@@ -623,18 +616,18 @@ async fn forward_http(
     // the actual response_bytes whenever the stream ends — normal completion,
     // early client disconnect, or any other drop path.
     let body_stream = futures_util::stream::unfold(
-        (resp_body, sender, bytes_counter, rsp_bytes, guard),
-        |(mut body, sender, counter, rsp_bytes, guard)| async move {
+        (resp_body, sender, meter, rsp_bytes, guard),
+        |(mut body, sender, meter, rsp_bytes, guard)| async move {
             match body.frame().await {
                 Some(Ok(f)) => {
                     if let Some(data) = f.data_ref() {
                         let n = data.len() as u64;
-                        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                        meter.add(0, n);
                         rsp_bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                     }
                     Some((
                         Ok::<Frame<Bytes>, Infallible>(f),
-                        (body, sender, counter, rsp_bytes, guard),
+                        (body, sender, meter, rsp_bytes, guard),
                     ))
                 }
                 // Stream exhausted or errored — returning None drops the state,
@@ -658,7 +651,7 @@ async fn handle_ws_upgrade(
     conn_id: Uuid,
     ctx: &ProxyCtx,
     start: Instant,
-    bytes_proxied: Arc<std::sync::atomic::AtomicU64>,
+    meter: crate::core::tunnel::TransferMeter,
 ) -> Response<BoxBody> {
     debug!(%conn_id, "WebSocket upgrade");
 
@@ -675,7 +668,8 @@ async fn handle_ws_upgrade(
                 match tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await {
                     Ok((up, dn)) => {
                         debug!(%conn_id, bytes_up=up, bytes_dn=dn, "WS done");
-                        bytes_proxied.fetch_add(up + dn, std::sync::atomic::Ordering::Relaxed);
+                        // client -> local is inbound, local -> client is outbound.
+                        meter.add(up, dn);
                     }
                     Err(e) => debug!(%conn_id, "WS copy: {e}"),
                 }

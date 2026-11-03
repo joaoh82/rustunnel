@@ -8,5 +8,6 @@ pub use limiter::RateLimiter;
 pub use router::{classify_nat_pair, P2pPublisher, TunnelCore};
 pub use tunnel::{
     ControlMessage, GroupAlertPayload, GroupEvent, GroupMember, GroupSpec, HealthEvent,
-    SessionInfo, TcpTunnelEvent, TunnelGroup, TunnelInfo, UdpTunnelEvent, ZeroHealthyAlert,
+    LiveTunnelMeter, SessionInfo, TcpTunnelEvent, TunnelGroup, TunnelInfo, UdpTunnelEvent,
+    ZeroHealthyAlert,
 };

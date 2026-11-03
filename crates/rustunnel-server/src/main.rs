@@ -19,7 +19,7 @@ use axum::response::Response;
 use axum::{routing::get, Router};
 use clap::Parser;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use rustunnel_server::audit;
 use rustunnel_server::config::ServerConfig;
@@ -101,11 +101,12 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
 
     info!(url = %config.database.url, "connecting to PostgreSQL");
     let db = db::init_db(&config.database).await?;
-    let stale = db::close_stale_tunnels(&db.pg).await?;
+    let stale = db::close_stale_tunnels(&db.pg, &config.region.id).await?;
     if stale > 0 {
         info!(
             count = stale,
-            "closed stale tunnel_log rows from previous run"
+            region = %config.region.id,
+            "closed stale tunnel_log rows from previous run in this region"
         );
     }
     info!("database ready");
@@ -236,6 +237,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let dashboard_origin = config.server.dashboard_origin.clone();
         let audit_tx = audit_tx.clone();
         let region = config.region.clone();
+        let db = db.clone();
         tokio::spawn(async move {
             if let Err(e) = run_dashboard(
                 dashboard_addr,
@@ -270,11 +272,44 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
 
     Arc::clone(&cert_manager).start_renewal_task();
 
+    // ── task g: periodic meter flush ──────────────────────────────────────────
+    //
+    // Writes absolute counters onto open tunnel_log rows so a crash loses at
+    // most one interval. `0` disables the task. Shutdown flushes either way.
+
+    let h_meter = {
+        let core = Arc::clone(&core);
+        let db = db.clone();
+        let interval = Duration::from_secs(config.metering.flush_interval_secs);
+        tokio::spawn(async move {
+            if interval.is_zero() {
+                info!("periodic tunnel meter flush disabled");
+                return;
+            }
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // the first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                match db::flush_live_meters(&db.pg, &core).await {
+                    Ok(n) if n > 0 => debug!(count = n, "flushed live tunnel meters"),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "periodic tunnel meter flush failed"),
+                }
+            }
+        })
+    };
+
     // ── wait for shutdown signal ──────────────────────────────────────────────
 
     wait_for_shutdown_signal().await;
 
-    info!("shutdown signal received — draining active sessions");
+    info!("shutdown signal received, flushing tunnel meters before close");
+    if let Err(e) = db::flush_live_meters(&db.pg, &core).await {
+        warn!(error = %e, "shutdown meter flush failed");
+    }
+
+    info!("draining active sessions");
 
     // Notify every active session so it can close cleanly.
     let session_count = core.sessions.len();
@@ -293,6 +328,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         h_udp.abort_handle(),
         h_dashboard.abort_handle(),
         h_metrics.abort_handle(),
+        h_meter.abort_handle(),
     ];
 
     // Allow up to 30 s for tasks to complete, then abort stragglers.
@@ -303,13 +339,21 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let _ = h_udp.await;
         let _ = h_dashboard.await;
         let _ = h_metrics.await;
+        let _ = h_meter.await;
     })
     .await;
+
+    // Sessions that exited wrote their own close. Anything still registered
+    // is flushed again and closed here, so bytes gathered during the drain
+    // are not left only in memory.
+    if let Err(e) = db::flush_and_close_live_meters(&db.pg, &core).await {
+        warn!(error = %e, "final shutdown meter close failed");
+    }
 
     match drain_result {
         Ok(_) => info!("all tasks finished cleanly"),
         Err(_) => {
-            warn!("shutdown timeout exceeded — aborting remaining tasks");
+            warn!("shutdown timeout exceeded, aborting remaining tasks");
             for handle in &abort_handles {
                 handle.abort();
             }

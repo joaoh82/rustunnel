@@ -32,6 +32,33 @@ pub struct ServerConfig {
     /// Absent on self-hosted configs: reporting stays off.
     #[serde(default)]
     pub platform: PlatformSection,
+    /// How often live tunnel counters are written to Postgres.
+    /// Absent section keeps the 60s default. `flush_interval_secs = 0`
+    /// turns the periodic task off. Shutdown still flushes.
+    #[serde(default)]
+    pub metering: MeteringSection,
+}
+
+/// Live byte and request counter persistence.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeteringSection {
+    /// Seconds between flushes of in-memory counters onto open `tunnel_log`
+    /// rows. A crash loses at most one interval. `0` disables the periodic
+    /// task. Default is 60.
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+}
+
+fn default_flush_interval_secs() -> u64 {
+    60
+}
+
+impl Default for MeteringSection {
+    fn default() -> Self {
+        Self {
+            flush_interval_secs: default_flush_interval_secs(),
+        }
+    }
 }
 
 /// Where the edge reports Hobby-limit hits so platform-api can dedupe and
@@ -427,6 +454,7 @@ impl Default for ServerConfig {
             load_balancing: LoadBalancingSection::default(),
             testing: TestingSection::default(),
             platform: PlatformSection::default(),
+            metering: MeteringSection::default(),
         }
     }
 }

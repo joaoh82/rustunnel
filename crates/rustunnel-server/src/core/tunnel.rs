@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -80,11 +80,116 @@ pub struct TunnelInfo {
     pub created_at: Instant,
     /// Monotonically-increasing counter of proxied requests/connections.
     pub request_count: Arc<AtomicU64>,
-    /// Total bytes proxied through this tunnel (upstream + downstream combined).
+    /// Bytes from the public side toward the local service (requests, uploads).
+    pub bytes_in: Arc<AtomicU64>,
+    /// Bytes from the local service toward the public side (responses, downloads).
+    pub bytes_out: Arc<AtomicU64>,
+    /// `bytes_in + bytes_out`. Kept as its own counter so existing readers
+    /// (dashboard, Prometheus) keep seeing the combined total.
     pub bytes_proxied: Arc<AtomicU64>,
     /// Limits concurrent proxied connections for this tunnel.
     /// Shared across all clones so every proxy task draws from the same pool.
     pub conn_semaphore: Arc<Semaphore>,
+}
+
+/// Absolute in-memory counters for one live tunnel.
+///
+/// Persisted as absolute values (not deltas). A later flush or close with
+/// smaller numbers does not decrease what is already stored.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveTunnelMeter {
+    pub tunnel_id: Uuid,
+    pub request_count: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+impl LiveTunnelMeter {
+    pub fn bytes_proxied(self) -> u64 {
+        self.bytes_in.saturating_add(self.bytes_out)
+    }
+
+    /// Zero counters for `tunnel_id`. Used when the routing entry is already
+    /// gone so a close still marks the row, without wiping a previous flush.
+    pub fn zeros(tunnel_id: Uuid) -> Self {
+        Self {
+            tunnel_id,
+            request_count: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+        }
+    }
+}
+
+/// Shared directional counters. Cloning shares the same atomics.
+#[derive(Debug, Clone)]
+pub struct TransferMeter {
+    bytes_in: Arc<AtomicU64>,
+    bytes_out: Arc<AtomicU64>,
+    bytes_proxied: Arc<AtomicU64>,
+}
+
+impl TransferMeter {
+    /// Record one transfer. `inbound` is public toward local, `outbound` is
+    /// local toward public. `bytes_proxied` increases by the same sum.
+    pub fn add(&self, inbound: u64, outbound: u64) {
+        if inbound > 0 {
+            self.bytes_in.fetch_add(inbound, Ordering::Relaxed);
+        }
+        if outbound > 0 {
+            self.bytes_out.fetch_add(outbound, Ordering::Relaxed);
+        }
+        let total = inbound.saturating_add(outbound);
+        if total > 0 {
+            self.bytes_proxied.fetch_add(total, Ordering::Relaxed);
+        }
+    }
+}
+
+impl TunnelInfo {
+    pub fn new(
+        session_id: Uuid,
+        tunnel_id: Uuid,
+        protocol: TunnelProtocol,
+        subdomain: Option<String>,
+        assigned_port: Option<u16>,
+        max_connections: usize,
+    ) -> Self {
+        Self {
+            session_id,
+            tunnel_id,
+            protocol,
+            subdomain,
+            assigned_port,
+            created_at: Instant::now(),
+            request_count: Arc::new(AtomicU64::new(0)),
+            bytes_in: Arc::new(AtomicU64::new(0)),
+            bytes_out: Arc::new(AtomicU64::new(0)),
+            bytes_proxied: Arc::new(AtomicU64::new(0)),
+            conn_semaphore: Arc::new(Semaphore::new(max_connections)),
+        }
+    }
+
+    pub fn meter(&self) -> TransferMeter {
+        TransferMeter {
+            bytes_in: Arc::clone(&self.bytes_in),
+            bytes_out: Arc::clone(&self.bytes_out),
+            bytes_proxied: Arc::clone(&self.bytes_proxied),
+        }
+    }
+
+    pub fn add_transfer(&self, inbound: u64, outbound: u64) {
+        self.meter().add(inbound, outbound);
+    }
+
+    pub fn meter_snapshot(&self) -> LiveTunnelMeter {
+        LiveTunnelMeter {
+            tunnel_id: self.tunnel_id,
+            request_count: self.request_count.load(Ordering::Relaxed),
+            bytes_in: self.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
+        }
+    }
 }
 
 // ── Load-balancing groups (TUNNEL-7) ──────────────────────────────────────────
@@ -383,5 +488,33 @@ impl SessionInfo {
             last_heartbeat: RwLock::new(now),
             data_pipe: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_keeps_bytes_proxied_equal_to_in_plus_out() {
+        let info = TunnelInfo::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            TunnelProtocol::Http,
+            None,
+            None,
+            1,
+        );
+        info.add_transfer(100, 40);
+        info.add_transfer(5, 0);
+        info.meter().add(0, 7);
+        let snap = info.meter_snapshot();
+        assert_eq!(snap.bytes_in, 105);
+        assert_eq!(snap.bytes_out, 47);
+        assert_eq!(
+            info.bytes_proxied.load(Ordering::Relaxed),
+            snap.bytes_proxied()
+        );
+        assert_eq!(snap.bytes_proxied(), 152);
     }
 }

@@ -284,7 +284,8 @@ async fn proxy_udp_session(
     };
 
     let mut upstream = yamux_stream.compat();
-    let mut total_bytes: u64 = 0;
+    let mut bytes_in: u64 = 0;
+    let mut bytes_out: u64 = 0;
 
     // Bidirectional bridge: datagrams ↔ framed yamux stream.
     // Framing: [4-byte big-endian length][payload]
@@ -307,7 +308,7 @@ async fn proxy_udp_session(
                 if upstream.flush().await.is_err() {
                     break;
                 }
-                total_bytes += data.len() as u64;
+                bytes_in += data.len() as u64;
             }
 
             // Outbound datagram from the client via yamux stream.
@@ -317,7 +318,7 @@ async fn proxy_udp_session(
                         if public_socket.send_to(&data, peer).await.is_err() {
                             break;
                         }
-                        total_bytes += data.len() as u64;
+                        bytes_out += data.len() as u64;
                     }
                     Err(_) => break,
                 }
@@ -331,12 +332,10 @@ async fn proxy_udp_session(
         }
     }
 
-    tunnel_info
-        .bytes_proxied
-        .fetch_add(total_bytes, Ordering::Relaxed);
+    tunnel_info.add_transfer(bytes_in, bytes_out);
     info!(
         %conn_id, port, %peer,
-        bytes = total_bytes,
+        bytes_in, bytes_out,
         "UDP session proxy done"
     );
 }
