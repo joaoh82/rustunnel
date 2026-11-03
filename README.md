@@ -13,7 +13,7 @@ Expose local services through a public server over encrypted WebSocket connectio
 
 You can self-host or use our managed service.
 
-**Using an AI agent?** rustunnel ships an [MCP server](https://rustunnel.com/docs/guides/mcp-server) — one-click setup for Cursor (then add your [API token](https://rustunnel.com)):
+**Using an AI agent?** rustunnel ships an [MCP server](https://rustunnel.com/docs/guides/mcp-server): one-click setup for Cursor (then add your [API token](https://rustunnel.com)):
 
 [![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=rustunnel&config=eyJjb21tYW5kIjoicnVzdHVubmVsLW1jcCIsImFyZ3MiOlsiLS1zZXJ2ZXIiLCJldS5lZGdlLnJ1c3R1bm5lbC5jb206NDA0MCIsIi0tYXBpIiwiaHR0cHM6Ly9ldS5lZGdlLnJ1c3R1bm5lbC5jb206ODQ0MyJdLCJlbnYiOnsiUlVTVFVOTkVMX1RPS0VOIjoiWU9VUl9UT0tFTiJ9fQ==)
 
@@ -33,15 +33,15 @@ For Claude Code, Claude Desktop, Windsurf, and others, see the [agent integratio
   - [Run the client locally](#run-the-client-locally)
   - [Git hooks](#git-hooks)
 - [Production deployment (Ubuntu / systemd)](#production-deployment-ubuntu--systemd)
-  - [1 — Install dependencies](#1--install-dependencies)
-  - [2 — Build release binaries](#2--build-release-binaries)
-  - [3 — Create system user and directories](#3--create-system-user-and-directories)
-  - [4 — Install the server binary](#4--install-the-server-binary)
-  - [5 — Create the server config file](#5--create-the-server-config-file)
-  - [6 — TLS certificates (Let's Encrypt + Cloudflare)](#6--tls-certificates-lets-encrypt--cloudflare)
-  - [7 — Set up systemd service](#7--set-up-systemd-service)
-  - [8 — Open firewall ports](#8--open-firewall-ports)
-  - [9 — Verify the server is running](#9--verify-the-server-is-running)
+  - [1: Install dependencies](#1-install-dependencies)
+  - [2: Build release binaries](#2-build-release-binaries)
+  - [3: Create system user and directories](#3-create-system-user-and-directories)
+  - [4: Install the server binary](#4-install-the-server-binary)
+  - [5: Create the server config file](#5-create-the-server-config-file)
+  - [6: TLS certificates (Let's Encrypt + Cloudflare)](#6-tls-certificates-lets-encrypt--cloudflare)
+  - [7: Set up systemd service](#7-set-up-systemd-service)
+  - [8: Open firewall ports](#8-open-firewall-ports)
+  - [9: Verify the server is running](#9-verify-the-server-is-running)
   - [Updating the server](#updating-the-server)
 - [Docker deployment](#docker-deployment) · [full guide](docs/docker-deployment.md)
 - [Client configuration](#client-configuration)
@@ -80,21 +80,21 @@ The client auto-selects the nearest region by default. Use `--region <id>` to co
 
 ### Getting an auth token
 
-Sign up for a free account at **[rustunnel.com](https://rustunnel.com)** — no waiting list, no manual approval.
+Sign up for a free account at **[rustunnel.com](https://rustunnel.com)**. No waiting list, no manual approval.
 
 1. Create an account at [rustunnel.com](https://rustunnel.com)
 2. Go to **Dashboard → API Keys** and create a token
-3. Copy the token — it is shown only once
+3. Copy the token. It is shown only once
 
 **Plans:**
 
 | Plan | Price | Tunnels | Subdomains | Bandwidth | TLS/HTTPS |
 |------|-------|---------|------------|-----------|-----------|
-| Hobby (free) | $0 | 2 concurrent | Random only | 1 GB | ✓ |
+| Hobby (free) | $0 | 2 concurrent | Random only | 1 GB/mo | ✓ |
 | Pay-as-you-go | $3/mo minimum, credited at $0.10/GB | No cap | Custom | $0.10/GB | ✓ |
 | Self-host | Free (run your own server) | Unlimited | Custom | Unmetered | ✓ |
 
-The Hobby (free) plan is a great way to get started: 2 concurrent tunnels, random subdomains only, and 1 GB. Upgrade to pay-as-you-go from your dashboard whenever you need custom subdomains or more tunnels. Pay-as-you-go has no tunnel cap.
+The Hobby (free) plan is a great way to get started: 2 concurrent tunnels, random subdomains only, and 1 GB/mo. Upgrade to pay-as-you-go from your dashboard whenever you need custom subdomains or more tunnels. Pay-as-you-go has no tunnel cap.
 
 ### Quick start with the hosted server
 
@@ -111,7 +111,7 @@ rustunnel setup
 Then expose a local service:
 
 ```bash
-# HTTP tunnel — auto-selects the nearest region
+# HTTP tunnel: auto-selects the nearest region
 rustunnel http 3000
 
 # Connect to a specific region
@@ -120,16 +120,16 @@ rustunnel http 3000 --region eu
 # Custom subdomain
 rustunnel http 3000 --subdomain myapp
 
-# TCP tunnel — e.g. expose a local database
+# TCP tunnel: e.g. expose a local database
 rustunnel tcp 5432
 
-# UDP tunnel — e.g. expose a game server
+# UDP tunnel: e.g. expose a game server
 rustunnel udp 27015
 
-# P2P tunnel — expose a service to another rustunnel client
+# P2P tunnel: expose a service to another rustunnel client
 rustunnel p2p 27015 --name my-game --secret "shared-secret"
 
-# P2P tunnel — connect to a peer's service
+# P2P tunnel: connect to a peer's service
 rustunnel p2p 8000 --target my-game --secret "shared-secret"
 ```
 
@@ -302,13 +302,13 @@ tcp  tunnel  →  tcp://localhost:20000
 The tunnel URL uses a subdomain (e.g. `http://abc123.localhost:8080`).
 Browsers won't resolve `*.localhost` subdomains by default, so you have two options:
 
-**Option A — curl with a Host header (no setup required)**
+**Option A: curl with a Host header (no setup required)**
 
 ```bash
 curl -v -H "Host: abc123.localhost" http://localhost:8080/
 ```
 
-**Option B — wildcard DNS via dnsmasq (enables browser access)**
+**Option B: wildcard DNS via dnsmasq (enables browser access)**
 
 ```bash
 # Install and configure dnsmasq to resolve *.localhost → 127.0.0.1
@@ -351,7 +351,7 @@ The steps below match a deployment where:
 - Wildcard DNS: `*.edge.rustunnel.com → <server IP>`
 - TLS certs: Let's Encrypt via Certbot + Cloudflare DNS challenge
 
-### 1 — Install dependencies
+### 1: Install dependencies
 
 ```bash
 apt update && apt install -y \
@@ -366,7 +366,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-### 2 — Build release binaries
+### 2: Build release binaries
 
 ```bash
 git clone https://github.com/joaoh82/rustunnel.git
@@ -378,7 +378,7 @@ Binaries will be at:
 - `target/release/rustunnel-server`
 - `target/release/rustunnel`
 
-### 3 — Create system user and directories
+### 3: Create system user and directories
 
 ```bash
 useradd --system --no-create-home --shell /usr/sbin/nologin rustunnel
@@ -388,7 +388,7 @@ chown rustunnel:rustunnel /var/lib/rustunnel
 chmod 750 /var/lib/rustunnel
 ```
 
-### 4 — Install the server binary
+### 4: Install the server binary
 
 ```bash
 install -Dm755 target/release/rustunnel-server /usr/local/bin/rustunnel-server
@@ -403,7 +403,7 @@ Or use the Makefile target (runs build + install + systemd setup):
 sudo make deploy
 ```
 
-### 5 — Set up PostgreSQL
+### 5: Set up PostgreSQL
 
 rustunnel requires PostgreSQL for shared state (tokens, tunnel history, audit log).
 
@@ -427,9 +427,9 @@ SQL
 > **Tip:** For managed PostgreSQL (e.g. AWS RDS, DigitalOcean Managed Database, Supabase) skip the
 > `apt install` step above and just note the connection URL for the config in the next step.
 
-Schema migrations run automatically when the server starts — no manual SQL needed.
+Schema migrations run automatically when the server starts. No manual SQL needed.
 
-### 6 — Create the server config file
+### 6: Create the server config file
 
 Create `/etc/rustunnel/server.toml` with the content below.
 Replace `your-admin-token-here` with a strong random secret (e.g. `openssl rand -hex 32`).
@@ -438,14 +438,14 @@ Replace `your-admin-token-here` with a strong random secret (e.g. `openssl rand 
 # /etc/rustunnel/server.toml
 
 [server]
-# Primary domain — must match your wildcard DNS record.
+# Primary domain: must match your wildcard DNS record.
 domain       = "edge.rustunnel.com"
 
 # Ports for incoming tunnel traffic (requires CAP_NET_BIND_SERVICE or root).
 http_port    = 80
 https_port   = 443
 
-# Control-plane WebSocket port — clients connect here.
+# Control-plane WebSocket port: clients connect here.
 control_port = 4040
 
 # Dashboard UI and REST API port.
@@ -468,7 +468,7 @@ acme_enabled = false
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 [auth]
-# Strong random secret — used both as the admin token and for client auth.
+# Strong random secret: used both as the admin token and for client auth.
 # Generate: openssl rand -hex 32
 admin_token  = "your-admin-token-here"
 require_auth = true
@@ -477,7 +477,7 @@ max_failed_auth_per_minute = 10
 
 # ── Database ─────────────────────────────────────────────────────────────────
 [database]
-# PostgreSQL connection URL — the database and user must exist before starting
+# PostgreSQL connection URL: the database and user must exist before starting
 # the server (see the PostgreSQL setup step above).  Schema migrations run
 # automatically on first start.
 url = "postgresql://rustunnel:CHANGE_ME@localhost:5432/rustunnel"
@@ -530,7 +530,7 @@ chown root:rustunnel /etc/rustunnel/server.toml
 chmod 640 /etc/rustunnel/server.toml
 ```
 
-### 7 — TLS certificates (Let's Encrypt + Cloudflare)
+### 7: TLS certificates (Let's Encrypt + Cloudflare)
 
 Create the Cloudflare credentials file:
 
@@ -585,7 +585,7 @@ chgrp rustunnel /etc/letsencrypt/archive/edge.rustunnel.com/*.pem
 chmod 640 /etc/letsencrypt/archive/edge.rustunnel.com/*.pem
 ```
 
-### 8 — Set up systemd service
+### 8: Set up systemd service
 
 ```bash
 # Copy the unit file from the repository
@@ -599,7 +599,7 @@ systemctl status rustunnel.service
 journalctl -u rustunnel.service -f
 ```
 
-### 9 — Open firewall ports
+### 9: Open firewall ports
 
 ```bash
 ufw allow 80/tcp   comment "rustunnel HTTP edge"
@@ -615,10 +615,10 @@ ufw allow 20000:20099/tcp comment "rustunnel TCP tunnels"
 ufw allow 20100:20199/udp comment "rustunnel UDP tunnels"
 ```
 
-### 10 — Verify the server is running
+### 10: Verify the server is running
 
 ```bash
-# Health check — use dashboard_port from server.toml (default 8443 in production)
+# Health check: use dashboard_port from server.toml (default 8443 in production)
 curl http://localhost:8443/api/status
 
 # Confirm which ports the process is actually bound to
@@ -633,7 +633,7 @@ curl -s http://localhost:9090/metrics
 
 > **Port reminder**: port 4040 is the control-plane WebSocket (clients connect here),
 > not the dashboard. Hitting it with plain HTTP returns `HTTP/0.9` which is expected.
-> The dashboard is on `dashboard_port` — check your `server.toml` if unsure.
+> The dashboard is on `dashboard_port`. Check your `server.toml` if unsure.
 
 ### Updating the server
 
@@ -656,7 +656,7 @@ production VPS (Let's Encrypt) is available in
 ### Pull the published image
 
 Multi-arch images (`linux/amd64` + `linux/arm64`) are published to GitHub
-Container Registry on every stable release — no build required:
+Container Registry on every stable release. No build required:
 
 ```bash
 # Latest stable, or pin a version (e.g. :0.8.1)
@@ -711,19 +711,19 @@ make docker-stop
 
 ### Installation
 
-**Option 1 — Homebrew (macOS and Linux, recommended)**
+**Option 1: Homebrew (macOS and Linux, recommended)**
 
 ```bash
 brew tap joaoh82/rustunnel
 brew install rustunnel
 ```
 
-Homebrew installs pre-built binaries — no Rust toolchain required.
+Homebrew installs pre-built binaries. No Rust toolchain required.
 The formula is updated automatically on every release. This installs
 both `rustunnel` (the CLI client) and `rustunnel-mcp` (the MCP server
 for AI agent integration).
 
-**Option 2 — Pre-built binary**
+**Option 2: Pre-built binary**
 
 Download the archive for your platform from the
 [latest GitHub Release](https://github.com/joaoh82/rustunnel/releases/latest),
@@ -747,7 +747,7 @@ Available targets:
 | Linux arm64 | `rustunnel-<version>-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows x86_64 | `rustunnel-<version>-x86_64-pc-windows-msvc.zip` |
 
-**Option 3 — Build from source**
+**Option 3: Build from source**
 
 Requires Rust 1.76+.
 
@@ -772,7 +772,7 @@ rustunnel setup
 It prompts for your region and auth token, then writes `~/.rustunnel/config.yml` with the correct server address and a commented `tunnels:` example section.
 
 ```
-rustunnel setup — create ~/.rustunnel/config.yml
+rustunnel setup: create ~/.rustunnel/config.yml
 
 Region [auto / eu / us / ap / self-hosted] (default: auto):
   Selecting nearest region… eu 12ms · us 143ms · ap 311ms · → eu (Helsinki, FI) 12ms
@@ -784,7 +784,7 @@ Created: /Users/you/.rustunnel/config.yml
 Run `rustunnel start` to connect using this config.
 ```
 
-Pick a specific region (`eu`, `us`, `ap`) to connect directly, or `auto` (the default) to let the client probe all regions and pick the nearest. Choose `self-hosted` if you run your own server — the wizard will then prompt for your server address.
+Pick a specific region (`eu`, `us`, `ap`) to connect directly, or `auto` (the default) to let the client probe all regions and pick the nearest. Choose `self-hosted` if you run your own server. The wizard will then prompt for your server address.
 
 After running setup, use `rustunnel start` to connect with all tunnels defined in the config, or use `rustunnel http <port>` / `rustunnel tcp <port>` for one-off tunnels.
 
@@ -819,8 +819,8 @@ rustunnel http 3000 --no-reconnect
 ### Machine-readable output (`--json`)
 
 All tunnel-running commands (`http`, `tcp`, `udp`, `p2p`, `start`) and
-`token create` accept a `--json` flag. With it, stdout emits NDJSON —
-one JSON event object per line — instead of the human-readable startup
+`token create` accept a `--json` flag. With it, stdout emits NDJSON,
+one JSON event object per line, instead of the human-readable startup
 box, which makes the CLI easy to drive from scripts and AI agents:
 
 ```bash
@@ -837,7 +837,7 @@ Events:
 |-------|------|--------|
 | `tunnel_ready` | Tunnel registered and accepting traffic | `protocol`, `public_url`, `public_addr` (host:port, tcp/udp only), `local_port`, `local_host`, `tunnel_id`, `name` |
 | `reconnecting` | Connection dropped, retry scheduled | `attempt`, `reason`, `delay_secs` |
-| `reconnected` | Reconnect succeeded (fresh `tunnel_ready` events follow) | — |
+| `reconnected` | Reconnect succeeded (fresh `tunnel_ready` events follow) | None |
 | `error` | Fatal error; process exits with code 1 | `code` (`config`/`auth`/`tunnel`/`connection`/`protocol`/`io`), `message`, `hint` |
 | `token_created` | `token create --json` succeeded | `token`, `name`, `id` |
 
@@ -868,7 +868,7 @@ tunnels:
   web:
     proto: http
     local_port: 3000
-    subdomain: myapp      # optional — server assigns one if omitted
+    subdomain: myapp      # optional: server assigns one if omitted
 
   db:
     proto: tcp
@@ -911,9 +911,9 @@ curl -s -X POST https://your-server:8443/api/tokens \
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 80 | TCP | HTTP edge — redirects to HTTPS; also ACME HTTP-01 challenge |
-| 443 | TCP | HTTPS edge — TLS-terminated tunnel ingress |
-| 4040 | TCP | Control-plane WebSocket — clients connect here |
+| 80 | TCP | HTTP edge: redirects to HTTPS; also ACME HTTP-01 challenge |
+| 443 | TCP | HTTPS edge: TLS-terminated tunnel ingress |
+| 4040 | TCP | Control-plane WebSocket: clients connect here |
 | 8443 | TCP | Dashboard UI and REST API |
 | 9090 | TCP | Prometheus metrics (`/metrics`) |
 | 20000–20099 | TCP | TCP tunnel range (configurable via `tcp_port_range`) |
@@ -925,34 +925,34 @@ curl -s -X POST https://your-server:8443/api/tokens \
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `server.domain` | string | — | Base domain for tunnel URLs |
-| `server.http_port` | u16 | — | HTTP edge port |
-| `server.https_port` | u16 | — | HTTPS edge port |
-| `server.control_port` | u16 | — | WebSocket control-plane port |
+| `server.domain` | string | None | Base domain for tunnel URLs |
+| `server.http_port` | u16 | None | HTTP edge port |
+| `server.https_port` | u16 | None | HTTPS edge port |
+| `server.control_port` | u16 | None | WebSocket control-plane port |
 | `server.dashboard_port` | u16 | `4040` | Dashboard port |
-| `tls.cert_path` | string | — | Path to TLS certificate (PEM) |
-| `tls.key_path` | string | — | Path to TLS private key (PEM) |
+| `tls.cert_path` | string | None | Path to TLS certificate (PEM) |
+| `tls.key_path` | string | None | Path to TLS private key (PEM) |
 | `tls.acme_enabled` | bool | `false` | Enable built-in ACME renewal |
 | `tls.acme_email` | string | `""` | Contact email for ACME |
 | `tls.acme_staging` | bool | `false` | Use Let's Encrypt staging CA |
 | `tls.acme_account_dir` | string | `/var/lib/rustunnel` | ACME state directory |
 | `tls.cloudflare_api_token` | string | `""` | Cloudflare DNS API token (prefer env var `CLOUDFLARE_API_TOKEN`) |
 | `tls.cloudflare_zone_id` | string | `""` | Cloudflare Zone ID (prefer env var `CLOUDFLARE_ZONE_ID`) |
-| `auth.admin_token` | string | — | Master auth token |
-| `auth.require_auth` | bool | — | Reject unauthenticated clients |
+| `auth.admin_token` | string | None | Master auth token |
+| `auth.require_auth` | bool | None | Reject unauthenticated clients |
 | `auth.max_failed_auth_per_minute` | int | `10` | Failed auth attempts allowed per source IP per minute before further attempts are rejected (control-plane handshake and dashboard API); `0` disables |
-| `database.url` | string | — | PostgreSQL connection URL (required) |
+| `database.url` | string | None | PostgreSQL connection URL (required) |
 | `database.captured_path` | string | `/var/lib/rustunnel/captured.db` | Per-region SQLite file for captured HTTP request bodies |
 | `server.dashboard_origin` | string | `""` | Allowed CORS origin for the dashboard UI (e.g. `http://localhost:3000`) |
-| `logging.level` | string | — | `trace` / `debug` / `info` / `warn` / `error` |
-| `logging.format` | string | — | `json` or `pretty` |
+| `logging.level` | string | None | `trace` / `debug` / `info` / `warn` / `error` |
+| `logging.format` | string | None | `json` or `pretty` |
 | `logging.audit_log_path` | string | `null` | Path for audit log (JSON-lines); omit to disable |
-| `limits.max_tunnels_per_session` | usize | — | Max tunnels per connected client |
-| `limits.max_connections_per_tunnel` | usize | — | Max concurrent connections per tunnel |
-| `limits.rate_limit_rps` | u32 | — | Per-tunnel request rate cap (req/s) |
+| `limits.max_tunnels_per_session` | usize | None | Max tunnels per connected client |
+| `limits.max_connections_per_tunnel` | usize | None | Max concurrent connections per tunnel |
+| `limits.rate_limit_rps` | u32 | None | Per-tunnel request rate cap (req/s) |
 | `limits.ip_rate_limit_rps` | u32 | `100` | Per-source-IP rate cap (req/s); `0` = disabled |
-| `limits.request_body_max_bytes` | usize | — | Max proxied request body size (bytes) |
-| `limits.tcp_port_range` | [u16, u16] | — | Inclusive `[low, high]` TCP tunnel port range |
+| `limits.request_body_max_bytes` | usize | None | Max proxied request body size (bytes) |
+| `limits.tcp_port_range` | [u16, u16] | None | Inclusive `[low, high]` TCP tunnel port range |
 | `limits.udp_port_range` | [u16, u16] | `[0, 0]` | Inclusive `[low, high]` UDP tunnel port range; `[0, 0]` disables UDP tunnels |
 | `region.id` | string | `"default"` | Region identifier recorded in tunnel history (e.g. `"eu"`, `"us"`, `"ap"`) |
 | `region.name` | string | `"Default"` | Human-readable region name shown in the dashboard |
@@ -1022,14 +1022,14 @@ letting AI agents (Claude, GPT-4o, custom agents) open and manage tunnels
 without any manual intervention.
 
 **Works with any MCP harness.** For copy-paste config for Claude Code, Claude
-Desktop, Codex, Cursor, Windsurf, Cline, and custom agents — plus a one-command
-installer — see the **[Agent Integration Guide](docs/agent-integration.md)**:
+Desktop, Codex, Cursor, Windsurf, Cline, and custom agents, plus a one-command
+installer, see the **[Agent Integration Guide](docs/agent-integration.md)**:
 
 ```bash
 ./integrations/install.sh        # prompts for your token, writes the config
 ```
 
-### Quick setup (Claude Desktop — hosted server)
+### Quick setup (Claude Desktop, hosted server)
 
 ```json
 {
@@ -1052,7 +1052,7 @@ Set `RUSTUNNEL_TOKEN` once and the agent never has to pass a token on a tool cal
 
 | Tool | Description |
 |------|-------------|
-| `create_tunnel` | Open a tunnel and return the public URL — HTTP/TCP/UDP, P2P, and load-balanced pools with health checks |
+| `create_tunnel` | Open a tunnel and return the public URL: HTTP/TCP/UDP, P2P, and load-balanced pools with health checks |
 | `list_tunnels` | List all active tunnels |
 | `close_tunnel` | Force-close a tunnel by ID |
 | `list_regions` | List available server regions |
@@ -1061,7 +1061,7 @@ Set `RUSTUNNEL_TOKEN` once and the agent never has to pass a token on a tool cal
 
 ### Installation
 
-**Homebrew (macOS and Linux)** — installs `rustunnel-mcp` alongside the CLI:
+**Homebrew (macOS and Linux):** installs `rustunnel-mcp` alongside the CLI:
 
 ```bash
 brew tap joaoh82/rustunnel
@@ -1081,7 +1081,7 @@ Full setup guide, configuration options, and workflow examples are in
 ### Claude Code plugin
 
 The easiest way to use rustunnel with [Claude Code](https://claude.com/claude-code).
-Install the plugin and it handles all MCP configuration automatically — just enter
+Install the plugin and it handles all MCP configuration automatically. Just enter
 your token once and start asking Claude to expose ports.
 
 ```
@@ -1098,8 +1098,8 @@ or manual setup needed.
 ### OpenClaw skill
 
 rustunnel ships an [OpenClaw](https://openclaw.dev) skill that gives any
-OpenClaw-compatible AI agent first-class knowledge of rustunnel — config file
-format, authentication, tool signatures, and common workflows — without you
+OpenClaw-compatible AI agent first-class knowledge of rustunnel: config file
+format, authentication, tool signatures, and common workflows, without you
 having to explain it.
 
 **Skill file:** [`skills/rustunnel/SKILL.md`](skills/rustunnel/SKILL.md)
@@ -1152,7 +1152,7 @@ Contributions are welcome! Please follow these steps:
 
 ### Guidelines
 
-- Keep PRs focused — one logical change per PR.
+- Keep PRs focused: one logical change per PR.
 - Add or update tests for any new behaviour.
 - Follow the existing code style; `cargo fmt` is enforced by CI.
 - For larger changes or new features, open an issue first to discuss the approach.
@@ -1161,7 +1161,7 @@ Contributions are welcome! Please follow these steps:
 
 ## License
 
-This project is licensed under the **GNU AGPLv3 License** — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **GNU AGPLv3 License**. See the [LICENSE](LICENSE) file for details.
 
 ---
 
