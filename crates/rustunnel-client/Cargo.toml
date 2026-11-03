@@ -1,6 +1,6 @@
 [package]
 name = "rustunnel-client"
-version = "0.8.7"
+version = "0.8.8"
 edition = "2021"
 description = "CLI client for rustunnel — open-source secure tunnel server. Expose local HTTP/HTTPS/TCP/UDP services from your machine to a public URL."
 keywords = ["tunnel", "ngrok", "cli", "webhook", "reverse-proxy"]
