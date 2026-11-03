@@ -384,3 +384,163 @@ fn resync_listeners(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::TunnelCore;
+    use futures_util::future::poll_fn;
+    use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    fn make_core() -> Arc<TunnelCore> {
+        Arc::new(TunnelCore::new([0, 0], [27000, 27010], 5, 100, 1000, 10))
+    }
+
+    /// Hand the edge a yamux stream. The peer stream arrives after the edge
+    /// writes, which is what flushes yamux's lazy SYN.
+    fn yamux_peer_after_edge_write(
+        core: &Arc<TunnelCore>,
+        conn_id: Uuid,
+    ) -> tokio::sync::oneshot::Receiver<yamux::Stream> {
+        let (io_a, io_b) = tokio::io::duplex(1024 * 1024);
+        let (edge_tx, edge_rx) = tokio::sync::oneshot::channel();
+        let (local_tx, local_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut conn = yamux::Connection::new(
+                io_b.compat(),
+                yamux::Config::default(),
+                yamux::Mode::Server,
+            );
+            let stream = poll_fn(|cx| conn.poll_new_outbound(cx))
+                .await
+                .expect("yamux outbound");
+            let _ = edge_tx.send(stream);
+            while let Some(Ok(_)) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {}
+        });
+
+        tokio::spawn(async move {
+            let mut conn = yamux::Connection::new(
+                io_a.compat(),
+                yamux::Config::default(),
+                yamux::Mode::Client,
+            );
+            if let Some(Ok(stream)) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {
+                let _ = local_tx.send(stream);
+            }
+            while let Some(Ok(_)) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {}
+        });
+
+        let core = Arc::clone(core);
+        tokio::spawn(async move {
+            let edge_stream = edge_rx.await.expect("edge yamux stream");
+            assert!(
+                core.resolve_pending_conn(&conn_id, edge_stream),
+                "edge task should be waiting for {conn_id}"
+            );
+        });
+
+        local_rx
+    }
+
+    #[tokio::test]
+    async fn udp_proxy_counts_payload_both_directions() {
+        let core = make_core();
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(16);
+        let sid = core.register_session(addr, "tok".into(), None, None, ctrl_tx);
+        let (tunnel_id, port) = core.register_udp_tunnel(&sid).unwrap();
+        let (tunnel_info, control_tx) = core.resolve_udp(port).unwrap();
+
+        let public_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = client.local_addr().unwrap();
+
+        let (dg_tx, dg_rx) = mpsc::channel::<Bytes>(4);
+        let conn_id = Uuid::new_v4();
+        let core_proxy = Arc::clone(&core);
+        let proxy = tokio::spawn(async move {
+            proxy_udp_session(
+                conn_id,
+                peer,
+                port,
+                dg_rx,
+                public_socket,
+                tunnel_info,
+                control_tx,
+                core_proxy,
+            )
+            .await;
+        });
+
+        let msg = timeout(Duration::from_secs(2), ctrl_rx.recv())
+            .await
+            .expect("NewConnection")
+            .unwrap();
+        let opened = match msg {
+            ControlMessage::NewConnection { conn_id, .. } => conn_id,
+            other => panic!("expected NewConnection, got {other:?}"),
+        };
+        assert_eq!(opened, conn_id);
+
+        let local_rx = yamux_peer_after_edge_write(&core, conn_id);
+        let upload = b"udp-upload-xyz";
+        let download = b"udp-download-from-local-service";
+        let download_for_local = *download;
+
+        let local = tokio::spawn(async move {
+            let mut stream = timeout(Duration::from_secs(3), local_rx)
+                .await
+                .expect("local yamux stream timeout")
+                .expect("local yamux stream");
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.expect("frame len");
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut got = vec![0u8; len];
+            stream.read_exact(&mut got).await.expect("frame body");
+            assert_eq!(got, upload);
+            let out_len = (download_for_local.len() as u32).to_be_bytes();
+            stream.write_all(&out_len).await.expect("write len");
+            stream
+                .write_all(&download_for_local)
+                .await
+                .expect("write payload");
+            stream.flush().await.expect("flush");
+            // Hold the stream open until the edge has copied the datagram.
+            // The test aborts this task after the session flush.
+            std::future::pending::<()>().await
+        });
+
+        dg_tx
+            .send(Bytes::from_static(upload))
+            .await
+            .expect("send datagram");
+
+        let mut buf = vec![0u8; 128];
+        let (n, _from) = timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+            .await
+            .expect("echo timeout")
+            .expect("recv");
+        assert_eq!(&buf[..n], download);
+
+        // Closing the datagram channel ends the session, which flushes meters.
+        drop(dg_tx);
+        timeout(Duration::from_secs(3), proxy)
+            .await
+            .expect("proxy did not finish")
+            .unwrap();
+        local.abort();
+
+        let snap = core.tunnel_meter(&tunnel_id);
+        // Payload only — the 4-byte length prefix is not part of bytes_in/out.
+        assert_eq!(snap.bytes_in, upload.len() as u64);
+        assert_eq!(snap.bytes_out, download.len() as u64);
+        assert!(snap.bytes_in > 0 && snap.bytes_out > 0);
+        assert_eq!(
+            core.get_tunnel_bytes_proxied(&tunnel_id),
+            snap.bytes_in + snap.bytes_out
+        );
+        assert_eq!(snap.bytes_proxied(), snap.bytes_in + snap.bytes_out);
+    }
+}
