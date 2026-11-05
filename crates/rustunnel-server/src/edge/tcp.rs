@@ -202,7 +202,10 @@ async fn proxy_tcp_connection(
                 bytes_up = up, bytes_down = down,
                 "TCP proxy done"
             );
-            // public -> local is inbound, local -> public is outbound.
+            // Payload on the yamux stream after the 16-byte conn_id.
+            // `up` is public → local (`bytes_in`); `down` is local → public
+            // (`bytes_out`). Yamux frames, the data-plane WebSocket, and
+            // TLS are below this copy and are not included.
             tunnel_info.add_transfer(up, down);
         }
         Err(e) => {
@@ -323,5 +326,134 @@ mod tests {
         // so the full roundtrip is covered by integration tests.
         drop(session);
         let _ = conn_id;
+    }
+
+    /// Open a yamux stream the edge can write, and return the peer stream
+    /// once that first write flushes the lazy SYN.
+    fn yamux_peer_after_edge_write(
+        core: &Arc<TunnelCore>,
+        conn_id: Uuid,
+    ) -> tokio::sync::oneshot::Receiver<yamux::Stream> {
+        use futures_util::future::poll_fn;
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let (io_a, io_b) = tokio::io::duplex(1024 * 1024);
+        let (edge_tx, edge_rx) = tokio::sync::oneshot::channel();
+        let (local_tx, local_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut conn = yamux::Connection::new(
+                io_b.compat(),
+                yamux::Config::default(),
+                yamux::Mode::Server,
+            );
+            let stream = poll_fn(|cx| conn.poll_new_outbound(cx))
+                .await
+                .expect("yamux outbound");
+            let _ = edge_tx.send(stream);
+            while let Some(Ok(_)) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {}
+        });
+
+        tokio::spawn(async move {
+            let mut conn = yamux::Connection::new(
+                io_a.compat(),
+                yamux::Config::default(),
+                yamux::Mode::Client,
+            );
+            if let Some(Ok(stream)) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {
+                let _ = local_tx.send(stream);
+            }
+            while let Some(Ok(_)) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {}
+        });
+
+        let core = Arc::clone(core);
+        tokio::spawn(async move {
+            let edge_stream = edge_rx.await.expect("edge yamux stream");
+            assert!(
+                core.resolve_pending_conn(&conn_id, edge_stream),
+                "edge task should be waiting for {conn_id}"
+            );
+        });
+
+        local_rx
+    }
+
+    #[tokio::test]
+    async fn tcp_proxy_counts_both_directions() {
+        use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let core = make_core();
+        let (sid, mut ctrl_rx) = add_session(&core);
+        let (tunnel_id, port) = core.register_tcp_tunnel(&sid, None).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_addr = listener.local_addr().unwrap();
+        let core_proxy = Arc::clone(&core);
+        let proxy = tokio::spawn(async move {
+            let (sock, peer) = listener.accept().await.unwrap();
+            proxy_tcp_connection(sock, peer, port, core_proxy)
+                .await
+                .unwrap();
+        });
+
+        let mut public = tokio::net::TcpStream::connect(public_addr).await.unwrap();
+        let msg = timeout(Duration::from_secs(2), ctrl_rx.recv())
+            .await
+            .expect("NewConnection")
+            .unwrap();
+        let conn_id = match msg {
+            ControlMessage::NewConnection { conn_id, .. } => conn_id,
+            other => panic!("expected NewConnection, got {other:?}"),
+        };
+
+        let local_rx = yamux_peer_after_edge_write(&core, conn_id);
+        let upload = b"upload-from-public-side-0123456789";
+        let download = vec![b'D'; 200];
+        let download_for_local = download.clone();
+
+        let local = tokio::spawn(async move {
+            let mut stream = timeout(Duration::from_secs(3), local_rx)
+                .await
+                .expect("local yamux stream timeout")
+                .expect("local yamux stream");
+            let mut got = vec![0u8; upload.len()];
+            stream.read_exact(&mut got).await.expect("read upload");
+            assert_eq!(got, upload);
+            stream
+                .write_all(&download_for_local)
+                .await
+                .expect("write download");
+            stream.close().await.expect("close local stream");
+        });
+
+        public.write_all(upload).await.unwrap();
+        public.shutdown().await.unwrap();
+        let mut echoed = vec![0u8; download.len()];
+        timeout(Duration::from_secs(3), public.read_exact(&mut echoed))
+            .await
+            .expect("download timeout")
+            .unwrap();
+        assert_eq!(echoed, download);
+
+        timeout(Duration::from_secs(3), local)
+            .await
+            .expect("local task")
+            .unwrap();
+        timeout(Duration::from_secs(3), proxy)
+            .await
+            .expect("proxy task")
+            .unwrap();
+
+        let snap = core.tunnel_meter(&tunnel_id);
+        assert_eq!(snap.bytes_in, upload.len() as u64);
+        assert_eq!(snap.bytes_out, download.len() as u64);
+        assert!(snap.bytes_in > 0 && snap.bytes_out > 0);
+        assert_eq!(
+            core.get_tunnel_bytes_proxied(&tunnel_id),
+            snap.bytes_in + snap.bytes_out
+        );
+        assert_eq!(snap.bytes_proxied(), snap.bytes_in + snap.bytes_out);
     }
 }
