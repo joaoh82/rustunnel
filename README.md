@@ -9,6 +9,12 @@
 
 The open-source tunnel that scales with you. Don't pay for idle time. Secure, Rust-fast, and Pay-as-you-go.
 
+![rustunnel CLI with an HTTP tunnel online. The public URL is http://demo.localhost, forwarding to localhost:3000, and the request log shows live traffic.](docs/images/rustunnel-cli.png)
+
+![rustunnel local request inspector showing the same tunnel and a captured POST to /api/hooks, including the request and response bodies.](docs/images/rustunnel-inspect.png)
+
+The stills above are a real local session: `rustunnel http 3000 --server localhost:4040 --insecure --subdomain demo --inspect-port 4044` against the self-hosted server in `deploy/local/server.toml`. Auth is off in that config, so the command uses no token. The CLI prints the URL the server assigns, `http://demo.localhost`. With this local config, HTTP traffic for that hostname is served on port 8080.
+
 Expose local services through a public server over encrypted WebSocket connections with TLS termination, HTTP/TCP proxying, a live dashboard, Prometheus metrics, and audit logging.
 
 You can self-host or use our managed service.
