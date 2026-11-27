@@ -115,7 +115,7 @@ COMMENT ON COLUMN tokens.expires_at IS
 --   scheme). Default is every protocol, so free and payg stay unrestricted.
 -- bandwidth_hard_cap + bandwidth_limit_bytes: a hard monthly cap on
 --   tunnel_log.bytes_proxied. bandwidth_limit_gb stays the soft Hobby
---   warning and is whole binary gigabytes, so it cannot store 250 MiB.
+--   warning and is whole binary gigabytes, so it cannot store 250 MB.
 --   Hard cap is off and the byte column is NULL unless both are set.
 
 ALTER TABLE plans ADD COLUMN IF NOT EXISTS allowed_protocols TEXT[];
@@ -156,7 +156,7 @@ COMMENT ON COLUMN plans.allowed_protocols IS
 COMMENT ON COLUMN plans.bandwidth_hard_cap IS
     'When true, bandwidth_limit_bytes is a hard monthly cap. When false, bandwidth_limit_gb remains the soft Hobby warning.';
 COMMENT ON COLUMN plans.bandwidth_limit_bytes IS
-    'Hard monthly cap in bytes (1024-based, same family as the 1 GiB Hobby cap). NULL when bandwidth_hard_cap is false.';
+    'Hard monthly cap in bytes. NULL when bandwidth_hard_cap is false. The agent plan stores the advertised 250 MB as 250000000.';
 
 -- The agent plan. name is the plan value. There is no plans enum.
 -- Limits:
@@ -164,7 +164,7 @@ COMMENT ON COLUMN plans.bandwidth_limit_bytes IS
 --   allowed_protocols            http + https only (HTTP edge)
 --   allow_custom_subdomains      false = random subdomain only
 --   bandwidth_hard_cap           true
---   bandwidth_limit_bytes        262144000 = 250 * 1024 * 1024 (250 MiB)
+--   bandwidth_limit_bytes        250000000 (250 MB decimal, the advertised cap)
 --   bandwidth_limit_gb           NULL (soft gigabyte warning is not used)
 --   billing_model                'agent' (not 'free', so the deployed
 --                                hobby gate does not apply)
@@ -199,8 +199,10 @@ INSERT INTO plans (
     0,
     ARRAY['http', 'https']::text[],
     true,
-    262144000
+    250000000
 )
+-- A replay rewrites the agent row, including bandwidth_limit_bytes, so
+-- an earlier 262144000 (binary MiB) becomes 250000000.
 ON CONFLICT (name) DO UPDATE SET
     billing_model = EXCLUDED.billing_model,
     monthly_price_cents = EXCLUDED.monthly_price_cents,

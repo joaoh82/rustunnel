@@ -130,7 +130,7 @@ async fn agent_plan_row_matches_the_published_limits() {
         agent.bandwidth_limit_bytes,
         Some(AgentPlanLimits::BANDWIDTH_LIMIT_BYTES)
     );
-    assert_eq!(AgentPlanLimits::BANDWIDTH_LIMIT_BYTES, 250 * 1024 * 1024);
+    assert_eq!(AgentPlanLimits::BANDWIDTH_LIMIT_BYTES, 250_000_000);
     assert!(agent.bandwidth_limit_gb.is_none());
     assert_eq!(agent.monthly_price_cents, 0);
     assert!(agent.is_active);

@@ -122,11 +122,10 @@ impl AgentPlanLimits {
     /// with an https public URL. `tcp`, `udp`, and `p2p` are excluded.
     pub const ALLOWED_PROTOCOLS: &'static [&'static str] = &["http", "https"];
     pub const BANDWIDTH_HARD_CAP: bool = true;
-    /// 250 MiB. Binary units, the same 1024-based family as the Hobby
-    /// gigabyte cap (`250 * 1024 * 1024`). Not 250_000_000 decimal bytes,
-    /// and not `plans.bandwidth_limit_gb` (that column is whole GiB and is
-    /// a soft warning).
-    pub const BANDWIDTH_LIMIT_BYTES: i64 = 250 * 1024 * 1024;
+    /// 250 MB, the advertised monthly cap (`250_000_000` decimal bytes).
+    /// Not `plans.bandwidth_limit_gb` (that column is whole GiB and is a
+    /// soft warning).
+    pub const BANDWIDTH_LIMIT_BYTES: i64 = 250_000_000;
     /// Unclaimed agent API tokens expire this many days after
     /// `users.created_at`. Cleared to NULL when `users.claimed_at` is set.
     pub const TOKEN_TTL_DAYS: i64 = 7;
