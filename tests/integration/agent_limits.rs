@@ -801,6 +801,17 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
     )
     .await;
     assert_eq!(page.status(), 200);
+    assert_eq!(page.headers().get("x-frame-options").unwrap(), "DENY");
+    let csp = page
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("default-src 'none'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert!(csp.contains("style-src 'sha256-"));
+    assert!(!csp.contains("unsafe-inline"));
     let html = page.text().await.unwrap();
     assert!(html.contains("temporary tunnel created by an automated agent"));
     assert!(html.contains(&host));

@@ -967,6 +967,12 @@ fn edge_response(response: EdgeResponse) -> Response<BoxBody> {
     if let Some(location) = response.location {
         builder = builder.header("location", location);
     }
+    if let Some(value) = response.frame_options {
+        builder = builder.header("x-frame-options", value);
+    }
+    if let Some(value) = response.content_security_policy {
+        builder = builder.header("content-security-policy", value);
+    }
     builder.body(full(response.body)).unwrap()
 }
 
