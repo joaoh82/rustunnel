@@ -1391,6 +1391,36 @@ async fn agent_tunnels_cannot_mint_or_see_warning_cookies() {
     seed.cleanup().await;
 }
 
+#[tokio::test]
+async fn concurrent_registrations_allow_exactly_one_tunnel() {
+    init_tracing();
+    let server = TestServer::start().await;
+    let seed = Seed::create(&server.db.pg, "agent", "agent").await;
+    let mut first = TestClient::connect_with_token(&server, &seed.raw)
+        .await
+        .unwrap();
+    let mut second = TestClient::connect_with_token(&server, &seed.raw)
+        .await
+        .unwrap();
+    let (left, right) = tokio::join!(
+        first.register_http_tunnel(None),
+        second.register_http_tunnel(None),
+    );
+    let results = [left, right];
+    let allowed = results.iter().filter(|result| result.is_ok()).count();
+    let limited = results
+        .iter()
+        .filter(|result| {
+            result
+                .as_ref()
+                .is_err_and(|err| err.contains("[tunnel_limit]"))
+        })
+        .count();
+    assert_eq!(allowed, 1, "{results:?}");
+    assert_eq!(limited, 1, "{results:?}");
+    seed.cleanup().await;
+}
+
 fn location_leaves_host(location: &str) -> bool {
     let lower = location.to_ascii_lowercase();
     lower.starts_with("//")

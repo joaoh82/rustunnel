@@ -679,18 +679,107 @@ struct OpenTunnelRow {
     region_id: Option<String>,
 }
 
-async fn count_open_tunnels(
-    pool: &PgPool,
+/// Outcome of [`reserve_plan_registration`].
+///
+/// `Allowed(Some(tx))` still holds `pg_advisory_xact_lock` for this user.
+/// The caller registers the route, inserts `tunnel_log` on `tx`, and
+/// commits. Dropping `tx` rolls the lock back and the insert never lands.
+/// Two edges that share Postgres serialize on the lock. An in-process mutex
+/// would not: the other region could count, register, and insert in between.
+pub enum PlanReservation<'a> {
+    Allowed(Option<sqlx::Transaction<'a, sqlx::Postgres>>),
+    Denied(RegistrationDenial),
+}
+
+/// Same checks as [`evaluate_plan_registration`], but the open-tunnel count
+/// and the caller's `tunnel_log` insert share one transaction.
+///
+/// Protocol and custom-subdomain denials return before the lock. The byte
+/// total is read first, on its own transaction, so the lock is only the
+/// count plus the insert. Bandwidth is still applied after the tunnel limit.
+pub async fn reserve_plan_registration<'a>(
+    pool: &'a PgPool,
+    user_id: Uuid,
+    protocol: &str,
+    requested_subdomain: Option<&str>,
+    core: &TunnelCore,
+    scope: TunnelCountScope<'_>,
+) -> Result<PlanReservation<'a>> {
+    let Some(view) = load_account(pool, user_id).await? else {
+        return Ok(PlanReservation::Allowed(None));
+    };
+    let Some(plan) = view.plan else {
+        return Ok(PlanReservation::Allowed(None));
+    };
+    if let Some(denial) = plan_registration_denial(&plan, protocol, requested_subdomain, 0, 0) {
+        if denial.code == code::PROTOCOL_NOT_ALLOWED
+            || denial.code == code::CUSTOM_SUBDOMAIN_NOT_ALLOWED
+        {
+            return Ok(PlanReservation::Denied(denial));
+        }
+    }
+    let month_bytes = if hard_cap_limit(&plan).is_some() {
+        month_bytes_including_live(pool, user_id, &core.live_bytes_proxied_for_user(user_id))
+            .await?
+    } else {
+        0
+    };
+    let needs_count = plan.billing_model != "free" && plan.max_tunnels.is_some();
+    if !needs_count {
+        return Ok(
+            match plan_registration_denial(&plan, protocol, requested_subdomain, 0, month_bytes) {
+                Some(denial) => PlanReservation::Denied(denial),
+                None => PlanReservation::Allowed(None),
+            },
+        );
+    }
+    let mut tx = pool.begin().await?;
+    let (key1, key2) = advisory_lock_keys(user_id);
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(key1)
+        .bind(key2)
+        .execute(&mut *tx)
+        .await?;
+    let open_tunnels = count_open_tunnels(&mut *tx, user_id, core, scope).await?;
+    Ok(
+        match plan_registration_denial(
+            &plan,
+            protocol,
+            requested_subdomain,
+            open_tunnels,
+            month_bytes,
+        ) {
+            Some(denial) => PlanReservation::Denied(denial),
+            None => PlanReservation::Allowed(Some(tx)),
+        },
+    )
+}
+
+/// Two `int4` keys for `pg_advisory_xact_lock`. The first eight bytes of the
+/// user id are enough: a collision only makes unrelated users queue, and the
+/// count underneath the lock is still per user.
+fn advisory_lock_keys(user_id: Uuid) -> (i32, i32) {
+    let bytes = user_id.as_bytes();
+    let key1 = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let key2 = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    (key1, key2)
+}
+
+async fn count_open_tunnels<'e, E>(
+    executor: E,
     user_id: Uuid,
     core: &TunnelCore,
     scope: TunnelCountScope<'_>,
-) -> Result<i64> {
+) -> Result<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let rows: Vec<OpenTunnelRow> = sqlx::query_as(
         "SELECT session_id, token_id, region_id FROM tunnel_log \
          WHERE user_id = $1 AND unregistered_at IS NULL",
     )
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     let Some(token_id) = scope.token_id else {
         return Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX));

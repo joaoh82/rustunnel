@@ -199,6 +199,17 @@ pub struct TunnelRegistration<'a> {
 
 /// Insert a tunnel_log row when a tunnel is registered.
 pub async fn log_tunnel_registered(pool: &PgPool, reg: TunnelRegistration<'_>) -> Result<()> {
+    insert_tunnel_log(pool, reg).await
+}
+
+/// Insert a tunnel_log row on an existing transaction.
+///
+/// Registration holds `pg_advisory_xact_lock` on this transaction across the
+/// open-tunnel count and this insert, then commits.
+pub async fn insert_tunnel_log<'e, E>(executor: E, reg: TunnelRegistration<'_>) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO tunnel_log \
@@ -214,7 +225,7 @@ pub async fn log_tunnel_registered(pool: &PgPool, reg: TunnelRegistration<'_>) -
     .bind(Utc::now())
     .bind(reg.region_id)
     .bind(reg.user_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
