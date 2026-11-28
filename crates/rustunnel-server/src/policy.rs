@@ -1046,13 +1046,19 @@ pub fn without_warning_cookies(cookie: &str) -> Option<String> {
 }
 
 /// `true` when a `Set-Cookie` value mints a warning cookie.
+///
+/// A nameless cookie (`=__Host-rustunnel_warn_…`) counts too: some agents
+/// omit the name and put the warning cookie in the value.
 pub fn is_warning_set_cookie(value: &str) -> bool {
     let pair = value.split(';').next().unwrap_or(value).trim();
-    let name = pair
-        .split_once('=')
-        .map(|(name, _)| name.trim())
-        .unwrap_or(pair);
-    is_warning_cookie_name(name)
+    let (name, cookie_value) = match pair.split_once('=') {
+        Some((name, value)) => (name.trim(), value.trim()),
+        None => (pair, ""),
+    };
+    if is_warning_cookie_name(name) {
+        return true;
+    }
+    name.is_empty() && cookie_value.starts_with(WARNING_COOKIE_PREFIX)
 }
 
 fn cookie_value<'a>(cookie: Option<&'a str>, name: &str) -> Option<&'a str> {
@@ -2038,6 +2044,10 @@ mod tests {
             "__Host-rustunnel_warn_nonce=minted; Path=/"
         ));
         assert!(!is_warning_set_cookie("app_session=keep; Path=/"));
+        assert!(is_warning_set_cookie(
+            "=__Host-rustunnel_warn_ok=1; Path=/; Secure"
+        ));
+        assert!(!is_warning_set_cookie("=app_session=keep; Path=/"));
     }
 
     #[test]
