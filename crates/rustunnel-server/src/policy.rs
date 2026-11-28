@@ -24,14 +24,17 @@
 //! cap. An open stream therefore stops on the next pass even when the meter
 //! flush is disabled. A database error on that pass or on a proxied request
 //! serves the last cached account and byte total, including one past its
-//! TTL. The request is proxied, and the session stays up, only when this
-//! process has no cached entry at all.
+//! TTL. The account lookup itself waits at most [`ACCOUNT_LOOKUP_TIMEOUT`]
+//! and, after a failure, is not tried again for that user for
+//! [`ACCOUNT_LOOKUP_BACKOFF`]. The request is proxied, and the session stays
+//! up, only when this process has no cached entry at all.
 //!
 //! # Deactivation sweep
 //!
 //! [`deactivate_expired_unclaimed_agents`] is one `UPDATE`. Every edge may
 //! run it. It never deletes a user or a token.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -45,7 +48,7 @@ use rustunnel_protocol::TunnelProtocol;
 use crate::billing::month_bytes_including_live;
 use crate::core::{ControlMessage, TunnelCore};
 use crate::db::models::{AgentPlanLimits, Token};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Per-request account snapshot. The session recheck still reads Postgres.
 /// When that read fails it uses this snapshot, including after the TTL.
@@ -60,6 +63,14 @@ pub const SESSION_RECHECK_INTERVAL: Duration = Duration::from_secs(20);
 /// month-byte read the hard cap uses. A stuck database returns in this time
 /// instead of holding the recheck loop.
 const STATEMENT_TIMEOUT: &str = "2s";
+/// How long a proxied request waits for the account row before using the
+/// cached snapshot, or failing open when there is none. The pool's own
+/// acquire timeout is much longer; this is the bound the edge actually uses.
+const ACCOUNT_LOOKUP_TIMEOUT: Duration = Duration::from_millis(400);
+/// After a timed-out or failed account lookup, how long further requests
+/// for that user skip Postgres. One request every few seconds is enough to
+/// notice the database is back.
+const ACCOUNT_LOOKUP_BACKOFF: Duration = Duration::from_secs(3);
 /// How often expired unclaimed agent accounts are marked `deactivated_at`.
 pub const DEACTIVATION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -200,6 +211,14 @@ struct CachedBytes {
     live: Vec<(Uuid, u64)>,
 }
 
+/// One in-flight account lookup, shared by every request for that user.
+struct AccountFlight {
+    notify: tokio::sync::Notify,
+    /// `Ok` is the loaded row (`None` means the user does not exist).
+    /// `Err` means the lookup failed or timed out.
+    outcome: std::sync::Mutex<Option<std::result::Result<Option<AccountView>, ()>>>,
+}
+
 /// Short-lived cache in front of account and bandwidth reads.
 pub struct AccountGate {
     pool: PgPool,
@@ -207,6 +226,9 @@ pub struct AccountGate {
     bandwidth_ttl: Duration,
     accounts: DashMap<Uuid, CachedView>,
     bandwidth: DashMap<Uuid, CachedBytes>,
+    /// `user_id` → do not query again until this instant.
+    lookup_not_before: DashMap<Uuid, Instant>,
+    inflight: DashMap<Uuid, Arc<AccountFlight>>,
 }
 
 impl AccountGate {
@@ -217,20 +239,78 @@ impl AccountGate {
             bandwidth_ttl,
             accounts: DashMap::new(),
             bandwidth: DashMap::new(),
+            lookup_not_before: DashMap::new(),
+            inflight: DashMap::new(),
         }
     }
 
     /// Account row plus the active plan. `None` when the user does not exist.
     ///
-    /// A database error returns the last cached snapshot, including one past
-    /// [`ACCOUNT_CACHE_TTL`]. The error is returned only when this user has
-    /// never been cached.
+    /// The lookup waits at most [`ACCOUNT_LOOKUP_TIMEOUT`]. A timeout or
+    /// database error returns the last cached snapshot, including one past
+    /// [`ACCOUNT_CACHE_TTL`], and skips Postgres for
+    /// [`ACCOUNT_LOOKUP_BACKOFF`]. The error is returned only when this user
+    /// has never been cached. Concurrent misses share one lookup.
     pub async fn view(&self, user_id: Uuid) -> Result<Option<AccountView>> {
         if let Some(hit) = self.fresh_view(user_id) {
             return Ok(Some(hit));
         }
-        match load_account(&self.pool, user_id).await {
-            Ok(loaded) => {
+        if self.lookup_deferred(user_id) {
+            return self.cached_or_err(user_id);
+        }
+        let flight = Arc::new(AccountFlight {
+            notify: tokio::sync::Notify::new(),
+            outcome: std::sync::Mutex::new(None),
+        });
+        let role = match self.inflight.entry(user_id) {
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&flight));
+                Some(flight)
+            }
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let existing = Arc::clone(entry.get());
+                drop(entry);
+                return self.wait_for_lookup(user_id, existing).await;
+            }
+        };
+        let flight = role.expect("vacant entry inserts a flight");
+        let result = self.load_view(user_id).await;
+        let stored = match &result {
+            Ok(view) => Ok(view.clone()),
+            Err(_) => Err(()),
+        };
+        *flight
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
+        flight.notify.notify_waiters();
+        self.inflight.remove(&user_id);
+        result
+    }
+
+    async fn wait_for_lookup(
+        &self,
+        user_id: Uuid,
+        flight: Arc<AccountFlight>,
+    ) -> Result<Option<AccountView>> {
+        let _ = tokio::time::timeout(ACCOUNT_LOOKUP_TIMEOUT, flight.notify.notified()).await;
+        let outcome = flight
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match outcome {
+            Some(Ok(view)) => Ok(view),
+            Some(Err(())) | None => self.cached_or_err(user_id),
+        }
+    }
+
+    async fn load_view(&self, user_id: Uuid) -> Result<Option<AccountView>> {
+        let loaded =
+            tokio::time::timeout(ACCOUNT_LOOKUP_TIMEOUT, load_account(&self.pool, user_id)).await;
+        match loaded {
+            Ok(Ok(loaded)) => {
+                self.lookup_not_before.remove(&user_id);
                 if !self.account_ttl.is_zero() {
                     if let Some(ref view) = loaded {
                         self.accounts.insert(
@@ -246,17 +326,40 @@ impl AccountGate {
                 }
                 Ok(loaded)
             }
-            Err(e) => match self.any_view(user_id) {
-                Some(view) => {
-                    tracing::warn!(
-                        error = %e,
-                        %user_id,
-                        "account lookup failed; using cached account"
-                    );
-                    Ok(Some(view))
-                }
-                None => Err(e),
-            },
+            Ok(Err(e)) => self.failed_lookup(user_id, e),
+            Err(_elapsed) => {
+                tracing::warn!(%user_id, "account lookup timed out");
+                self.failed_lookup(user_id, lookup_timeout_error())
+            }
+        }
+    }
+
+    fn failed_lookup(&self, user_id: Uuid, error: Error) -> Result<Option<AccountView>> {
+        self.lookup_not_before
+            .insert(user_id, Instant::now() + ACCOUNT_LOOKUP_BACKOFF);
+        match self.any_view(user_id) {
+            Some(view) => {
+                tracing::warn!(
+                    error = %error,
+                    %user_id,
+                    "account lookup failed; using cached account"
+                );
+                Ok(Some(view))
+            }
+            None => Err(error),
+        }
+    }
+
+    fn lookup_deferred(&self, user_id: Uuid) -> bool {
+        self.lookup_not_before
+            .get(&user_id)
+            .is_some_and(|until| Instant::now() < *until)
+    }
+
+    fn cached_or_err(&self, user_id: Uuid) -> Result<Option<AccountView>> {
+        match self.any_view(user_id) {
+            Some(view) => Ok(Some(view)),
+            None => Err(lookup_timeout_error()),
         }
     }
 
@@ -657,6 +760,10 @@ fn view_from_row(row: AccountRow) -> AccountView {
         deactivated_at: row.deactivated_at,
         plan,
     }
+}
+
+fn lookup_timeout_error() -> Error {
+    Error::Db(sqlx::Error::PoolTimedOut)
 }
 
 async fn load_account(pool: &PgPool, user_id: Uuid) -> Result<Option<AccountView>> {
@@ -2050,6 +2157,109 @@ mod tests {
             "flushing the same counters must not count them twice"
         );
         fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn a_hung_database_serves_the_cached_account_within_the_timeout() {
+        let (accepted, pool) = hung_pool().await;
+        let gate = AccountGate::new(pool, ACCOUNT_CACHE_TTL, BANDWIDTH_CACHE_TTL);
+        let user_id = Uuid::new_v4();
+        let cached = view("human", true, "pro");
+        gate.accounts.insert(
+            user_id,
+            CachedView {
+                view: cached.clone(),
+                at: Instant::now() - Duration::from_secs(3600),
+            },
+        );
+
+        let started = Instant::now();
+        let got = gate.view(user_id).await.unwrap().unwrap();
+        assert_eq!(got, cached);
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "lookup waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(accepted(), 1);
+
+        let again = Instant::now();
+        assert_eq!(gate.view(user_id).await.unwrap().unwrap(), cached);
+        assert!(
+            again.elapsed() < Duration::from_millis(50),
+            "backoff still queried the database"
+        );
+        assert_eq!(accepted(), 1, "backoff must not open another connection");
+    }
+
+    #[tokio::test]
+    async fn a_hung_database_fails_open_and_backs_off_when_nothing_is_cached() {
+        let (accepted, pool) = hung_pool().await;
+        let gate = AccountGate::new(pool, ACCOUNT_CACHE_TTL, BANDWIDTH_CACHE_TTL);
+        let user_id = Uuid::new_v4();
+
+        let started = Instant::now();
+        assert!(gate.view(user_id).await.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "lookup waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(accepted(), 1);
+
+        assert!(gate.view(user_id).await.is_err());
+        assert_eq!(accepted(), 1, "backoff must not open another connection");
+    }
+
+    #[tokio::test]
+    async fn concurrent_account_misses_share_one_database_lookup() {
+        let (accepted, pool) = hung_pool().await;
+        let gate = Arc::new(AccountGate::new(
+            pool,
+            ACCOUNT_CACHE_TTL,
+            BANDWIDTH_CACHE_TTL,
+        ));
+        let user_id = Uuid::new_v4();
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let gate = Arc::clone(&gate);
+            tasks.push(tokio::spawn(async move { gate.view(user_id).await }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap().is_err());
+        }
+        assert_eq!(accepted(), 1, "four misses must share one lookup");
+    }
+
+    /// A listener that accepts and never speaks Postgres. `accepted` counts
+    /// TCP connections, which is the number of times the pool reached the
+    /// database.
+    async fn hung_pool() -> (impl Fn() -> usize, PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                count.fetch_add(1, Ordering::Relaxed);
+                held.push(sock);
+            }
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_lazy(&format!(
+                "postgres://rustunnel:test@127.0.0.1:{port}/rustunnel_test"
+            ))
+            .unwrap();
+        let read = move || accepted.load(Ordering::Relaxed);
+        (read, pool)
     }
 
     #[tokio::test]
