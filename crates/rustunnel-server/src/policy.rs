@@ -1628,6 +1628,12 @@ pub async fn disconnect_blocked_sessions(
     let token_ids: Vec<String> = snapshot.iter().map(|(_, id)| id.clone()).collect();
     match load_recheck_rows(pool, &token_ids).await {
         Ok((tokens, accounts)) => {
+            // A user this batch no longer returns (no live session, or the
+            // row is gone) must not keep a stale snapshot.
+            if !gate.account_ttl.is_zero() {
+                gate.accounts
+                    .retain(|user_id, _| accounts.contains_key(user_id));
+            }
             remember_accounts(gate, &accounts);
             let mut closed = 0usize;
             let mut over_cap: std::collections::HashMap<Uuid, bool> =
@@ -3080,6 +3086,50 @@ mod tests {
             "seeded cache still queried the database"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recheck_evicts_cached_users_the_batch_no_longer_returns() {
+        let pool = pool().await;
+        let present = Fixture::insert(&pool, "human", "free", false, "active").await;
+        let absent = Fixture::insert(&pool, "human", "free", false, "active").await;
+        let present_id = present.user_id;
+        let absent_id = absent.user_id;
+        let token_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO tokens (id, token_hash, label, created_at, user_id, status) \
+             VALUES ($1, $2, 't', NOW(), $3, 'active')",
+        )
+        .bind(&token_id)
+        .bind(format!("hash-{token_id}"))
+        .bind(present_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let core = idle_core();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        core.register_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "present".into(),
+            Some(token_id),
+            Some(present_id),
+            tx,
+        );
+        let gate = AccountGate::new(pool.clone(), ACCOUNT_CACHE_TTL, BANDWIDTH_CACHE_TTL);
+        gate.view(present_id).await.unwrap().unwrap();
+        gate.view(absent_id).await.unwrap().unwrap();
+        assert!(gate.accounts.get(&absent_id).is_some());
+        let closed = disconnect_blocked_sessions(&pool, &core, &gate)
+            .await
+            .unwrap();
+        assert_eq!(closed, 0);
+        assert!(gate.accounts.get(&present_id).is_some());
+        assert!(
+            gate.accounts.get(&absent_id).is_none(),
+            "cached user with no live session was still in the account cache"
+        );
+        present.cleanup().await;
+        absent.cleanup().await;
     }
 
     #[tokio::test]
