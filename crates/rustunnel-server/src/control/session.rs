@@ -51,6 +51,42 @@ fn auth_error(message: impl Into<String>, code: Option<&str>) -> ControlFrame {
     }
 }
 
+struct TunnelLogWrite<'a> {
+    pool: &'a sqlx::PgPool,
+    /// Open when the plan count ran under `pg_advisory_xact_lock`. The insert
+    /// commits this transaction. `None` is a registration with no per-user cap.
+    hold: Option<sqlx::Transaction<'a, sqlx::Postgres>>,
+    tunnel_id: Uuid,
+    protocol: &'a str,
+    label: &'a str,
+    session_id: Uuid,
+    token_id: Option<&'a str>,
+    region_id: &'a str,
+    user_id: Option<Uuid>,
+}
+
+async fn write_tunnel_log(write: TunnelLogWrite<'_>) -> Result<()> {
+    let tunnel_id = write.tunnel_id.to_string();
+    let session_id = write.session_id.to_string();
+    let reg = db::TunnelRegistration {
+        tunnel_id: &tunnel_id,
+        protocol: write.protocol,
+        label: write.label,
+        session_id: &session_id,
+        token_id: write.token_id,
+        region_id: write.region_id,
+        user_id: write.user_id,
+    };
+    match write.hold {
+        Some(mut tx) => {
+            db::insert_tunnel_log(&mut *tx, reg).await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        None => db::log_tunnel_registered(write.pool, reg).await,
+    }
+}
+
 fn tunnel_error(
     request_id: String,
     message: impl Into<String>,
@@ -576,6 +612,9 @@ where
             // is omitted by those CLIs and means `cli`.
             let surface = crate::billing::Surface::parse(client_surface.as_deref());
             let mut registration_notice: Option<String> = None;
+            // Held across the in-memory register and the tunnel_log insert
+            // when this user has a concurrent-tunnel cap.
+            let mut plan_hold: Option<sqlx::Transaction<'_, sqlx::Postgres>> = None;
 
             // ── Token limit enforcement ────────────────────────────────────
             // status is always checked; limit/expiry checks are skipped for
@@ -660,7 +699,7 @@ where
                             );
                             registration_notice = Some(warning.message(surface));
                         }
-                        let denial = match crate::policy::evaluate_plan_registration(
+                        match crate::policy::reserve_plan_registration(
                             &db.pg,
                             user_id,
                             crate::policy::protocol_name(&protocol),
@@ -674,7 +713,17 @@ where
                         )
                         .await
                         {
-                            Ok(denial) => denial,
+                            Ok(crate::policy::PlanReservation::Denied(denial)) => {
+                                send_frame(
+                                    ws,
+                                    &tunnel_error(request_id, denial.message, Some(denial.code)),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                            Ok(crate::policy::PlanReservation::Allowed(hold)) => {
+                                plan_hold = hold;
+                            }
                             Err(e) => {
                                 // The tunnel is refused, and the websocket stays
                                 // up. Dropping the session here made a database
@@ -691,14 +740,6 @@ where
                                 .await?;
                                 return Ok(());
                             }
-                        };
-                        if let Some(denial) = denial {
-                            send_frame(
-                                ws,
-                                &tunnel_error(request_id, denial.message, Some(denial.code)),
-                            )
-                            .await?;
-                            return Ok(());
                         }
                     }
                 }
@@ -722,37 +763,51 @@ where
                             };
                             let public_url = format!("{scheme}://{}.{}", sub, config.server.domain);
                             let proto_str = format!("{protocol:?}").to_lowercase();
-                            let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
-                                session_id: session_id.to_string(),
-                                tunnel_id: tunnel_id.to_string(),
-                                protocol: proto_str.clone(),
-                                label: sub.clone(),
-                            });
-                            let _ = db::log_tunnel_registered(
-                                &db.pg,
-                                db::TunnelRegistration {
-                                    tunnel_id: &tunnel_id.to_string(),
-                                    protocol: &proto_str,
-                                    label: &sub,
-                                    session_id: &session_id.to_string(),
-                                    token_id: db_token_id.as_deref(),
-                                    region_id: &config.region.id,
-                                    user_id: token_user_id,
-                                },
-                            )
-                            .await;
-                            send_frame(
-                                ws,
-                                &ControlFrame::TunnelRegistered {
-                                    request_id,
-                                    tunnel_id,
-                                    public_url,
-                                    assigned_port: None,
-                                    p2p_tunnel_name: None,
-                                    notice: registration_notice.clone(),
-                                },
-                            )
-                            .await?;
+                            if let Err(e) = write_tunnel_log(TunnelLogWrite {
+                                pool: &db.pg,
+                                hold: plan_hold,
+                                tunnel_id,
+                                protocol: &proto_str,
+                                label: &sub,
+                                session_id,
+                                token_id: db_token_id.as_deref(),
+                                region_id: &config.region.id,
+                                user_id: token_user_id,
+                            })
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    %session_id,
+                                    %tunnel_id,
+                                    "tunnel log insert failed"
+                                );
+                                core.remove_tunnel(&tunnel_id);
+                                send_frame(
+                                    ws,
+                                    &tunnel_error(request_id, "tunnel registration failed", None),
+                                )
+                                .await?;
+                            } else {
+                                let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
+                                    session_id: session_id.to_string(),
+                                    tunnel_id: tunnel_id.to_string(),
+                                    protocol: proto_str,
+                                    label: sub.clone(),
+                                });
+                                send_frame(
+                                    ws,
+                                    &ControlFrame::TunnelRegistered {
+                                        request_id,
+                                        tunnel_id,
+                                        public_url,
+                                        assigned_port: None,
+                                        p2p_tunnel_name: None,
+                                        notice: registration_notice.clone(),
+                                    },
+                                )
+                                .await?;
+                            }
                         }
                         Err(e) => {
                             send_frame(ws, &tunnel_error(request_id, e.to_string(), None)).await?;
@@ -763,37 +818,51 @@ where
                     Ok((tunnel_id, port)) => {
                         let public_url = format!("udp://{}:{port}", config.server.domain);
                         let port_str = port.to_string();
-                        let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
-                            session_id: session_id.to_string(),
-                            tunnel_id: tunnel_id.to_string(),
-                            protocol: "udp".into(),
-                            label: port_str.clone(),
-                        });
-                        let _ = db::log_tunnel_registered(
-                            &db.pg,
-                            db::TunnelRegistration {
-                                tunnel_id: &tunnel_id.to_string(),
-                                protocol: "udp",
-                                label: &port_str,
-                                session_id: &session_id.to_string(),
-                                token_id: db_token_id.as_deref(),
-                                region_id: &config.region.id,
-                                user_id: token_user_id,
-                            },
-                        )
-                        .await;
-                        send_frame(
-                            ws,
-                            &ControlFrame::TunnelRegistered {
-                                request_id,
-                                tunnel_id,
-                                public_url,
-                                assigned_port: Some(port),
-                                p2p_tunnel_name: None,
-                                notice: registration_notice.clone(),
-                            },
-                        )
-                        .await?;
+                        if let Err(e) = write_tunnel_log(TunnelLogWrite {
+                            pool: &db.pg,
+                            hold: plan_hold,
+                            tunnel_id,
+                            protocol: "udp",
+                            label: &port_str,
+                            session_id,
+                            token_id: db_token_id.as_deref(),
+                            region_id: &config.region.id,
+                            user_id: token_user_id,
+                        })
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                %session_id,
+                                %tunnel_id,
+                                "tunnel log insert failed"
+                            );
+                            core.remove_tunnel(&tunnel_id);
+                            send_frame(
+                                ws,
+                                &tunnel_error(request_id, "tunnel registration failed", None),
+                            )
+                            .await?;
+                        } else {
+                            let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
+                                session_id: session_id.to_string(),
+                                tunnel_id: tunnel_id.to_string(),
+                                protocol: "udp".into(),
+                                label: port_str,
+                            });
+                            send_frame(
+                                ws,
+                                &ControlFrame::TunnelRegistered {
+                                    request_id,
+                                    tunnel_id,
+                                    public_url,
+                                    assigned_port: Some(port),
+                                    p2p_tunnel_name: None,
+                                    notice: registration_notice.clone(),
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Err(e) => {
                         send_frame(ws, &tunnel_error(request_id, e.to_string(), None)).await?;
@@ -803,37 +872,51 @@ where
                     Ok((tunnel_id, port)) => {
                         let public_url = format!("tcp://{}:{port}", config.server.domain);
                         let port_str = port.to_string();
-                        let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
-                            session_id: session_id.to_string(),
-                            tunnel_id: tunnel_id.to_string(),
-                            protocol: "tcp".into(),
-                            label: port_str.clone(),
-                        });
-                        let _ = db::log_tunnel_registered(
-                            &db.pg,
-                            db::TunnelRegistration {
-                                tunnel_id: &tunnel_id.to_string(),
-                                protocol: "tcp",
-                                label: &port_str,
-                                session_id: &session_id.to_string(),
-                                token_id: db_token_id.as_deref(),
-                                region_id: &config.region.id,
-                                user_id: token_user_id,
-                            },
-                        )
-                        .await;
-                        send_frame(
-                            ws,
-                            &ControlFrame::TunnelRegistered {
-                                request_id,
-                                tunnel_id,
-                                public_url,
-                                assigned_port: Some(port),
-                                p2p_tunnel_name: None,
-                                notice: registration_notice.clone(),
-                            },
-                        )
-                        .await?;
+                        if let Err(e) = write_tunnel_log(TunnelLogWrite {
+                            pool: &db.pg,
+                            hold: plan_hold,
+                            tunnel_id,
+                            protocol: "tcp",
+                            label: &port_str,
+                            session_id,
+                            token_id: db_token_id.as_deref(),
+                            region_id: &config.region.id,
+                            user_id: token_user_id,
+                        })
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                %session_id,
+                                %tunnel_id,
+                                "tunnel log insert failed"
+                            );
+                            core.remove_tunnel(&tunnel_id);
+                            send_frame(
+                                ws,
+                                &tunnel_error(request_id, "tunnel registration failed", None),
+                            )
+                            .await?;
+                        } else {
+                            let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
+                                session_id: session_id.to_string(),
+                                tunnel_id: tunnel_id.to_string(),
+                                protocol: "tcp".into(),
+                                label: port_str,
+                            });
+                            send_frame(
+                                ws,
+                                &ControlFrame::TunnelRegistered {
+                                    request_id,
+                                    tunnel_id,
+                                    public_url,
+                                    assigned_port: Some(port),
+                                    p2p_tunnel_name: None,
+                                    notice: registration_notice.clone(),
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Err(e) => {
                         send_frame(ws, &tunnel_error(request_id, e.to_string(), None)).await?;
@@ -885,37 +968,51 @@ where
                     match core.register_p2p_tunnel(&session_id, p2p_name.clone(), secret_hash) {
                         Ok((tunnel_id, name)) => {
                             let public_url = format!("p2p://{name}");
-                            let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
-                                session_id: session_id.to_string(),
-                                tunnel_id: tunnel_id.to_string(),
-                                protocol: "p2p".into(),
-                                label: name.clone(),
-                            });
-                            let _ = db::log_tunnel_registered(
-                                &db.pg,
-                                db::TunnelRegistration {
-                                    tunnel_id: &tunnel_id.to_string(),
-                                    protocol: "p2p",
-                                    label: &name,
-                                    session_id: &session_id.to_string(),
-                                    token_id: db_token_id.as_deref(),
-                                    region_id: &config.region.id,
-                                    user_id: token_user_id,
-                                },
-                            )
-                            .await;
-                            send_frame(
-                                ws,
-                                &ControlFrame::TunnelRegistered {
-                                    request_id,
-                                    tunnel_id,
-                                    public_url,
-                                    assigned_port: None,
-                                    p2p_tunnel_name: Some(name),
-                                    notice: registration_notice.clone(),
-                                },
-                            )
-                            .await?;
+                            if let Err(e) = write_tunnel_log(TunnelLogWrite {
+                                pool: &db.pg,
+                                hold: plan_hold,
+                                tunnel_id,
+                                protocol: "p2p",
+                                label: &name,
+                                session_id,
+                                token_id: db_token_id.as_deref(),
+                                region_id: &config.region.id,
+                                user_id: token_user_id,
+                            })
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    %session_id,
+                                    %tunnel_id,
+                                    "tunnel log insert failed"
+                                );
+                                core.remove_tunnel(&tunnel_id);
+                                send_frame(
+                                    ws,
+                                    &tunnel_error(request_id, "tunnel registration failed", None),
+                                )
+                                .await?;
+                            } else {
+                                let _ = audit_tx.try_send(AuditEvent::TunnelRegistered {
+                                    session_id: session_id.to_string(),
+                                    tunnel_id: tunnel_id.to_string(),
+                                    protocol: "p2p".into(),
+                                    label: name.clone(),
+                                });
+                                send_frame(
+                                    ws,
+                                    &ControlFrame::TunnelRegistered {
+                                        request_id,
+                                        tunnel_id,
+                                        public_url,
+                                        assigned_port: None,
+                                        p2p_tunnel_name: Some(name),
+                                        notice: registration_notice.clone(),
+                                    },
+                                )
+                                .await?;
+                            }
                         }
                         Err(e) => {
                             send_frame(ws, &tunnel_error(request_id, e.to_string(), None)).await?;

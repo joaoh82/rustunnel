@@ -81,6 +81,9 @@ pub const WARNING_NONCE_COOKIE: &str = "__Host-rustunnel_warn_nonce";
 /// `__Host-` cookie set once the nonce matches. The browser stores it for
 /// the tunnel host, so a visitor is not warned again on that host for this long.
 pub const WARNING_COOKIE_NAME: &str = "__Host-rustunnel_warn_ok";
+/// Prefix of every warning cookie. Proxied agent tunnels cannot set or
+/// observe these; the edge strips them in both directions.
+pub const WARNING_COOKIE_PREFIX: &str = "__Host-rustunnel_warn_";
 pub const WARNING_COOKIE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// Query flag the Continue link uses. Its value is the nonce from
 /// [`WARNING_NONCE_COOKIE`]. The edge answers it itself and does not
@@ -182,6 +185,8 @@ pub struct EdgeResponse {
     pub content_type: &'static str,
     pub body: String,
     pub set_cookie: Option<String>,
+    /// Second `Set-Cookie`, used to expire the warning nonce after Continue.
+    pub clear_cookie: Option<String>,
     pub location: Option<String>,
     /// `DENY` on HTML pages so the warning cannot be framed.
     pub frame_options: Option<&'static str>,
@@ -199,6 +204,9 @@ pub struct IncomingRequest<'a> {
     pub method: &'a str,
     pub accept: Option<&'a str>,
     pub sec_fetch_mode: Option<&'a str>,
+    /// `Sec-Fetch-Dest` when the browser sent it. `document` and `iframe`
+    /// are navigations even when the method is not GET.
+    pub sec_fetch_dest: Option<&'a str>,
     /// `Sec-Fetch-Site` when the browser sent it. The acknowledgement
     /// accepts `same-origin` and also a request that omits the header.
     pub sec_fetch_site: Option<&'a str>,
@@ -227,8 +235,46 @@ struct CachedBytes {
 struct AccountFlight {
     notify: tokio::sync::Notify,
     /// `Ok` is the loaded row (`None` means the user does not exist).
-    /// `Err` means the lookup failed or timed out.
+    /// `Err` means the lookup failed, timed out, or the leader was dropped.
     outcome: std::sync::Mutex<Option<std::result::Result<Option<AccountView>, ()>>>,
+}
+
+/// Releases the in-flight slot when the leader is cancelled mid-lookup.
+///
+/// Without this, dropping the leader leaves the slot occupied and every
+/// later request for that user waits out [`ACCOUNT_LOOKUP_TIMEOUT`] forever.
+struct InflightGuard<'a> {
+    user_id: Uuid,
+    flight: Arc<AccountFlight>,
+    inflight: &'a DashMap<Uuid, Arc<AccountFlight>>,
+    finished: bool,
+}
+
+impl InflightGuard<'_> {
+    fn finish(&mut self, stored: std::result::Result<Option<AccountView>, ()>) {
+        self.publish(stored);
+        self.finished = true;
+    }
+
+    fn publish(&self, stored: std::result::Result<Option<AccountView>, ()>) {
+        *self
+            .flight
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
+        self.flight.notify.notify_waiters();
+        self.inflight.remove(&self.user_id);
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // No backoff. The next request should become a new leader.
+        self.publish(Err(()));
+    }
 }
 
 /// Short-lived cache in front of account and bandwidth reads.
@@ -286,17 +332,17 @@ impl AccountGate {
             }
         };
         let flight = role.expect("vacant entry inserts a flight");
+        let mut guard = InflightGuard {
+            user_id,
+            flight,
+            inflight: &self.inflight,
+            finished: false,
+        };
         let result = self.load_view(user_id).await;
-        let stored = match &result {
+        guard.finish(match &result {
             Ok(view) => Ok(view.clone()),
             Err(_) => Err(()),
-        };
-        *flight
-            .outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
-        flight.notify.notify_waiters();
-        self.inflight.remove(&user_id);
+        });
         result
     }
 
@@ -305,15 +351,30 @@ impl AccountGate {
         user_id: Uuid,
         flight: Arc<AccountFlight>,
     ) -> Result<Option<AccountView>> {
-        let _ = tokio::time::timeout(ACCOUNT_LOOKUP_TIMEOUT, flight.notify.notified()).await;
-        let outcome = flight
-            .outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        // Subscribe before reading the outcome. A leader that finished
+        // between the occupied-entry check and this wait would otherwise
+        // leave the waiter asleep for the whole timeout.
+        let notified = flight.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(outcome) = flight_outcome(&flight) {
+            return self.lookup_outcome(user_id, outcome);
+        }
+        let _ = tokio::time::timeout(ACCOUNT_LOOKUP_TIMEOUT, notified).await;
+        match flight_outcome(&flight) {
+            Some(outcome) => self.lookup_outcome(user_id, outcome),
+            None => self.cached_or_err(user_id),
+        }
+    }
+
+    fn lookup_outcome(
+        &self,
+        user_id: Uuid,
+        outcome: std::result::Result<Option<AccountView>, ()>,
+    ) -> Result<Option<AccountView>> {
         match outcome {
-            Some(Ok(view)) => Ok(view),
-            Some(Err(())) | None => self.cached_or_err(user_id),
+            Ok(view) => Ok(view),
+            Err(()) => self.cached_or_err(user_id),
         }
     }
 
@@ -673,18 +734,107 @@ struct OpenTunnelRow {
     region_id: Option<String>,
 }
 
-async fn count_open_tunnels(
-    pool: &PgPool,
+/// Outcome of [`reserve_plan_registration`].
+///
+/// `Allowed(Some(tx))` still holds `pg_advisory_xact_lock` for this user.
+/// The caller registers the route, inserts `tunnel_log` on `tx`, and
+/// commits. Dropping `tx` rolls the lock back and the insert never lands.
+/// Two edges that share Postgres serialize on the lock. An in-process mutex
+/// would not: the other region could count, register, and insert in between.
+pub enum PlanReservation<'a> {
+    Allowed(Option<sqlx::Transaction<'a, sqlx::Postgres>>),
+    Denied(RegistrationDenial),
+}
+
+/// Same checks as [`evaluate_plan_registration`], but the open-tunnel count
+/// and the caller's `tunnel_log` insert share one transaction.
+///
+/// Protocol and custom-subdomain denials return before the lock. The byte
+/// total is read first, on its own transaction, so the lock is only the
+/// count plus the insert. Bandwidth is still applied after the tunnel limit.
+pub async fn reserve_plan_registration<'a>(
+    pool: &'a PgPool,
+    user_id: Uuid,
+    protocol: &str,
+    requested_subdomain: Option<&str>,
+    core: &TunnelCore,
+    scope: TunnelCountScope<'_>,
+) -> Result<PlanReservation<'a>> {
+    let Some(view) = load_account(pool, user_id).await? else {
+        return Ok(PlanReservation::Allowed(None));
+    };
+    let Some(plan) = view.plan else {
+        return Ok(PlanReservation::Allowed(None));
+    };
+    if let Some(denial) = plan_registration_denial(&plan, protocol, requested_subdomain, 0, 0) {
+        if denial.code == code::PROTOCOL_NOT_ALLOWED
+            || denial.code == code::CUSTOM_SUBDOMAIN_NOT_ALLOWED
+        {
+            return Ok(PlanReservation::Denied(denial));
+        }
+    }
+    let month_bytes = if hard_cap_limit(&plan).is_some() {
+        month_bytes_including_live(pool, user_id, &core.live_bytes_proxied_for_user(user_id))
+            .await?
+    } else {
+        0
+    };
+    let needs_count = plan.billing_model != "free" && plan.max_tunnels.is_some();
+    if !needs_count {
+        return Ok(
+            match plan_registration_denial(&plan, protocol, requested_subdomain, 0, month_bytes) {
+                Some(denial) => PlanReservation::Denied(denial),
+                None => PlanReservation::Allowed(None),
+            },
+        );
+    }
+    let mut tx = pool.begin().await?;
+    let (key1, key2) = advisory_lock_keys(user_id);
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(key1)
+        .bind(key2)
+        .execute(&mut *tx)
+        .await?;
+    let open_tunnels = count_open_tunnels(&mut *tx, user_id, core, scope).await?;
+    Ok(
+        match plan_registration_denial(
+            &plan,
+            protocol,
+            requested_subdomain,
+            open_tunnels,
+            month_bytes,
+        ) {
+            Some(denial) => PlanReservation::Denied(denial),
+            None => PlanReservation::Allowed(Some(tx)),
+        },
+    )
+}
+
+/// Two `int4` keys for `pg_advisory_xact_lock`. The first eight bytes of the
+/// user id are enough: a collision only makes unrelated users queue, and the
+/// count underneath the lock is still per user.
+fn advisory_lock_keys(user_id: Uuid) -> (i32, i32) {
+    let bytes = user_id.as_bytes();
+    let key1 = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let key2 = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    (key1, key2)
+}
+
+async fn count_open_tunnels<'e, E>(
+    executor: E,
     user_id: Uuid,
     core: &TunnelCore,
     scope: TunnelCountScope<'_>,
-) -> Result<i64> {
+) -> Result<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let rows: Vec<OpenTunnelRow> = sqlx::query_as(
         "SELECT session_id, token_id, region_id FROM tunnel_log \
          WHERE user_id = $1 AND unregistered_at IS NULL",
     )
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     let Some(token_id) = scope.token_id else {
         return Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX));
@@ -755,6 +905,14 @@ const ACCOUNT_SELECT: &str = "SELECT u.id, u.status, u.kind, u.claimed_at, u.dea
          LIMIT 1 \
      ) p ON TRUE";
 
+fn flight_outcome(flight: &AccountFlight) -> Option<std::result::Result<Option<AccountView>, ()>> {
+    flight
+        .outcome
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 fn view_from_row(row: AccountRow) -> AccountView {
     let plan = row.plan_name.map(|name| PlanLimits {
         name,
@@ -786,26 +944,36 @@ async fn load_account(pool: &PgPool, user_id: Uuid) -> Result<Option<AccountView
     Ok(row.map(view_from_row))
 }
 
-/// GET navigations that ask for HTML. `Sec-Fetch-Mode` must be `navigate`
-/// when the browser sent it. `*/*` (curl) is not HTML.
+/// A top-level or framed document navigation.
+///
+/// `Sec-Fetch-Mode: navigate` or `Sec-Fetch-Dest: document|iframe` counts
+/// for any method, so a cross-site form POST cannot skip the warning.
+/// When the browser sent neither header, a GET whose `Accept` contains
+/// `text/html` is the fallback. `*/*` (curl) is not HTML.
 pub fn is_browser_navigation(
     method: &str,
     accept: Option<&str>,
     sec_fetch_mode: Option<&str>,
+    sec_fetch_dest: Option<&str>,
 ) -> bool {
-    if !method.eq_ignore_ascii_case("GET") {
+    if sec_fetch_mode
+        .map(str::trim)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("navigate"))
+    {
+        return true;
+    }
+    if sec_fetch_dest.map(str::trim).is_some_and(|dest| {
+        dest.eq_ignore_ascii_case("document") || dest.eq_ignore_ascii_case("iframe")
+    }) {
+        return true;
+    }
+    // A fetch header that is present and is not a navigation wins over
+    // Accept, so a CORS GET is proxied.
+    if sec_fetch_mode.is_some() || sec_fetch_dest.is_some() {
         return false;
     }
-    let Some(accept) = accept else {
-        return false;
-    };
-    if !accept.to_ascii_lowercase().contains("text/html") {
-        return false;
-    }
-    !matches!(
-        sec_fetch_mode.map(str::trim),
-        Some(mode) if !mode.eq_ignore_ascii_case("navigate")
-    )
+    method.eq_ignore_ascii_case("GET")
+        && accept.is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
 }
 
 pub fn warning_skipped(skip_header: Option<&str>, cookie: Option<&str>) -> bool {
@@ -814,6 +982,44 @@ pub fn warning_skipped(skip_header: Option<&str>, cookie: Option<&str>) -> bool 
 
 pub fn cookie_has_warning_ack(cookie: Option<&str>) -> bool {
     cookie_value(cookie, WARNING_COOKIE_NAME) == Some("1")
+}
+
+pub fn is_warning_cookie_name(name: &str) -> bool {
+    name.trim().starts_with(WARNING_COOKIE_PREFIX)
+}
+
+/// `Cookie` header with every warning cookie removed. `None` when the
+/// header would be empty.
+pub fn without_warning_cookies(cookie: &str) -> Option<String> {
+    let kept: Vec<&str> = cookie
+        .split(';')
+        .map(str::trim)
+        .filter(|part| {
+            if part.is_empty() {
+                return false;
+            }
+            let name = part
+                .split_once('=')
+                .map(|(name, _)| name.trim())
+                .unwrap_or(part);
+            !is_warning_cookie_name(name)
+        })
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join("; "))
+    }
+}
+
+/// `true` when a `Set-Cookie` value mints a warning cookie.
+pub fn is_warning_set_cookie(value: &str) -> bool {
+    let pair = value.split(';').next().unwrap_or(value).trim();
+    let name = pair
+        .split_once('=')
+        .map(|(name, _)| name.trim())
+        .unwrap_or(pair);
+    is_warning_cookie_name(name)
 }
 
 fn cookie_value<'a>(cookie: Option<&'a str>, name: &str) -> Option<&'a str> {
@@ -854,6 +1060,7 @@ pub fn warning_acknowledgement(
         content_type: "text/plain; charset=utf-8",
         body: String::new(),
         set_cookie: Some(warning_cookie()),
+        clear_cookie: Some(clear_nonce_cookie()),
         location: Some(location),
         frame_options: None,
         content_security_policy: None,
@@ -866,6 +1073,10 @@ pub fn warning_cookie() -> String {
     format!(
         "{WARNING_COOKIE_NAME}=1; Path=/; Max-Age={WARNING_COOKIE_MAX_AGE_SECS}; SameSite=Lax; HttpOnly; Secure"
     )
+}
+
+fn clear_nonce_cookie() -> String {
+    format!("{WARNING_NONCE_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure")
 }
 
 fn nonce_cookie(nonce: &str) -> String {
@@ -920,6 +1131,45 @@ fn safe_path(path: &str) -> &str {
     }
 }
 
+/// `https://<host><path>?<query>` for a plain-HTTP browser navigation.
+///
+/// The port is dropped: production HTTPS is 443, and a `:80` left on the
+/// host would send the browser back to plain HTTP. A host that is not a
+/// hostname, or a path that could leave this host, does not become a
+/// redirect.
+fn https_navigation(req: &IncomingRequest<'_>) -> Option<EdgeResponse> {
+    let host = req.host.split(':').next().unwrap_or(req.host);
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return None;
+    }
+    let (path, query) = req
+        .path_and_query
+        .split_once('?')
+        .unwrap_or((req.path_and_query, ""));
+    let path = safe_path(path);
+    let location = if query.is_empty() || query.chars().any(|c| c == '\r' || c == '\n') {
+        format!("https://{host}{path}")
+    } else {
+        format!("https://{host}{path}?{query}")
+    };
+    Some(EdgeResponse {
+        status: 307,
+        content_type: "text/plain; charset=utf-8",
+        body: String::new(),
+        set_cookie: None,
+        clear_cookie: None,
+        location: Some(location),
+        frame_options: None,
+        content_security_policy: None,
+        robots: Some("noindex"),
+        referrer_policy: Some("no-referrer"),
+    })
+}
+
 fn is_same_origin_path(path: &str) -> bool {
     let mut chars = path.chars();
     if chars.next() != Some('/') {
@@ -948,6 +1198,22 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
             }
         }
     }
+    // `__Host-` cookies are dropped on plain HTTP, so a browser navigation
+    // of an unclaimed agent tunnel is sent to HTTPS before the warning.
+    // Webhooks and other non-navigations stay on HTTP and are proxied.
+    if unclaimed_agent_tunnel(view)
+        && !req.https
+        && is_browser_navigation(
+            req.method,
+            req.accept,
+            req.sec_fetch_mode,
+            req.sec_fetch_dest,
+        )
+    {
+        if let Some(redirect) = https_navigation(req) {
+            return EdgeAction::Respond(redirect);
+        }
+    }
     // The continue flag is handled only for GET on an unclaimed agent
     // tunnel. A human tunnel, a POST, or any other request keeps the query
     // string and is proxied.
@@ -960,7 +1226,12 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
     }
     if unclaimed_agent_tunnel(view)
         && !warning_skipped(req.skip_warning, req.cookie)
-        && is_browser_navigation(req.method, req.accept, req.sec_fetch_mode)
+        && is_browser_navigation(
+            req.method,
+            req.accept,
+            req.sec_fetch_mode,
+            req.sec_fetch_dest,
+        )
     {
         return EdgeAction::Respond(warning_page(req.host, req.path_and_query));
     }
@@ -969,7 +1240,12 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
 
 fn account_page(block: AuthBlock, req: &IncomingRequest<'_>) -> EdgeResponse {
     let message = block.message();
-    if is_browser_navigation(req.method, req.accept, req.sec_fetch_mode) {
+    if is_browser_navigation(
+        req.method,
+        req.accept,
+        req.sec_fetch_mode,
+        req.sec_fetch_dest,
+    ) {
         let body = html_doc(
             "Tunnel unavailable",
             &format!(
@@ -989,7 +1265,12 @@ fn bandwidth_page(plan: &PlanLimits, limit: i64, req: &IncomingRequest<'_>) -> E
         "{} plan monthly bandwidth cap reached ({limit} bytes)",
         plan.name
     );
-    if is_browser_navigation(req.method, req.accept, req.sec_fetch_mode) {
+    if is_browser_navigation(
+        req.method,
+        req.accept,
+        req.sec_fetch_mode,
+        req.sec_fetch_dest,
+    ) {
         let body = html_doc(
             "Bandwidth cap reached",
             &format!(
@@ -1057,6 +1338,7 @@ fn html_response(status: u16, body: String) -> EdgeResponse {
         content_type: "text/html; charset=utf-8",
         body,
         set_cookie: None,
+        clear_cookie: None,
         location: None,
         frame_options: Some("DENY"),
         content_security_policy: Some(content_security_policy()),
@@ -1071,6 +1353,7 @@ fn json_response(status: u16, error_code: &str, message: &str) -> EdgeResponse {
         content_type: "application/json",
         body: json!({ "code": error_code, "error": message }).to_string(),
         set_cookie: None,
+        clear_cookie: None,
         location: None,
         frame_options: None,
         content_security_policy: None,
@@ -1353,6 +1636,12 @@ pub async fn disconnect_blocked_sessions(
     let token_ids: Vec<String> = snapshot.iter().map(|(_, id)| id.clone()).collect();
     match load_recheck_rows(pool, &token_ids).await {
         Ok((tokens, accounts)) => {
+            // A user this batch no longer returns (no live session, or the
+            // row is gone) must not keep a stale snapshot.
+            if !gate.account_ttl.is_zero() {
+                gate.accounts
+                    .retain(|user_id, _| accounts.contains_key(user_id));
+            }
             remember_accounts(gate, &accounts);
             let mut closed = 0usize;
             let mut over_cap: std::collections::HashMap<Uuid, bool> =
@@ -1611,6 +1900,7 @@ mod tests {
             method: "GET",
             accept: Some("text/html,application/xhtml+xml"),
             sec_fetch_mode: Some("navigate"),
+            sec_fetch_dest: None,
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
@@ -1660,11 +1950,17 @@ mod tests {
 
         let mut json = browser("h.example", "/");
         json.accept = Some("application/json");
+        json.sec_fetch_mode = None;
         assert!(matches!(edge_action(&agent, 0, &json), EdgeAction::Proxy));
 
         let mut post = browser("h.example", "/");
         post.method = "POST";
-        assert!(matches!(edge_action(&agent, 0, &post), EdgeAction::Proxy));
+        post.sec_fetch_mode = None;
+        post.accept = Some("text/html");
+        assert!(
+            matches!(edge_action(&agent, 0, &post), EdgeAction::Proxy),
+            "a POST without fetch metadata is not a navigation"
+        );
 
         let mut cors = browser("h.example", "/");
         cors.sec_fetch_mode = Some("cors");
@@ -1677,6 +1973,71 @@ mod tests {
         let mut acked = browser("h.example", "/");
         acked.cookie = Some("other=1; __Host-rustunnel_warn_ok=1");
         assert!(matches!(edge_action(&agent, 0, &acked), EdgeAction::Proxy));
+    }
+
+    #[test]
+    fn warning_cookies_are_stripped_in_both_directions() {
+        assert_eq!(
+            without_warning_cookies(
+                "__Host-rustunnel_warn_ok=1; visitor=1; __Host-rustunnel_warn_nonce=abc"
+            )
+            .as_deref(),
+            Some("visitor=1")
+        );
+        assert!(without_warning_cookies("__Host-rustunnel_warn_ok=1").is_none());
+        assert!(without_warning_cookies("").is_none());
+        assert!(is_warning_set_cookie(
+            "__Host-rustunnel_warn_ok=1; Path=/; Secure"
+        ));
+        assert!(is_warning_set_cookie(
+            "__Host-rustunnel_warn_nonce=minted; Path=/"
+        ));
+        assert!(!is_warning_set_cookie("app_session=keep; Path=/"));
+    }
+
+    #[test]
+    fn a_post_navigation_without_an_ack_gets_the_warning_or_a_block() {
+        let agent = view("agent", false, "agent");
+        let mut posted = browser("h.example", "/");
+        posted.method = "POST";
+        posted.accept = Some("*/*");
+        posted.sec_fetch_mode = Some("navigate");
+        match edge_action(&agent, 0, &posted) {
+            EdgeAction::Respond(page) => assert_eq!(page.status, 200),
+            EdgeAction::Proxy => panic!("Sec-Fetch-Mode: navigate must not be proxied"),
+        }
+
+        let mut framed = browser("h.example", "/");
+        framed.method = "POST";
+        framed.sec_fetch_mode = None;
+        framed.sec_fetch_dest = Some("iframe");
+        match edge_action(&agent, 0, &framed) {
+            EdgeAction::Respond(page) => assert_eq!(page.status, 200),
+            EdgeAction::Proxy => panic!("an iframe destination must not be proxied"),
+        }
+
+        let mut document = browser("h.example", "/pay");
+        document.method = "POST";
+        document.sec_fetch_mode = None;
+        document.sec_fetch_dest = Some("document");
+        document.path_and_query = "/pay?rustunnel_warn_continue=1";
+        match edge_action(&agent, 0, &document) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 200);
+                assert!(page.location.is_none());
+            }
+            EdgeAction::Proxy => panic!("a document POST must not acknowledge itself"),
+        }
+
+        let mut banned = agent.clone();
+        banned.status = "banned".into();
+        match edge_action(&banned, 0, &posted) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 403);
+                assert!(page.body.contains("account banned"));
+            }
+            EdgeAction::Proxy => panic!("a banned navigation must be a 403"),
+        }
     }
 
     #[test]
@@ -1757,6 +2118,12 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(!cookie.to_ascii_lowercase().contains("domain="));
+        let cleared = ack.clear_cookie.unwrap();
+        assert!(cleared.starts_with("__Host-rustunnel_warn_nonce=;"));
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.contains("Path=/"));
+        assert!(cleared.contains("Secure"));
+        assert!(!cleared.to_ascii_lowercase().contains("domain="));
         assert!(acknowledged("/docs?x=1", nonce, Some("same-origin")).is_none());
         assert_eq!(
             acknowledged(
@@ -1839,6 +2206,9 @@ mod tests {
                 assert!(set.starts_with("__Host-rustunnel_warn_ok=1; Path=/;"));
                 assert!(set.contains("Secure"));
                 assert!(!set.to_ascii_lowercase().contains("domain="));
+                let cleared = ack.clear_cookie.unwrap();
+                assert!(cleared.contains("Max-Age=0"));
+                assert!(cleared.starts_with("__Host-rustunnel_warn_nonce=;"));
             }
             EdgeAction::Proxy => panic!("a matching same-origin nonce should acknowledge"),
         }
@@ -1875,6 +2245,42 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_navigation_is_sent_to_https_before_the_warning() {
+        let agent = view("agent", false, "agent");
+        let mut nav = browser("demo.example:80", "/docs?x=1");
+        nav.https = false;
+        match edge_action(&agent, 0, &nav) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 307);
+                assert_eq!(
+                    page.location.as_deref(),
+                    Some("https://demo.example/docs?x=1")
+                );
+                assert!(page.set_cookie.is_none());
+                assert_eq!(page.robots, Some("noindex"));
+            }
+            EdgeAction::Proxy => panic!("expected the https redirect"),
+        }
+
+        let mut api = browser("demo.example", "/hook");
+        api.https = false;
+        api.method = "POST";
+        api.accept = Some("*/*");
+        api.sec_fetch_mode = None;
+        assert!(
+            matches!(edge_action(&agent, 0, &api), EdgeAction::Proxy),
+            "a webhook stays on plain HTTP"
+        );
+
+        let mut human = browser("demo.example", "/");
+        human.https = false;
+        assert!(matches!(
+            edge_action(&view("human", false, "free"), 0, &human),
+            EdgeAction::Proxy
+        ));
+    }
+
+    #[test]
     fn continue_is_ignored_unless_this_is_an_unclaimed_agent_get() {
         let agent = view("agent", false, "agent");
         let human = view("human", false, "free");
@@ -1882,9 +2288,10 @@ mod tests {
 
         let mut post = browser("h.example", flagged);
         post.method = "POST";
+        post.sec_fetch_mode = None;
         assert!(
             matches!(edge_action(&agent, 0, &post), EdgeAction::Proxy),
-            "a POST carrying the flag is proxied"
+            "a POST without fetch metadata is proxied"
         );
 
         let human_get = browser("h.example", "/?rustunnel_warn_continue=1");
@@ -1913,6 +2320,7 @@ mod tests {
             method: "GET",
             accept: Some("*/*"),
             sec_fetch_mode: None,
+            sec_fetch_dest: None,
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
@@ -2478,6 +2886,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_account_lookup_lets_the_next_one_through() {
+        let (accepted, pool) = hung_pool().await;
+        let gate = Arc::new(AccountGate::new(pool, Duration::ZERO, Duration::ZERO));
+        let user_id = Uuid::new_v4();
+        let leader = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.view(user_id).await })
+        };
+        let started = Instant::now();
+        while gate.inflight.get(&user_id).is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "leader never started the lookup"
+            );
+            tokio::task::yield_now().await;
+        }
+        leader.abort();
+        let _ = leader.await;
+        assert!(
+            gate.inflight.get(&user_id).is_none(),
+            "a dropped leader must release the in-flight slot"
+        );
+        let before = accepted();
+        let follower = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.view(user_id).await })
+        };
+        let again = Instant::now();
+        while accepted() <= before {
+            assert!(
+                again.elapsed() < Duration::from_secs(2),
+                "the next lookup never reached the database"
+            );
+            tokio::task::yield_now().await;
+        }
+        follower.abort();
+        let _ = follower.await;
+    }
+
+    #[tokio::test]
     async fn stale_cache_keeps_limits_when_the_database_fails() {
         use std::sync::atomic::Ordering;
 
@@ -2548,6 +2996,7 @@ mod tests {
             method: "GET",
             accept: Some("application/json"),
             sec_fetch_mode: None,
+            sec_fetch_dest: None,
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
@@ -2654,6 +3103,50 @@ mod tests {
             "seeded cache still queried the database"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recheck_evicts_cached_users_the_batch_no_longer_returns() {
+        let pool = pool().await;
+        let present = Fixture::insert(&pool, "human", "free", false, "active").await;
+        let absent = Fixture::insert(&pool, "human", "free", false, "active").await;
+        let present_id = present.user_id;
+        let absent_id = absent.user_id;
+        let token_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO tokens (id, token_hash, label, created_at, user_id, status) \
+             VALUES ($1, $2, 't', NOW(), $3, 'active')",
+        )
+        .bind(&token_id)
+        .bind(format!("hash-{token_id}"))
+        .bind(present_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let core = idle_core();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        core.register_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "present".into(),
+            Some(token_id),
+            Some(present_id),
+            tx,
+        );
+        let gate = AccountGate::new(pool.clone(), ACCOUNT_CACHE_TTL, BANDWIDTH_CACHE_TTL);
+        gate.view(present_id).await.unwrap().unwrap();
+        gate.view(absent_id).await.unwrap().unwrap();
+        assert!(gate.accounts.get(&absent_id).is_some());
+        let closed = disconnect_blocked_sessions(&pool, &core, &gate)
+            .await
+            .unwrap();
+        assert_eq!(closed, 0);
+        assert!(gate.accounts.get(&present_id).is_some());
+        assert!(
+            gate.accounts.get(&absent_id).is_none(),
+            "cached user with no live session was still in the account cache"
+        );
+        present.cleanup().await;
+        absent.cleanup().await;
     }
 
     #[tokio::test]

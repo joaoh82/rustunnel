@@ -35,18 +35,17 @@
 //! WebSocket upgrade
 //! ──────────────────
 //! Detected via `Upgrade: websocket`; after the 101 response the upgraded
-//! connection is bridged to the yamux stream via copy_bidirectional. The
-//! 101 headers go through the same `Set-Cookie` domain filter as a proxied
-//! HTTP response.
+//! connection is bridged to the yamux stream via copy_bidirectional.
 //!
 //! Upstream cookies
 //! ────────────────
-//! On a tunnel whose host is `rustunnel.com` or a subdomain of it, a proxied
-//! `Set-Cookie` is dropped when its `Domain` is anything other than that
-//! exact host. That stops the tunnel's own app from planting a cookie on
-//! the dashboard, the API, or every other tunnel (`Domain=.rustunnel.com`).
-//! Host-only cookies and a `Domain` of the exact tunnel host are forwarded
-//! unchanged. A host that is not under `rustunnel.com` is left alone.
+//! On a tunnel whose host is the configured edge domain or a subdomain of
+//! it, a proxied `Set-Cookie` is dropped when its `Domain` is anything other
+//! than that exact host. That stops the tunnel's own app from planting a
+//! cookie on the dashboard, the API, or every other tunnel. Host-only
+//! cookies and a `Domain` of the exact tunnel host are forwarded unchanged.
+//! A host that is not under the configured domain is left alone. Agent
+//! tunnels also drop warning cookies in that same header walk.
 
 use std::convert::Infallible;
 use std::io;
@@ -417,9 +416,11 @@ async fn proxy_request(
     // ── 2b2. Plan cap, ban, and the unclaimed-agent warning ──────────────
     // Before a stream is opened, so a blocked request never reaches the
     // local service. The acknowledgement redirect is answered here too.
-    if let Some(response) = account_guard(&ctx, &req, &tunnel_info, scheme).await {
+    let guard = account_guard(&ctx, &req, &tunnel_info, scheme).await;
+    if let Some(response) = guard.response {
         return response;
     }
+    let strip_warning_cookies = guard.strip_warning_cookies;
 
     // ── 2c. Concurrent connection limit ──────────────────────────────────
     let _permit = match tunnel_info.conn_semaphore.clone().try_acquire_owned() {
@@ -520,6 +521,8 @@ async fn proxy_request(
                 path,
                 request_bytes,
                 start,
+                strip_warning_cookies,
+                edge_domain: ctx.domain.clone(),
             },
         ),
     )
@@ -639,6 +642,9 @@ struct HttpCaptureCtx {
     path: String,
     request_bytes: u64,
     start: Instant,
+    strip_warning_cookies: bool,
+    /// Configured public domain (`ctx.domain`), not the request host.
+    edge_domain: String,
 }
 
 /// RAII guard that emits the capture event when dropped.
@@ -712,6 +718,9 @@ where
     // Strip hop-by-hop headers before forwarding upstream.
     let (mut parts, body) = req.into_parts();
     remove_hop_by_hop(&mut parts.headers);
+    if capture.strip_warning_cookies {
+        strip_request_warning_cookies(&mut parts.headers);
+    }
     set_forwarded_headers(&mut parts.headers, peer, scheme, original_host);
     let fwd_req = Request::from_parts(parts, body);
 
@@ -720,10 +729,14 @@ where
     let (mut resp_parts, resp_body) = upstream.into_parts();
     let status = resp_parts.status.as_u16();
     remove_hop_by_hop(&mut resp_parts.headers);
-    // HTTP and HTTPS both land here. Drop a Domain that would be shared
-    // with the dashboard or another tunnel. Custom-domain hosts are skipped
-    // inside the helper.
-    scrub_upstream_set_cookies(&mut resp_parts.headers, original_host);
+    // One walk: warning cookies on agent tunnels, and a Domain that is not
+    // this tunnel host when the host is under the configured edge domain.
+    filter_proxied_set_cookies(
+        &mut resp_parts.headers,
+        original_host,
+        &capture.edge_domain,
+        capture.strip_warning_cookies,
+    );
 
     // Shared counter incremented per body frame; read by CaptureGuard on drop.
     let rsp_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -836,10 +849,10 @@ async fn handle_ws_upgrade(
         .header("Connection", "Upgrade")
         .body(empty())
         .unwrap();
-    // The 101 we synthesize has no upstream cookie today. The same filter
-    // still runs, so a Set-Cookie added to this response cannot carry a
-    // parent Domain.
-    scrub_upstream_set_cookies(response.headers_mut(), tunnel_host);
+    // Defence in depth only: handle_ws_upgrade builds its own 101 and never
+    // forwards upstream headers, so this does not see a Set-Cookie the local
+    // app sent on the handshake.
+    filter_proxied_set_cookies(response.headers_mut(), tunnel_host, &ctx.domain, false);
     response
 }
 
@@ -879,28 +892,31 @@ fn remove_hop_by_hop(headers: &mut hyper::HeaderMap) {
     }
 }
 
-/// Registrable domain of the public edge. A tunnel host under this name
-/// shares a cookie jar with the dashboard and every sibling tunnel when an
-/// upstream `Set-Cookie` sets `Domain` to the parent.
-const PLATFORM_DOMAIN: &str = "rustunnel.com";
-
 /// Upstream `Set-Cookie` headers dropped because `Domain` was not the tunnel host.
 static UPSTREAM_SET_COOKIE_DOMAINS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Cookies dropped by [`scrub_upstream_set_cookies`] since process start.
+/// Cookies dropped by [`filter_proxied_set_cookies`] because `Domain` was not
+/// the tunnel host. Warning-cookie removals are not included.
 pub fn upstream_set_cookie_domains_dropped() -> u64 {
     UPSTREAM_SET_COOKIE_DOMAINS_DROPPED.load(Ordering::Relaxed)
 }
 
-/// Drop proxied `Set-Cookie` headers whose `Domain` is not `tunnel_host`.
+/// One walk over proxied `Set-Cookie` headers.
 ///
-/// Runs for every tunnel, not only agent tunnels. Host-only cookies and a
-/// `Domain` of the exact host (case-insensitive, leading dots ignored) are
-/// left byte-for-byte. A host that is not under [`PLATFORM_DOMAIN`] is not
-/// filtered. Returns how many headers were removed.
-fn scrub_upstream_set_cookies(headers: &mut hyper::HeaderMap, tunnel_host: &str) -> u64 {
+/// When `strip_warning_cookies` is set (agent tunnels), a warning cookie is
+/// removed. When `tunnel_host` is under `edge_domain` — the configured public
+/// domain, not a hard-coded name — a `Domain` that is not that exact host is
+/// removed. Host-only cookies and a matching `Domain` stay byte-for-byte.
+/// Returns how many headers were removed for a foreign `Domain`.
+fn filter_proxied_set_cookies(
+    headers: &mut hyper::HeaderMap,
+    tunnel_host: &str,
+    edge_domain: &str,
+    strip_warning_cookies: bool,
+) -> u64 {
     let host = canonical_host(tunnel_host);
-    if !host_under_platform(host) {
+    let filter_domain = host_under_edge(host, edge_domain);
+    if !filter_domain && !strip_warning_cookies {
         return 0;
     }
     let existing: Vec<hyper::header::HeaderValue> =
@@ -909,28 +925,42 @@ fn scrub_upstream_set_cookies(headers: &mut hyper::HeaderMap, tunnel_host: &str)
         return 0;
     }
     let mut kept = Vec::with_capacity(existing.len());
-    let mut dropped = 0u64;
+    let mut dropped_domain = 0u64;
+    let mut changed = false;
     for value in existing {
-        if set_cookie_domain_is_foreign(value.as_bytes(), host) {
-            dropped += 1;
-        } else {
-            kept.push(value);
+        if strip_warning_cookies {
+            if let Ok(text) = value.to_str() {
+                if policy::is_warning_set_cookie(text) {
+                    changed = true;
+                    continue;
+                }
+            }
         }
+        if filter_domain && set_cookie_domain_is_foreign(value.as_bytes(), host) {
+            dropped_domain += 1;
+            changed = true;
+            continue;
+        }
+        kept.push(value);
     }
-    if dropped == 0 {
+    if !changed {
         return 0;
     }
     headers.remove("set-cookie");
     for value in kept {
         headers.append("set-cookie", value);
     }
-    UPSTREAM_SET_COOKIE_DOMAINS_DROPPED.fetch_add(dropped, Ordering::Relaxed);
-    // Count and host only. The cookie name and value stay out of the log.
-    info!(
-        tunnel_host = host,
-        dropped, "dropped upstream Set-Cookie headers whose Domain was not the tunnel host"
-    );
-    dropped
+    if dropped_domain > 0 {
+        UPSTREAM_SET_COOKIE_DOMAINS_DROPPED.fetch_add(dropped_domain, Ordering::Relaxed);
+        // debug, not info: a tunnel owner can send this on every response.
+        // Count and host only. The cookie name and value stay out of the log.
+        debug!(
+            tunnel_host = host,
+            dropped = dropped_domain,
+            "dropped upstream Set-Cookie headers whose Domain was not the tunnel host"
+        );
+    }
+    dropped_domain
 }
 
 fn canonical_host(host: &str) -> &str {
@@ -943,13 +973,19 @@ fn canonical_host(host: &str) -> &str {
     host.trim_end_matches('.')
 }
 
-fn host_under_platform(host: &str) -> bool {
-    const SUFFIX: &[u8] = b".rustunnel.com";
-    if host.eq_ignore_ascii_case(PLATFORM_DOMAIN) {
+fn host_under_edge(host: &str, edge_domain: &str) -> bool {
+    let edge = canonical_host(edge_domain);
+    if edge.is_empty() || host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case(edge) {
         return true;
     }
-    host.len() > SUFFIX.len()
-        && host.as_bytes()[host.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+    let host_bytes = host.as_bytes();
+    let edge_bytes = edge.as_bytes();
+    host_bytes.len() > edge_bytes.len() + 1
+        && host_bytes[host_bytes.len() - edge_bytes.len() - 1] == b'.'
+        && host_bytes[host_bytes.len() - edge_bytes.len()..].eq_ignore_ascii_case(edge_bytes)
 }
 
 /// `true` when any `Domain` attribute is present and, after trimming and
@@ -1046,12 +1082,22 @@ fn header_str<'a>(req: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
     req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
+struct AccountGuard {
+    response: Option<Response<BoxBody>>,
+    /// Agent tunnels must not see or mint the warning cookies.
+    strip_warning_cookies: bool,
+}
+
 async fn account_guard(
     ctx: &ProxyCtx,
     req: &Request<Incoming>,
     tunnel: &crate::core::TunnelInfo,
     scheme: ForwardScheme,
-) -> Option<Response<BoxBody>> {
+) -> AccountGuard {
+    let allow = |strip_warning_cookies| AccountGuard {
+        response: None,
+        strip_warning_cookies,
+    };
     let path_and_query = req
         .uri()
         .path_and_query()
@@ -1062,15 +1108,18 @@ async fn account_guard(
         .sessions
         .get(&tunnel.session_id)
         .and_then(|session| session.user_id);
-    let user_id = user_id?;
+    let Some(user_id) = user_id else {
+        return allow(false);
+    };
     let view = match ctx.account_gate.view(user_id).await {
         Ok(Some(view)) => view,
-        Ok(None) => return None,
+        Ok(None) => return allow(false),
         Err(e) => {
             warn!(error = %e, %user_id, "account lookup failed with no cache; proxying");
-            return None;
+            return allow(false);
         }
     };
+    let strip_warning_cookies = view.kind == "agent";
     let month_bytes = if view
         .plan
         .as_ref()
@@ -1098,6 +1147,7 @@ async fn account_guard(
             method: req.method().as_str(),
             accept: header_str(req, "accept"),
             sec_fetch_mode: header_str(req, "sec-fetch-mode"),
+            sec_fetch_dest: header_str(req, "sec-fetch-dest"),
             sec_fetch_site: header_str(req, "sec-fetch-site"),
             skip_warning: header_str(req, policy::WARNING_SKIP_HEADER),
             cookie: header_str(req, "cookie"),
@@ -1107,8 +1157,28 @@ async fn account_guard(
         },
     );
     match action {
-        EdgeAction::Proxy => None,
-        EdgeAction::Respond(response) => Some(edge_response(response)),
+        EdgeAction::Proxy => allow(strip_warning_cookies),
+        EdgeAction::Respond(response) => AccountGuard {
+            response: Some(edge_response(response)),
+            strip_warning_cookies,
+        },
+    }
+}
+
+fn strip_request_warning_cookies(headers: &mut hyper::HeaderMap) {
+    let Some(raw) = headers.get("cookie").and_then(|value| value.to_str().ok()) else {
+        return;
+    };
+    let raw = raw.to_string();
+    match policy::without_warning_cookies(&raw) {
+        Some(kept) => {
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&kept) {
+                headers.insert("cookie", value);
+            }
+        }
+        None => {
+            headers.remove("cookie");
+        }
     }
 }
 
@@ -1119,6 +1189,9 @@ fn edge_response(response: EdgeResponse) -> Response<BoxBody> {
         .header("content-type", response.content_type)
         .header("cache-control", "no-store");
     if let Some(cookie) = response.set_cookie {
+        builder = builder.header("set-cookie", cookie);
+    }
+    if let Some(cookie) = response.clear_cookie {
         builder = builder.header("set-cookie", cookie);
     }
     if let Some(location) = response.location {
@@ -1215,6 +1288,7 @@ mod tests {
             method: "GET",
             accept: Some("text/html,application/xhtml+xml"),
             sec_fetch_mode: Some("navigate"),
+            sec_fetch_dest: Some("document"),
             sec_fetch_site: Some("same-origin"),
             skip_warning: None,
             cookie,
@@ -1295,12 +1369,22 @@ mod tests {
     }
 
     fn apply_cookies(host: &str, cookies: &[&str]) -> (Vec<String>, u64) {
+        apply_cookies_on(host, "rustunnel.com", false, cookies)
+    }
+
+    fn apply_cookies_on(
+        host: &str,
+        edge_domain: &str,
+        strip_warning_cookies: bool,
+        cookies: &[&str],
+    ) -> (Vec<String>, u64) {
         let mut headers = hyper::HeaderMap::new();
         for cookie in cookies {
             headers.append("set-cookie", HeaderValue::from_str(cookie).unwrap());
         }
         let before = upstream_set_cookie_domains_dropped();
-        let dropped = scrub_upstream_set_cookies(&mut headers, host);
+        let dropped =
+            filter_proxied_set_cookies(&mut headers, host, edge_domain, strip_warning_cookies);
         let after = upstream_set_cookie_domains_dropped();
         assert!(
             after >= before + dropped,
@@ -1373,6 +1457,43 @@ mod tests {
         );
         assert_eq!(dropped, 0);
 
+        // Configured edge domain, not the hard-coded rustunnel.com name.
+        let staged = "foo.example.test";
+        let staged_parent = "refresh_token=secret; Domain=.example.test";
+        let staged_exact = "id=1; Domain=foo.example.test";
+        let staged_sibling = "id=2; Domain=bar.example.test";
+        let (kept, dropped) = apply_cookies_on(
+            staged,
+            "example.test",
+            false,
+            &[host_only, staged_parent, staged_exact, staged_sibling],
+        );
+        assert_eq!(kept, vec![host_only, staged_exact]);
+        assert_eq!(dropped, 2);
+        let (kept, dropped) =
+            apply_cookies_on("app.customer.com", "example.test", false, &[staged_parent]);
+        assert_eq!(kept, vec![staged_parent]);
+        assert_eq!(dropped, 0);
+
+        // Same walk drops a warning cookie and a parent Domain, and keeps
+        // the app cookie. Only the Domain drop moves the counter.
+        let warning = format!("{}=1; Path=/; Secure", policy::WARNING_COOKIE_NAME);
+        let (kept, dropped) = apply_cookies_on(
+            host,
+            "rustunnel.com",
+            true,
+            &[warning.as_str(), host_only, parent.as_str()],
+        );
+        assert_eq!(kept, vec![host_only]);
+        assert_eq!(dropped, 1);
+        let (kept, dropped) = apply_cookies_on(host, "rustunnel.com", false, &[warning.as_str()]);
+        assert_eq!(
+            kept,
+            vec![warning.as_str()],
+            "a human tunnel keeps a host-only warning cookie"
+        );
+        assert_eq!(dropped, 0);
+
         // The upgrade response uses the same filter when it carries Set-Cookie.
         let mut upgrade = Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -1382,7 +1503,8 @@ mod tests {
             .header("set-cookie", host_only)
             .body(empty())
             .unwrap();
-        let dropped = scrub_upstream_set_cookies(upgrade.headers_mut(), host);
+        let dropped =
+            filter_proxied_set_cookies(upgrade.headers_mut(), host, "rustunnel.com", false);
         assert_eq!(dropped, 1);
         let kept: Vec<_> = upgrade
             .headers()
@@ -1395,7 +1517,7 @@ mod tests {
         let recorded = Arc::new(std::sync::Mutex::new(String::new()));
         let writer = Arc::clone(&recorded);
         let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::DEBUG)
             .with_ansi(false)
             .without_time()
             .with_writer(move || LogBuf(Arc::clone(&writer)))
@@ -1429,6 +1551,7 @@ mod tests {
     async fn proxy_cookies(
         scheme: ForwardScheme,
         host: &'static str,
+        edge_domain: &'static str,
         cookies: Vec<String>,
     ) -> Vec<String> {
         use crate::core::TunnelInfo;
@@ -1488,6 +1611,8 @@ mod tests {
                             path: "/".into(),
                             request_bytes: 0,
                             start: Instant::now(),
+                            strip_warning_cookies: false,
+                            edge_domain: edge_domain.to_string(),
                         },
                     )
                     .await
@@ -1542,18 +1667,43 @@ mod tests {
             "id=1; Domain=foo.rustunnel.com".to_string(),
         ];
         for scheme in [ForwardScheme::Http, ForwardScheme::Https] {
-            let kept = proxy_cookies(scheme, "foo.rustunnel.com", cookies.clone()).await;
+            let kept = proxy_cookies(
+                scheme,
+                "foo.rustunnel.com",
+                "rustunnel.com",
+                cookies.clone(),
+            )
+            .await;
             assert_eq!(kept, expect, "{scheme:?}");
         }
         let custom = proxy_cookies(
             ForwardScheme::Https,
             "app.example.com",
+            "rustunnel.com",
             vec!["refresh_token=secret; Domain=.rustunnel.com".into()],
         )
         .await;
         assert_eq!(
             custom,
             vec!["refresh_token=secret; Domain=.rustunnel.com".to_string()]
+        );
+        let staged = proxy_cookies(
+            ForwardScheme::Https,
+            "foo.example.test",
+            "example.test",
+            vec![
+                "session=abc; Path=/".into(),
+                "refresh_token=secret; Domain=.example.test".into(),
+                "id=1; Domain=foo.example.test".into(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            staged,
+            vec![
+                "session=abc; Path=/".to_string(),
+                "id=1; Domain=foo.example.test".to_string(),
+            ]
         );
     }
 
@@ -1768,6 +1918,8 @@ mod tests {
                             path: "/hook".into(),
                             request_bytes: 0,
                             start: Instant::now(),
+                            strip_warning_cookies: false,
+                            edge_domain: "example.test".to_string(),
                         },
                     )
                     .await
@@ -1982,6 +2134,8 @@ hello\r\n\
                             path: "/hook".into(),
                             request_bytes: 0,
                             start: Instant::now(),
+                            strip_warning_cookies: false,
+                            edge_domain: "example.test".to_string(),
                         },
                     )
                     .await
