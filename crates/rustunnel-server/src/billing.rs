@@ -371,15 +371,21 @@ pub(crate) async fn month_bytes_including_live(
     user_id: Uuid,
     live: &[(Uuid, u64)],
 ) -> Result<i64> {
-    if live.is_empty() {
-        return month_bytes_proxied(pool, user_id).await;
-    }
     let ids: Vec<String> = live.iter().map(|(id, _)| id.to_string()).collect();
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
+    // Same bound as the session recheck. A stuck read fails this statement
+    // instead of holding the connection until the pool times out.
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *tx)
+        .await?;
     let committed = month_bytes_proxied_at(&mut *tx, user_id, Utc::now()).await?;
+    if live.is_empty() {
+        tx.commit().await?;
+        return Ok(committed);
+    }
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT tunnel_id, COALESCE(SUM(bytes_proxied), 0)::bigint \
          FROM tunnel_log \

@@ -18,12 +18,14 @@
 //! inside the cache window. The column itself is written on the meter flush
 //! (default 60s) and when the tunnel closes. Registration and token auth read
 //! Postgres directly and fail closed. A background pass every
-//! [`SESSION_RECHECK_INTERVAL`] re-reads tokens and users and closes sessions
-//! that are no longer allowed, so a ban or deactivation lands within about a
-//! minute even when the per-request cache is warm. A database error on that
-//! pass or on a proxied request serves the last cached account and byte
-//! total, including one past its TTL. The request is proxied, and the
-//! session stays up, only when this process has no cached entry at all.
+//! [`SESSION_RECHECK_INTERVAL`] re-reads tokens and users in one query and
+//! closes sessions that are no longer allowed, including one whose committed
+//! month bytes plus this process's unflushed counters have reached a hard
+//! cap. An open stream therefore stops on the next pass even when the meter
+//! flush is disabled. A database error on that pass or on a proxied request
+//! serves the last cached account and byte total, including one past its
+//! TTL. The request is proxied, and the session stays up, only when this
+//! process has no cached entry at all.
 //!
 //! # Deactivation sweep
 //!
@@ -52,8 +54,12 @@ pub const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30);
 /// proxies after that snapshot are still counted on the next request.
 pub const BANDWIDTH_CACHE_TTL: Duration = Duration::from_secs(15);
 /// How often live sessions are checked for a ban, suspension, deactivation,
-/// or an expired token.
+/// an expired token, or a hard bandwidth cap.
 pub const SESSION_RECHECK_INTERVAL: Duration = Duration::from_secs(20);
+/// Bound on the session recheck's token and account query, and on the
+/// month-byte read the hard cap uses. A stuck database returns in this time
+/// instead of holding the recheck loop.
+const STATEMENT_TIMEOUT: &str = "2s";
 /// How often expired unclaimed agent accounts are marked `deactivated_at`.
 pub const DEACTIVATION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -529,6 +535,7 @@ async fn count_open_tunnels(pool: &PgPool, user_id: Uuid) -> Result<i64> {
 
 #[derive(sqlx::FromRow)]
 struct AccountRow {
+    id: Uuid,
     status: String,
     kind: String,
     claimed_at: Option<DateTime<Utc>>,
@@ -542,46 +549,47 @@ struct AccountRow {
     bandwidth_limit_bytes: Option<i64>,
 }
 
+const ACCOUNT_SELECT: &str = "SELECT u.id, u.status, u.kind, u.claimed_at, u.deactivated_at, \
+     p.name AS plan_name, p.billing_model, p.max_tunnels, \
+     p.allow_custom_subdomains, p.allowed_protocols, \
+     p.bandwidth_hard_cap, p.bandwidth_limit_bytes \
+     FROM users u \
+     LEFT JOIN LATERAL ( \
+         SELECT pl.name, pl.billing_model, pl.max_tunnels, \
+                pl.allow_custom_subdomains, pl.allowed_protocols, \
+                pl.bandwidth_hard_cap, pl.bandwidth_limit_bytes \
+         FROM subscriptions s \
+         JOIN plans pl ON pl.id = s.plan_id \
+         WHERE s.user_id = u.id AND s.status = 'active' \
+         ORDER BY s.created_at DESC \
+         LIMIT 1 \
+     ) p ON TRUE";
+
+fn view_from_row(row: AccountRow) -> AccountView {
+    let plan = row.plan_name.map(|name| PlanLimits {
+        name,
+        billing_model: row.billing_model.unwrap_or_default(),
+        max_tunnels: row.max_tunnels,
+        allow_custom_subdomains: row.allow_custom_subdomains.unwrap_or(false),
+        allowed_protocols: row.allowed_protocols.unwrap_or_default(),
+        bandwidth_hard_cap: row.bandwidth_hard_cap.unwrap_or(false),
+        bandwidth_limit_bytes: row.bandwidth_limit_bytes,
+    });
+    AccountView {
+        status: row.status,
+        kind: row.kind,
+        claimed_at: row.claimed_at,
+        deactivated_at: row.deactivated_at,
+        plan,
+    }
+}
+
 async fn load_account(pool: &PgPool, user_id: Uuid) -> Result<Option<AccountView>> {
-    let row: Option<AccountRow> = sqlx::query_as(
-        "SELECT u.status, u.kind, u.claimed_at, u.deactivated_at, \
-                p.name AS plan_name, p.billing_model, p.max_tunnels, \
-                p.allow_custom_subdomains, p.allowed_protocols, \
-                p.bandwidth_hard_cap, p.bandwidth_limit_bytes \
-         FROM users u \
-         LEFT JOIN LATERAL ( \
-             SELECT pl.name, pl.billing_model, pl.max_tunnels, \
-                    pl.allow_custom_subdomains, pl.allowed_protocols, \
-                    pl.bandwidth_hard_cap, pl.bandwidth_limit_bytes \
-             FROM subscriptions s \
-             JOIN plans pl ON pl.id = s.plan_id \
-             WHERE s.user_id = u.id AND s.status = 'active' \
-             ORDER BY s.created_at DESC \
-             LIMIT 1 \
-         ) p ON TRUE \
-         WHERE u.id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|row| {
-        let plan = row.plan_name.map(|name| PlanLimits {
-            name,
-            billing_model: row.billing_model.unwrap_or_default(),
-            max_tunnels: row.max_tunnels,
-            allow_custom_subdomains: row.allow_custom_subdomains.unwrap_or(false),
-            allowed_protocols: row.allowed_protocols.unwrap_or_default(),
-            bandwidth_hard_cap: row.bandwidth_hard_cap.unwrap_or(false),
-            bandwidth_limit_bytes: row.bandwidth_limit_bytes,
-        });
-        AccountView {
-            status: row.status,
-            kind: row.kind,
-            claimed_at: row.claimed_at,
-            deactivated_at: row.deactivated_at,
-            plan,
-        }
-    }))
+    let row: Option<AccountRow> = sqlx::query_as(&format!("{ACCOUNT_SELECT} WHERE u.id = $1"))
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(view_from_row))
 }
 
 /// GET navigations that ask for HTML. `Sec-Fetch-Mode` must be `navigate`
@@ -893,17 +901,112 @@ pub async fn deactivate_expired_unclaimed_agents(pool: &PgPool) -> Result<u64> {
 
 #[derive(sqlx::FromRow)]
 struct LiveToken {
+    id: String,
     status: String,
     expires_at: Option<DateTime<Utc>>,
     unlimited: bool,
     user_id: Option<Uuid>,
 }
 
-/// Close sessions whose token or user is no longer allowed.
+fn token_blocks(token: &LiveToken) -> bool {
+    if token.status != "active" {
+        return true;
+    }
+    if !token.unlimited {
+        if let Some(exp) = token.expires_at {
+            if Utc::now() > exp {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `true` when this user's hard cap is already spent.
 ///
-/// Reads Postgres on every call. A database error uses `gate`'s last
-/// account snapshot, including one past its TTL, and closes the session
-/// when that snapshot is blocked. With no snapshot the session stays up.
+/// The total is the committed month sum plus unflushed counters
+/// ([`AccountGate::month_bytes`]). A database error with a cached total still
+/// enforces the cap. With no cached total the session stays up.
+async fn over_hard_cap(
+    gate: &AccountGate,
+    core: &TunnelCore,
+    view: &AccountView,
+    user_id: Uuid,
+) -> bool {
+    let Some(plan) = view.plan.as_ref() else {
+        return false;
+    };
+    let Some(limit) = hard_cap_limit(plan) else {
+        return false;
+    };
+    match gate.month_bytes(user_id, core).await {
+        Ok(bytes) => bytes >= limit,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                %user_id,
+                "bandwidth recheck failed with no cache; leaving session up"
+            );
+            false
+        }
+    }
+}
+
+/// Tokens and their users, one round trip, bounded by [`STATEMENT_TIMEOUT`].
+async fn load_recheck_rows(
+    pool: &PgPool,
+    token_ids: &[String],
+) -> Result<(
+    std::collections::HashMap<String, LiveToken>,
+    std::collections::HashMap<Uuid, AccountView>,
+)> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    let tokens: Vec<LiveToken> = sqlx::query_as(
+        "SELECT id, status, expires_at, unlimited, user_id \
+         FROM tokens WHERE id = ANY($1)",
+    )
+    .bind(token_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let user_ids: Vec<Uuid> = tokens.iter().filter_map(|token| token.user_id).collect();
+    let accounts = if user_ids.is_empty() {
+        Vec::new()
+    } else {
+        let sql = format!("{ACCOUNT_SELECT} WHERE u.id = ANY($1)");
+        sqlx::query_as::<_, AccountRow>(&sql)
+            .bind(&user_ids)
+            .fetch_all(&mut *tx)
+            .await?
+    };
+    tx.commit().await?;
+    let tokens = tokens
+        .into_iter()
+        .map(|token| (token.id.clone(), token))
+        .collect();
+    let accounts = accounts
+        .into_iter()
+        .map(|row| {
+            let id = row.id;
+            (id, view_from_row(row))
+        })
+        .collect();
+    Ok((tokens, accounts))
+}
+
+/// Close sessions whose token, user, or hard bandwidth cap says to stop.
+///
+/// Token and account rows are loaded with `id = ANY($1)` under
+/// [`STATEMENT_TIMEOUT`], so one stuck database cannot stall the loop for
+/// every session. The hard cap adds this process's unflushed counters
+/// ([`TunnelCore::live_bytes_proxied_for_user`], the same totals
+/// [`TunnelCore::get_tunnel_bytes_proxied`] reports) to the committed month
+/// sum. A database error uses `gate`'s last account and byte snapshot,
+/// including one past its TTL. With no snapshot the session stays up.
 /// Sends [`ControlMessage::Shutdown`]; the session task drops its tunnels.
 pub async fn disconnect_blocked_sessions(
     pool: &PgPool,
@@ -920,82 +1023,100 @@ pub async fn disconnect_blocked_sessions(
                 .map(|token_id| (*entry.key(), token_id))
         })
         .collect();
-    let mut closed = 0usize;
-    for (session_id, token_id) in snapshot {
-        let blocked = match session_blocked(pool, &token_id).await {
-            Ok(blocked) => blocked,
-            Err(e) => match cached_account_block(core, gate, session_id) {
-                Some(blocked) => {
-                    tracing::warn!(
-                        error = %e,
-                        %session_id,
-                        blocked,
-                        "session recheck failed; using cached account"
-                    );
-                    blocked
+    if snapshot.is_empty() {
+        return Ok(0);
+    }
+    let token_ids: Vec<String> = snapshot.iter().map(|(_, id)| id.clone()).collect();
+    match load_recheck_rows(pool, &token_ids).await {
+        Ok((tokens, accounts)) => {
+            let mut closed = 0usize;
+            let mut over_cap: std::collections::HashMap<Uuid, bool> =
+                std::collections::HashMap::new();
+            for (session_id, token_id) in snapshot {
+                let close = match tokens.get(&token_id) {
+                    None => true,
+                    Some(token) if token_blocks(token) => true,
+                    Some(token) => match token.user_id {
+                        None => false,
+                        Some(user_id) => match accounts.get(&user_id) {
+                            None => true,
+                            Some(view) if account_block(view).is_some() => true,
+                            Some(view) => match over_cap.get(&user_id).copied() {
+                                Some(over) => over,
+                                None => {
+                                    let over = over_hard_cap(gate, core, view, user_id).await;
+                                    over_cap.insert(user_id, over);
+                                    over
+                                }
+                            },
+                        },
+                    },
+                };
+                if close && shutdown_session(core, session_id) {
+                    closed += 1;
                 }
-                None => {
+            }
+            Ok(closed)
+        }
+        Err(e) => {
+            let mut closed = 0usize;
+            let mut over_cap: std::collections::HashMap<Uuid, bool> =
+                std::collections::HashMap::new();
+            for (session_id, _) in snapshot {
+                let user_id = core
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.user_id);
+                let Some(user_id) = user_id else {
                     tracing::warn!(
                         error = %e,
                         %session_id,
                         "session recheck failed with no cache; leaving session up"
                     );
-                    false
+                    continue;
+                };
+                let Some(view) = gate.any_view(user_id) else {
+                    tracing::warn!(
+                        error = %e,
+                        %session_id,
+                        "session recheck failed with no cache; leaving session up"
+                    );
+                    continue;
+                };
+                tracing::warn!(
+                    error = %e,
+                    %session_id,
+                    "session recheck failed; using cached account"
+                );
+                let close = account_block(&view).is_some()
+                    || match over_cap.get(&user_id).copied() {
+                        Some(over) => over,
+                        None => {
+                            let over = over_hard_cap(gate, core, &view, user_id).await;
+                            over_cap.insert(user_id, over);
+                            over
+                        }
+                    };
+                if close && shutdown_session(core, session_id) {
+                    closed += 1;
                 }
-            },
-        };
-        if !blocked {
-            continue;
-        }
-        let sent = core.sessions.get(&session_id).is_some_and(|session| {
-            session
-                .control_tx
-                .try_send(ControlMessage::Shutdown)
-                .is_ok()
-        });
-        if sent {
-            closed += 1;
-            tracing::info!(%session_id, "closing session after account recheck");
-        }
-    }
-    Ok(closed)
-}
-
-fn cached_account_block(core: &TunnelCore, gate: &AccountGate, session_id: Uuid) -> Option<bool> {
-    let user_id = core
-        .sessions
-        .get(&session_id)
-        .and_then(|session| session.user_id)?;
-    let view = gate.any_view(user_id)?;
-    Some(account_block(&view).is_some())
-}
-
-async fn session_blocked(pool: &PgPool, token_id: &str) -> Result<bool> {
-    let token: Option<LiveToken> =
-        sqlx::query_as("SELECT status, expires_at, unlimited, user_id FROM tokens WHERE id = $1")
-            .bind(token_id)
-            .fetch_optional(pool)
-            .await?;
-    let Some(token) = token else {
-        return Ok(true);
-    };
-    if token.status != "active" {
-        return Ok(true);
-    }
-    if !token.unlimited {
-        if let Some(exp) = token.expires_at {
-            if Utc::now() > exp {
-                return Ok(true);
             }
+            Ok(closed)
         }
     }
-    let Some(user_id) = token.user_id else {
-        return Ok(false);
-    };
-    match load_account(pool, user_id).await? {
-        Some(view) => Ok(account_block(&view).is_some()),
-        None => Ok(true),
+}
+
+fn shutdown_session(core: &TunnelCore, session_id: Uuid) -> bool {
+    let sent = core.sessions.get(&session_id).is_some_and(|session| {
+        session
+            .control_tx
+            .try_send(ControlMessage::Shutdown)
+            .is_ok()
+    });
+    if sent {
+        tracing::info!(%session_id, "closing session after account recheck");
     }
+    sent
 }
 
 /// Sweep plus session recheck. Runs until the task is aborted on shutdown.
@@ -1688,9 +1809,9 @@ mod tests {
         let closed = disconnect_blocked_sessions(&pool, &core, &gate)
             .await
             .unwrap();
-        assert_eq!(closed, 1);
+        assert_eq!(closed, 2, "a stale cache keeps both the ban and the cap");
         assert!(matches!(ban_rx.try_recv(), Ok(ControlMessage::Shutdown)));
-        assert!(cap_rx.try_recv().is_err());
+        assert!(matches!(cap_rx.try_recv(), Ok(ControlMessage::Shutdown)));
         assert!(open_rx.try_recv().is_err());
 
         assert!(gate.view(uncached_id).await.is_err());
@@ -1719,6 +1840,79 @@ mod tests {
             token_auth_block(&pool, &token).await.is_err(),
             "token auth stays fail-closed"
         );
+    }
+
+    #[tokio::test]
+    async fn recheck_closes_a_session_when_live_bytes_cross_the_cap() {
+        use std::sync::atomic::Ordering;
+
+        let pool = pool().await;
+        let over = Fixture::insert(&pool, "agent", "agent", false, "active").await;
+        let under = Fixture::insert(&pool, "agent", "agent", false, "active").await;
+        let over_token = Uuid::new_v4().to_string();
+        let under_token = Uuid::new_v4().to_string();
+        for (id, user_id) in [(&over_token, over.user_id), (&under_token, under.user_id)] {
+            sqlx::query(
+                "INSERT INTO tokens (id, token_hash, label, created_at, user_id, status) \
+                 VALUES ($1, $2, 't', NOW(), $3, 'active')",
+            )
+            .bind(id)
+            .bind(format!("hash-{id}"))
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let core = idle_core();
+        let (over_tx, mut over_rx) = tokio::sync::mpsc::channel(4);
+        let over_session = core.register_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "over".into(),
+            Some(over_token),
+            Some(over.user_id),
+            over_tx,
+        );
+        let (tunnel_id, subdomain) = core
+            .register_http_tunnel(&over_session, None, TunnelProtocol::Http, None)
+            .unwrap();
+        let (under_tx, mut under_rx) = tokio::sync::mpsc::channel(4);
+        core.register_session(
+            "127.0.0.1:10".parse().unwrap(),
+            "under".into(),
+            Some(under_token),
+            Some(under.user_id),
+            under_tx,
+        );
+        core.http_routes
+            .get(&subdomain)
+            .unwrap()
+            .members
+            .get(&tunnel_id)
+            .unwrap()
+            .info
+            .bytes_in
+            .store(
+                AgentPlanLimits::BANDWIDTH_LIMIT_BYTES as u64,
+                Ordering::Relaxed,
+            );
+
+        let gate = AccountGate::new(pool.clone(), Duration::ZERO, Duration::ZERO);
+        let closed = disconnect_blocked_sessions(&pool, &core, &gate)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+        assert!(matches!(over_rx.try_recv(), Ok(ControlMessage::Shutdown)));
+        assert!(under_rx.try_recv().is_err());
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(bytes_proxied), 0)::bigint FROM tunnel_log WHERE user_id = $1",
+        )
+        .bind(over.user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 0, "the recheck must not need a flushed row");
+        over.cleanup().await;
+        under.cleanup().await;
     }
 
     #[tokio::test]

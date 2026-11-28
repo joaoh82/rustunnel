@@ -466,6 +466,153 @@ async fn long_lived_tunnel_is_cut_off_when_live_bytes_cross_the_cap() {
 }
 
 #[tokio::test]
+async fn open_stream_past_the_cap_is_closed_without_a_database_write() {
+    init_tracing();
+    let server = TestServer::start().await;
+    let cap = AgentPlanLimits::BANDWIDTH_LIMIT_BYTES;
+    let (local, _hold) = hold_open_body(cap as u64).await;
+
+    let seed = Seed::create(&server.db.pg, "agent", "agent").await;
+    let mut client = TestClient::connect_with_token(&server, &seed.raw)
+        .await
+        .unwrap();
+    let session_id = client.session_id.unwrap();
+    let (tunnel_id, subdomain, _) = client.register_http_tunnel(None).await.unwrap();
+    connect_data_bridge(&server, session_id, local)
+        .await
+        .expect("bridge");
+    let host = format!("{subdomain}.{}", server.domain);
+    let port = server.https_port;
+    let reader = tokio::spawn(async move {
+        discard_https_body(port, &host, "/stream").await;
+    });
+
+    let mut saw = 0u64;
+    for _ in 0..400 {
+        saw = server.core.get_tunnel_bytes_proxied(&tunnel_id);
+        if saw >= cap as u64 {
+            break;
+        }
+        if let Ok(ControlFrame::Ping { timestamp }) =
+            client.recv_timeout(Duration::from_millis(50)).await
+        {
+            let _ = client.send(&ControlFrame::Pong { timestamp }).await;
+        }
+    }
+    assert!(
+        saw >= cap as u64,
+        "open stream did not reach the cap in memory: {saw}"
+    );
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes_proxied), 0)::bigint FROM tunnel_log WHERE user_id = $1",
+    )
+    .bind(seed.user_id)
+    .fetch_one(&server.db.pg)
+    .await
+    .unwrap();
+    assert!(
+        stored < cap,
+        "usage must come from the live stream, not a database write: {stored}"
+    );
+
+    close_blocked(&server, &mut client).await;
+    wait_gone(&server, session_id).await;
+    let _ = reader.await;
+    seed.cleanup().await;
+}
+
+/// Local HTTP server that writes `bytes` and then leaves the response open.
+async fn hold_open_body(bytes: u64) -> (SocketAddr, oneshot::Sender<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accepted = listener.accept() => {
+                    let Ok((sock, _)) = accepted else { break };
+                    tokio::spawn(async move {
+                        write_open_body(sock, bytes).await;
+                    });
+                }
+            }
+        }
+    });
+    (addr, tx)
+}
+
+async fn write_open_body(mut sock: tokio::net::TcpStream, bytes: u64) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = [0u8; 8192];
+    let mut got = Vec::new();
+    loop {
+        let n = match sock.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        got.extend_from_slice(&buf[..n]);
+        if got.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                  Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+    if sock.write_all(header.as_bytes()).await.is_err() {
+        return;
+    }
+    let chunk = vec![b'a'; 256 * 1024];
+    let mut sent = 0u64;
+    while sent < bytes {
+        let n = ((bytes - sent) as usize).min(chunk.len());
+        let size = format!("{n:x}\r\n");
+        if sock.write_all(size.as_bytes()).await.is_err()
+            || sock.write_all(&chunk[..n]).await.is_err()
+            || sock.write_all(b"\r\n").await.is_err()
+        {
+            return;
+        }
+        sent += n as u64;
+    }
+    // No terminating chunk. The response stays open past the cap.
+    let _ = sock.read(&mut buf).await;
+}
+
+async fn discard_https_body(port: u16, host: &str, path: &str) {
+    use rustls::pki_types::ServerName;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsConnector;
+
+    let tcp = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(tcp) => tcp,
+        Err(_) => return,
+    };
+    let connector = TlsConnector::from(insecure_client_tls());
+    let Ok(name) = ServerName::try_from("localhost") else {
+        return;
+    };
+    let Ok(mut tls) = connector.connect(name, tcp).await else {
+        return;
+    };
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/octet-stream\r\nConnection: close\r\n\r\n"
+    );
+    if tls.write_all(req.as_bytes()).await.is_err() {
+        return;
+    }
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match tls.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+#[tokio::test]
 async fn banned_suspended_deactivated_and_expired_tokens_are_refused() {
     init_tracing();
     let server = TestServer::start().await;
