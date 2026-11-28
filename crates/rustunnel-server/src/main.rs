@@ -350,6 +350,8 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
     //
     // Writes absolute counters onto open tunnel_log rows so a crash loses at
     // most one interval. `0` disables the task. Shutdown flushes either way.
+    // The hard cap does not wait for this task: it adds these in-memory
+    // counters on top of the rows already stored.
 
     let h_meter = {
         let core = Arc::clone(&core);

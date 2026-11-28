@@ -11,7 +11,12 @@
 //! # Cache
 //!
 //! [`AccountGate`] caches the account snapshot for [`ACCOUNT_CACHE_TTL`] and
-//! month bytes for [`BANDWIDTH_CACHE_TTL`]. Registration and token auth read
+//! the month-byte total for [`BANDWIDTH_CACHE_TTL`]. That total is the
+//! committed `tunnel_log` sum plus live counters this process has not
+//! flushed. Bytes proxied after the snapshot are added on the next read, so
+//! a tunnel that crosses the cap is refused on the following request,
+//! inside the cache window. The column itself is written on the meter flush
+//! (default 60s) and when the tunnel closes. Registration and token auth read
 //! Postgres directly. A background pass every [`SESSION_RECHECK_INTERVAL`]
 //! re-reads tokens and users and closes sessions that are no longer allowed,
 //! so a ban or deactivation lands within about a minute even when the
@@ -34,7 +39,7 @@ use uuid::Uuid;
 
 use rustunnel_protocol::TunnelProtocol;
 
-use crate::billing::month_bytes_proxied;
+use crate::billing::month_bytes_including_live;
 use crate::core::{ControlMessage, TunnelCore};
 use crate::db::models::{AgentPlanLimits, Token};
 use crate::error::Result;
@@ -42,8 +47,8 @@ use crate::error::Result;
 /// Per-request account snapshot. A ban still closes the session on the
 /// shorter [`SESSION_RECHECK_INTERVAL`] pass, which does not use this cache.
 pub const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30);
-/// Month-byte total used for the hard cap. Short enough that crossing the
-/// cap blocks the next requests without a query on every one.
+/// How long a committed month-byte total is reused. Bytes the live tunnel
+/// proxies after that snapshot are still counted on the next request.
 pub const BANDWIDTH_CACHE_TTL: Duration = Duration::from_secs(15);
 /// How often live sessions are checked for a ban, suspension, deactivation,
 /// or an expired token.
@@ -174,8 +179,11 @@ struct CachedView {
 }
 
 struct CachedBytes {
+    /// Committed rows plus unflushed live bytes at `at`.
     bytes: i64,
     at: Instant,
+    /// In-memory totals for this user's tunnels when `bytes` was computed.
+    live: Vec<(Uuid, u64)>,
 }
 
 /// Short-lived cache in front of account and bandwidth reads.
@@ -219,24 +227,42 @@ impl AccountGate {
         Ok(loaded)
     }
 
-    /// UTC-month `tunnel_log.bytes_proxied` for `user_id`.
-    pub async fn month_bytes(&self, user_id: Uuid) -> Result<i64> {
-        if let Some(entry) = self.bandwidth.get(&user_id) {
-            if fresh(entry.at, self.bandwidth_ttl) {
-                return Ok(entry.bytes);
-            }
+    /// UTC-month bytes for `user_id`, including this process's unflushed counters.
+    ///
+    /// A fresh cache entry keeps the total from when it was stored and adds
+    /// whatever those tunnels have proxied since. Crossing the cap therefore
+    /// shows up on the next check, without waiting for the meter flush or
+    /// for the cache to expire.
+    pub async fn month_bytes(&self, user_id: Uuid, core: &TunnelCore) -> Result<i64> {
+        if let Some(hit) = self.cached_month_bytes(user_id, core) {
+            return Ok(hit);
         }
-        let bytes = month_bytes_proxied(&self.pool, user_id).await?;
+        let live = core.live_bytes_proxied_for_user(user_id);
+        let bytes = month_bytes_including_live(&self.pool, user_id, &live).await?;
         if !self.bandwidth_ttl.is_zero() {
             self.bandwidth.insert(
                 user_id,
                 CachedBytes {
                     bytes,
                     at: Instant::now(),
+                    live,
                 },
             );
         }
         Ok(bytes)
+    }
+
+    fn cached_month_bytes(&self, user_id: Uuid, core: &TunnelCore) -> Option<i64> {
+        let cached = self.bandwidth.get(&user_id).and_then(|entry| {
+            if fresh(entry.at, self.bandwidth_ttl) {
+                Some((entry.bytes, entry.live.clone()))
+            } else {
+                None
+            }
+        })?;
+        let (base, snapshot) = cached;
+        let now = core.live_bytes_proxied_for_user(user_id);
+        Some(base.saturating_add(live_growth(&snapshot, &now)))
     }
 
     fn fresh_view(&self, user_id: Uuid) -> Option<AccountView> {
@@ -251,6 +277,19 @@ impl AccountGate {
 
 fn fresh(at: Instant, ttl: Duration) -> bool {
     !ttl.is_zero() && at.elapsed() < ttl
+}
+
+/// Bytes proxied since `snapshot`. Tunnels that were not open then count
+/// in full. Tunnels that have since closed stay in the cached base.
+fn live_growth(snapshot: &[(Uuid, u64)], now: &[(Uuid, u64)]) -> i64 {
+    let base: std::collections::HashMap<Uuid, u64> = snapshot.iter().copied().collect();
+    let mut extra = 0i64;
+    for (id, bytes) in now {
+        let previous = base.get(id).copied().unwrap_or(0);
+        let delta = bytes.saturating_sub(previous);
+        extra = extra.saturating_add(i64::try_from(delta).unwrap_or(i64::MAX));
+    }
+    extra
 }
 
 /// Token status, expiry, and the owning user's ban / deactivation.
@@ -386,6 +425,7 @@ pub async fn evaluate_plan_registration(
     user_id: Uuid,
     protocol: &str,
     requested_subdomain: Option<&str>,
+    core: &TunnelCore,
 ) -> Result<Option<RegistrationDenial>> {
     let Some(view) = load_account(pool, user_id).await? else {
         return Ok(None);
@@ -408,7 +448,10 @@ pub async fn evaluate_plan_registration(
         count_open_tunnels(pool, user_id).await?
     };
     let month_bytes = if hard_cap_limit(&plan).is_some() {
-        month_bytes_proxied(pool, user_id).await?
+        // The open row stays at 0 until the meter flush or close. Add the
+        // counters the proxy has already incremented.
+        month_bytes_including_live(pool, user_id, &core.live_bytes_proxied_for_user(user_id))
+            .await?
     } else {
         0
     };
@@ -1138,6 +1181,10 @@ mod tests {
         }
     }
 
+    fn idle_core() -> TunnelCore {
+        TunnelCore::new([20000, 20001], [0, 0], 4, 8, 100, 20)
+    }
+
     async fn pool() -> PgPool {
         let url = std::env::var("TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://rustunnel:test@127.0.0.1:5432/rustunnel_test".into());
@@ -1230,17 +1277,18 @@ mod tests {
     #[tokio::test]
     async fn live_agent_plan_row_drives_registration() {
         let pool = pool().await;
+        let core = idle_core();
         let fixture = Fixture::insert(&pool, "agent", "agent", false, "active").await;
-        let none = evaluate_plan_registration(&pool, fixture.user_id, "http", None)
+        let none = evaluate_plan_registration(&pool, fixture.user_id, "http", None, &core)
             .await
             .unwrap();
         assert!(none.is_none());
-        let tcp = evaluate_plan_registration(&pool, fixture.user_id, "tcp", Some("name"))
+        let tcp = evaluate_plan_registration(&pool, fixture.user_id, "tcp", Some("name"), &core)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(tcp.code, code::PROTOCOL_NOT_ALLOWED);
-        let sub = evaluate_plan_registration(&pool, fixture.user_id, "http", Some("myapp"))
+        let sub = evaluate_plan_registration(&pool, fixture.user_id, "http", Some("myapp"), &core)
             .await
             .unwrap()
             .unwrap();
@@ -1261,7 +1309,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = evaluate_plan_registration(&pool, fixture.user_id, "https", None)
+        let second = evaluate_plan_registration(&pool, fixture.user_id, "https", None, &core)
             .await
             .unwrap()
             .unwrap();
@@ -1278,7 +1326,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let capped = evaluate_plan_registration(&pool, fixture.user_id, "http", None)
+        let capped = evaluate_plan_registration(&pool, fixture.user_id, "http", None, &core)
             .await
             .unwrap()
             .unwrap();
@@ -1287,12 +1335,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_tunnel_bytes_count_before_flush_without_double_counting() {
+        use std::sync::atomic::Ordering;
+
+        let pool = pool().await;
+        let fixture = Fixture::insert(&pool, "agent", "agent", false, "active").await;
+        let core = idle_core();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let session_id = core.register_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "t".into(),
+            None,
+            Some(fixture.user_id),
+            tx,
+        );
+        let (tunnel_id, subdomain) = core
+            .register_http_tunnel(&session_id, None, TunnelProtocol::Http, None)
+            .unwrap();
+        crate::db::log_tunnel_registered(
+            &pool,
+            crate::db::TunnelRegistration {
+                tunnel_id: &tunnel_id.to_string(),
+                protocol: "http",
+                label: &subdomain,
+                session_id: &session_id.to_string(),
+                token_id: None,
+                region_id: "test",
+                user_id: Some(fixture.user_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        let gate = AccountGate::new(pool.clone(), Duration::ZERO, Duration::from_secs(60));
+        assert_eq!(gate.month_bytes(fixture.user_id, &core).await.unwrap(), 0);
+
+        let (other_tx, _other_rx) = tokio::sync::mpsc::channel(1);
+        let other_session = core.register_session(
+            "127.0.0.1:10".parse().unwrap(),
+            "other".into(),
+            None,
+            Some(Uuid::new_v4()),
+            other_tx,
+        );
+        let (_other_id, other_sub) = core
+            .register_http_tunnel(&other_session, None, TunnelProtocol::Http, None)
+            .unwrap();
+        core.http_routes
+            .get(&other_sub)
+            .unwrap()
+            .members
+            .iter()
+            .next()
+            .unwrap()
+            .info
+            .bytes_in
+            .store(50_000_000, Ordering::Relaxed);
+
+        let cap = AgentPlanLimits::BANDWIDTH_LIMIT_BYTES as u64;
+        core.http_routes
+            .get(&subdomain)
+            .unwrap()
+            .members
+            .get(&tunnel_id)
+            .unwrap()
+            .info
+            .bytes_in
+            .store(cap, Ordering::Relaxed);
+
+        assert_eq!(
+            gate.month_bytes(fixture.user_id, &core).await.unwrap(),
+            AgentPlanLimits::BANDWIDTH_LIMIT_BYTES,
+            "a warm cache must still see bytes proxied after the snapshot"
+        );
+        let stored: i64 =
+            sqlx::query_scalar("SELECT bytes_proxied FROM tunnel_log WHERE tunnel_id = $1")
+                .bind(tunnel_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, 0, "the cap must trip before the meter flush");
+
+        crate::db::flush_live_meters(&pool, &core).await.unwrap();
+        let fresh = AccountGate::new(pool.clone(), Duration::ZERO, Duration::ZERO);
+        assert_eq!(
+            fresh.month_bytes(fixture.user_id, &core).await.unwrap(),
+            AgentPlanLimits::BANDWIDTH_LIMIT_BYTES,
+            "flushing the same counters must not count them twice"
+        );
+        fixture.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn hobby_registration_is_not_rewritten_to_agent_codes() {
         let pool = pool().await;
+        let core = idle_core();
         let fixture = Fixture::insert(&pool, "human", "free", false, "active").await;
-        let denial = evaluate_plan_registration(&pool, fixture.user_id, "tcp", Some("myapp"))
-            .await
-            .unwrap();
+        let denial =
+            evaluate_plan_registration(&pool, fixture.user_id, "tcp", Some("myapp"), &core)
+                .await
+                .unwrap();
         assert!(denial.is_none());
         fixture.cleanup().await;
     }

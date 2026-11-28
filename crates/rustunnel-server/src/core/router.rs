@@ -761,6 +761,50 @@ impl TunnelCore {
         rows
     }
 
+    /// Absolute `bytes_in + bytes_out` for tunnels whose session belongs to
+    /// `user_id`.
+    ///
+    /// These are the same totals a flush writes onto the open `tunnel_log`
+    /// row. The hard cap adds only the part that row does not have yet.
+    pub fn live_bytes_proxied_for_user(&self, user_id: Uuid) -> Vec<(Uuid, u64)> {
+        let mut found = Vec::new();
+        let mut consider = |info: &crate::core::TunnelInfo| {
+            found.push((
+                info.session_id,
+                info.tunnel_id,
+                info.meter_snapshot().bytes_proxied(),
+            ));
+        };
+        for group in self.http_routes.iter() {
+            for member in group.members.iter() {
+                consider(&member.info);
+            }
+        }
+        for group in self.tcp_routes.iter() {
+            for member in group.members.iter() {
+                consider(&member.info);
+            }
+        }
+        for group in self.udp_routes.iter() {
+            for member in group.members.iter() {
+                consider(&member.info);
+            }
+        }
+        for entry in self.p2p_tunnels.iter() {
+            consider(&entry.tunnel_info);
+        }
+        found
+            .into_iter()
+            .filter(|(session_id, _, _)| {
+                self.sessions
+                    .get(session_id)
+                    .and_then(|session| session.user_id)
+                    == Some(user_id)
+            })
+            .map(|(_, tunnel_id, bytes)| (tunnel_id, bytes))
+            .collect()
+    }
+
     /// Return the current bytes-proxied counter for a member.
     /// Returns 0 if the tunnel is unknown.
     pub fn get_tunnel_bytes_proxied(&self, tunnel_id: &Uuid) -> u64 {

@@ -319,6 +319,10 @@ pub async fn evaluate_hobby_limits(
 /// to its registration month, and that same cumulative total is not added
 /// again when the row later closes in a different month. The only filter
 /// besides the month rule is `user_id`.
+///
+/// The column is not written as bytes move. The meter flush (default 60s)
+/// and tunnel close store the in-memory counters. [`month_bytes_including_live`]
+/// is what the hard cap reads.
 pub(crate) async fn month_bytes_proxied(pool: &PgPool, user_id: Uuid) -> Result<i64> {
     month_bytes_proxied_at(pool, user_id, Utc::now()).await
 }
@@ -327,7 +331,7 @@ pub(crate) async fn month_bytes_proxied(pool: &PgPool, user_id: Uuid) -> Result<
 ///
 /// Tests pass a fixed timestamp so the month does not depend on the real date.
 pub(crate) async fn month_bytes_proxied_at(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     user_id: Uuid,
     at: DateTime<Utc>,
 ) -> Result<i64> {
@@ -347,9 +351,55 @@ pub(crate) async fn month_bytes_proxied_at(
     )
     .bind(user_id)
     .bind(at)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(row.0)
+}
+
+/// Committed month bytes plus counters this process has not flushed yet.
+///
+/// `live` is `(tunnel_id, bytes_in + bytes_out)` for this user's tunnels on
+/// this edge. Both numbers are absolute: a flush copies the counter onto
+/// the open row, so each live tunnel adds `max(0, memory - stored)` and a
+/// later flush cannot be counted twice. Closed rows stay as stored. A
+/// tunnel open only on another edge stays as stored until that edge flushes.
+///
+/// The two reads share one snapshot, so a flush that lands between them
+/// cannot subtract the new row and also omit it from the sum.
+pub(crate) async fn month_bytes_including_live(
+    pool: &PgPool,
+    user_id: Uuid,
+    live: &[(Uuid, u64)],
+) -> Result<i64> {
+    if live.is_empty() {
+        return month_bytes_proxied(pool, user_id).await;
+    }
+    let ids: Vec<String> = live.iter().map(|(id, _)| id.to_string()).collect();
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
+    let committed = month_bytes_proxied_at(&mut *tx, user_id, Utc::now()).await?;
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT tunnel_id, COALESCE(SUM(bytes_proxied), 0)::bigint \
+         FROM tunnel_log \
+         WHERE user_id = $1 AND unregistered_at IS NULL AND tunnel_id = ANY($2) \
+         GROUP BY tunnel_id",
+    )
+    .bind(user_id)
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let stored: std::collections::HashMap<String, i64> = rows.into_iter().collect();
+    let mut extra = 0i64;
+    for (id, memory) in live {
+        let persisted = stored.get(&id.to_string()).copied().unwrap_or(0);
+        let memory = i64::try_from(*memory).unwrap_or(i64::MAX);
+        extra = extra.saturating_add((memory - persisted).max(0));
+    }
+    Ok(committed.saturating_add(extra))
 }
 
 /// Fire-and-forget report. No-op when platform-api is not configured.

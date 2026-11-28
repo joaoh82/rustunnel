@@ -926,7 +926,11 @@ async fn account_guard(
         .as_ref()
         .is_some_and(|plan| plan.bandwidth_hard_cap)
     {
-        match ctx.account_gate.month_bytes(user_id).await {
+        match ctx
+            .account_gate
+            .month_bytes(user_id, ctx.core.as_ref())
+            .await
+        {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!(error = %e, %user_id, "bandwidth lookup failed; proxying");

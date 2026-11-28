@@ -647,6 +647,7 @@ where
                             user_id,
                             crate::policy::protocol_name(&protocol),
                             subdomain.as_deref(),
+                            core,
                         )
                         .await?
                         {
