@@ -1240,6 +1240,40 @@ async fn over_hard_cap(
     }
 }
 
+/// Same decision as [`over_hard_cap`] using only the byte cache. The batch
+/// load has already failed, so this must not open another Postgres query.
+fn cached_over_hard_cap(
+    gate: &AccountGate,
+    core: &TunnelCore,
+    view: &AccountView,
+    user_id: Uuid,
+) -> bool {
+    let Some(plan) = view.plan.as_ref() else {
+        return false;
+    };
+    let Some(limit) = hard_cap_limit(plan) else {
+        return false;
+    };
+    gate.any_month_bytes(user_id, core)
+        .is_some_and(|bytes| bytes >= limit)
+}
+
+fn remember_accounts(gate: &AccountGate, accounts: &std::collections::HashMap<Uuid, AccountView>) {
+    if gate.account_ttl.is_zero() {
+        return;
+    }
+    let now = Instant::now();
+    for (user_id, view) in accounts {
+        gate.accounts.insert(
+            *user_id,
+            CachedView {
+                view: view.clone(),
+                at: now,
+            },
+        );
+    }
+}
+
 /// Tokens and their users, one round trip, bounded by [`STATEMENT_TIMEOUT`].
 async fn load_recheck_rows(
     pool: &PgPool,
@@ -1293,8 +1327,10 @@ async fn load_recheck_rows(
 /// every session. The hard cap adds this process's unflushed counters
 /// ([`TunnelCore::live_bytes_proxied_for_user`], the same totals
 /// [`TunnelCore::get_tunnel_bytes_proxied`] reports) to the committed month
-/// sum. A database error uses `gate`'s last account and byte snapshot,
-/// including one past its TTL. With no snapshot the session stays up.
+/// sum. A successful load is written into `gate` so the proxy does not
+/// immediately read those users again. A database error uses `gate`'s last
+/// account and byte snapshot, including one past its TTL, and does not
+/// query Postgres again for the cap. With no snapshot the session stays up.
 /// Sends [`ControlMessage::Shutdown`]; the session task drops its tunnels.
 pub async fn disconnect_blocked_sessions(
     pool: &PgPool,
@@ -1317,6 +1353,7 @@ pub async fn disconnect_blocked_sessions(
     let token_ids: Vec<String> = snapshot.iter().map(|(_, id)| id.clone()).collect();
     match load_recheck_rows(pool, &token_ids).await {
         Ok((tokens, accounts)) => {
+            remember_accounts(gate, &accounts);
             let mut closed = 0usize;
             let mut over_cap: std::collections::HashMap<Uuid, bool> =
                 std::collections::HashMap::new();
@@ -1380,7 +1417,7 @@ pub async fn disconnect_blocked_sessions(
                     || match over_cap.get(&user_id).copied() {
                         Some(over) => over,
                         None => {
-                            let over = over_hard_cap(gate, core, &view, user_id).await;
+                            let over = cached_over_hard_cap(gate, core, &view, user_id);
                             over_cap.insert(user_id, over);
                             over
                         }
@@ -2574,6 +2611,49 @@ mod tests {
             token_auth_block(&pool, &token).await.is_err(),
             "token auth stays fail-closed"
         );
+    }
+
+    #[tokio::test]
+    async fn recheck_seeds_the_account_cache() {
+        let pool = pool().await;
+        let fixture = Fixture::insert(&pool, "human", "free", false, "active").await;
+        let user_id = fixture.user_id;
+        let token_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO tokens (id, token_hash, label, created_at, user_id, status) \
+             VALUES ($1, $2, 't', NOW(), $3, 'active')",
+        )
+        .bind(&token_id)
+        .bind(format!("hash-{token_id}"))
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let core = idle_core();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        core.register_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "seed".into(),
+            Some(token_id),
+            Some(user_id),
+            tx,
+        );
+        let gate = AccountGate::new(pool.clone(), ACCOUNT_CACHE_TTL, BANDWIDTH_CACHE_TTL);
+        let closed = disconnect_blocked_sessions(&pool, &core, &gate)
+            .await
+            .unwrap();
+        assert_eq!(closed, 0);
+        assert!(gate.accounts.get(&user_id).is_some());
+        fixture.cleanup().await;
+        pool.close().await;
+        let started = Instant::now();
+        let view = gate.view(user_id).await.unwrap().unwrap();
+        assert_eq!(view.status, "active");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "seeded cache still queried the database"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
