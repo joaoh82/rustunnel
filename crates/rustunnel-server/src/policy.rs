@@ -951,7 +951,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cap.code, code::BANDWIDTH_CAP_REACHED);
-        assert!(cap.message.contains("262144000"));
+        assert!(cap
+            .message
+            .contains(&AgentPlanLimits::BANDWIDTH_LIMIT_BYTES.to_string()));
     }
 
     #[test]
