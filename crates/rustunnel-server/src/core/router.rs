@@ -604,6 +604,10 @@ impl TunnelCore {
     /// Phase 1 has one-member-per-group, so every removal is the last one;
     /// this shape keeps Phase 2/3 from having to revisit the removal path.
     pub fn remove_tunnel(&self, tunnel_id: &Uuid) {
+        // Captured before the index entry is gone. A failed audit insert
+        // calls this, and the id has to leave session.tunnels or it keeps
+        // occupying a max_tunnels_per_session slot.
+        let session_id = self.tunnel_session(tunnel_id);
         let Some((_, key)) = self.tunnel_index.remove(tunnel_id) else {
             return;
         };
@@ -662,6 +666,11 @@ impl TunnelCore {
             }
             TunnelKey::P2p(name) => {
                 self.p2p_tunnels.remove(&name);
+            }
+        }
+        if let Some(session_id) = session_id {
+            if let Some(mut session) = self.sessions.get_mut(&session_id) {
+                session.tunnels.retain(|id| id != tunnel_id);
             }
         }
     }
@@ -759,6 +768,26 @@ impl TunnelCore {
             rows.push(entry.tunnel_info.meter_snapshot());
         }
         rows
+    }
+
+    /// Absolute `bytes_in + bytes_out` for tunnels whose session belongs to
+    /// `user_id`.
+    ///
+    /// Walks that user's sessions rather than every route. These are the
+    /// same totals a flush writes onto the open `tunnel_log` row. The hard
+    /// cap adds only the part that row does not have yet. A tunnel id that
+    /// has already been removed contributes zeros.
+    pub fn live_bytes_proxied_for_user(&self, user_id: Uuid) -> Vec<(Uuid, u64)> {
+        let tunnel_ids: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|session| session.user_id == Some(user_id))
+            .flat_map(|session| session.tunnels.clone())
+            .collect();
+        tunnel_ids
+            .into_iter()
+            .map(|tunnel_id| (tunnel_id, self.tunnel_meter(&tunnel_id).bytes_proxied()))
+            .collect()
     }
 
     /// Return the current bytes-proxied counter for a member.
@@ -1396,6 +1425,28 @@ mod tests {
 
         let result = core.register_http_tunnel(&session_id, None, TunnelProtocol::Http, None);
         assert!(matches!(result, Err(Error::LimitExceeded(_))));
+    }
+
+    #[test]
+    fn remove_tunnel_frees_the_session_slot() {
+        let core = TunnelCore::new([51000, 51009], [0, 0], 1, 100, 1000, 10);
+        let (session_id, _rx) = dummy_session(&core);
+        let (tunnel_id, _) = core
+            .register_http_tunnel(&session_id, None, TunnelProtocol::Http, None)
+            .unwrap();
+        assert_eq!(
+            core.sessions.get(&session_id).unwrap().tunnels,
+            vec![tunnel_id]
+        );
+        assert!(matches!(
+            core.register_http_tunnel(&session_id, None, TunnelProtocol::Http, None),
+            Err(Error::LimitExceeded(_))
+        ));
+        core.remove_tunnel(&tunnel_id);
+        assert!(core.sessions.get(&session_id).unwrap().tunnels.is_empty());
+        assert!(core
+            .register_http_tunnel(&session_id, None, TunnelProtocol::Http, None)
+            .is_ok());
     }
 
     #[test]

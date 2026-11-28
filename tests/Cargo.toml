@@ -88,3 +88,7 @@ path = "integration/dashboard_scope.rs"
 [[test]]
 name = "webhook_fidelity"
 path = "integration/webhook_fidelity.rs"
+
+[[test]]
+name = "agent_limits"
+path = "integration/agent_limits.rs"

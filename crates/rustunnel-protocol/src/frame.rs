@@ -83,6 +83,11 @@ pub enum ControlFrame {
     },
     AuthError {
         message: String,
+        /// Stable machine code (`token_expired`, `account_deactivated`,
+        /// `account_suspended`, `token_inactive`). Absent for generic
+        /// failures such as an unknown token. Released clients ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     RegisterTunnel {
         request_id: String,
@@ -128,6 +133,13 @@ pub enum ControlFrame {
     TunnelError {
         request_id: String,
         message: String,
+        /// Stable machine code (`protocol_not_allowed`,
+        /// `custom_subdomain_not_allowed`, `tunnel_limit`,
+        /// `bandwidth_cap_reached`, and the auth codes). Absent when the
+        /// failure has no plan or account code. Released clients ignore it
+        /// and print `message`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     UnregisterTunnel {
         tunnel_id: Uuid,
@@ -357,6 +369,44 @@ mod tests {
         match frame {
             ControlFrame::RegisterTunnel { client_surface, .. } => {
                 assert_eq!(client_surface.as_deref(), Some("mcp"));
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    /// Frames written before `code` existed must still decode.
+    #[test]
+    fn tunnel_and_auth_errors_without_code_decode() {
+        let tunnel = r#"{"type":"tunnel_error","request_id":"r","message":"nope"}"#;
+        match decode_frame(tunnel.as_bytes()).expect("tunnel") {
+            ControlFrame::TunnelError { message, code, .. } => {
+                assert_eq!(message, "nope");
+                assert!(code.is_none());
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        let auth = r#"{"type":"auth_error","message":"invalid token"}"#;
+        match decode_frame(auth.as_bytes()).expect("auth") {
+            ControlFrame::AuthError { message, code } => {
+                assert_eq!(message, "invalid token");
+                assert!(code.is_none());
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tunnel_error_code_round_trips() {
+        let frame = ControlFrame::TunnelError {
+            request_id: "r".into(),
+            message: "agent plan does not allow tcp tunnels".into(),
+            code: Some("protocol_not_allowed".into()),
+        };
+        let bytes = encode_frame(&frame);
+        match decode_frame(&bytes).expect("decode") {
+            ControlFrame::TunnelError { code, message, .. } => {
+                assert_eq!(code.as_deref(), Some("protocol_not_allowed"));
+                assert!(message.contains("tcp"));
             }
             other => panic!("unexpected frame: {other:?}"),
         }

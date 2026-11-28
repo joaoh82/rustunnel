@@ -540,6 +540,12 @@ impl TestServer {
                 rate_limit_rps: config.limits.rate_limit_rps,
                 request_body_max_bytes: config.limits.request_body_max_bytes,
                 plain_http_mode: config.server.plain_http_mode,
+                // Zero TTL so a claim, upgrade, or ban is visible on the next request.
+                account_gate: Arc::new(rustunnel_server::policy::AccountGate::new(
+                    db.pg.clone(),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )),
             };
             async move {
                 drop((http_hold, https_hold));
@@ -677,6 +683,13 @@ pub struct TestClient {
     pub server_version: Option<String>,
 }
 
+fn frame_err(kind: &str, message: String, code: Option<String>) -> String {
+    match code {
+        Some(code) => format!("{kind}[{code}]: {message}"),
+        None => format!("{kind}: {message}"),
+    }
+}
+
 impl TestClient {
     /// Connect and authenticate with `token`.
     pub async fn connect_with_token(server: &TestServer, token: &str) -> Result<Self, String> {
@@ -712,7 +725,7 @@ impl TestClient {
                 client.server_version = Some(server_version);
                 Ok(client)
             }
-            ControlFrame::AuthError { message } => Err(format!("AuthError: {message}")),
+            ControlFrame::AuthError { message, code } => Err(frame_err("AuthError", message, code)),
             other => Err(format!("unexpected frame: {other:?}")),
         }
     }
@@ -748,7 +761,7 @@ impl TestClient {
             .await?;
 
         match client.recv_timeout(Duration::from_secs(5)).await? {
-            ControlFrame::AuthError { message } => Ok(message),
+            ControlFrame::AuthError { message, .. } => Ok(message),
             ControlFrame::AuthOk { .. } => Err("expected AuthError but got AuthOk".into()),
             other => Err(format!("unexpected frame: {other:?}")),
         }
@@ -826,7 +839,9 @@ impl TestClient {
                     .to_string();
                 Ok((tunnel_id, sub, public_url))
             }
-            ControlFrame::TunnelError { message, .. } => Err(format!("TunnelError: {message}")),
+            ControlFrame::TunnelError { message, code, .. } => {
+                Err(frame_err("TunnelError", message, code))
+            }
             other => Err(format!("unexpected frame: {other:?}")),
         }
     }
@@ -869,7 +884,9 @@ impl TestClient {
                     .to_string();
                 Ok((tunnel_id, sub, public_url))
             }
-            ControlFrame::TunnelError { message, .. } => Err(format!("TunnelError: {message}")),
+            ControlFrame::TunnelError { message, code, .. } => {
+                Err(frame_err("TunnelError", message, code))
+            }
             other => Err(format!("unexpected frame: {other:?}")),
         }
     }
@@ -909,7 +926,9 @@ impl TestClient {
                     .to_string();
                 Ok((tunnel_id, sub, public_url))
             }
-            ControlFrame::TunnelError { message, .. } => Err(format!("TunnelError: {message}")),
+            ControlFrame::TunnelError { message, code, .. } => {
+                Err(frame_err("TunnelError", message, code))
+            }
             other => Err(format!("unexpected frame: {other:?}")),
         }
     }
@@ -947,7 +966,9 @@ impl TestClient {
                 let port = assigned_port.ok_or("missing assigned_port")?;
                 Ok((tunnel_id, port))
             }
-            ControlFrame::TunnelError { message, .. } => Err(format!("TunnelError: {message}")),
+            ControlFrame::TunnelError { message, code, .. } => {
+                Err(frame_err("TunnelError", message, code))
+            }
             other => Err(format!("unexpected frame: {other:?}")),
         }
     }
@@ -978,7 +999,9 @@ impl TestClient {
                 let port = assigned_port.ok_or("missing assigned_port")?;
                 Ok((tunnel_id, port))
             }
-            ControlFrame::TunnelError { message, .. } => Err(format!("TunnelError: {message}")),
+            ControlFrame::TunnelError { message, code, .. } => {
+                Err(frame_err("TunnelError", message, code))
+            }
             other => Err(format!("unexpected frame: {other:?}")),
         }
     }
@@ -1009,7 +1032,9 @@ impl TestClient {
                 let port = assigned_port.ok_or("missing assigned_port")?;
                 Ok((tunnel_id, port))
             }
-            ControlFrame::TunnelError { message, .. } => Err(format!("TunnelError: {message}")),
+            ControlFrame::TunnelError { message, code, .. } => {
+                Err(frame_err("TunnelError", message, code))
+            }
             other => Err(format!("unexpected frame: {other:?}")),
         }
     }
@@ -1044,7 +1069,9 @@ impl TestClient {
                 let tname = p2p_tunnel_name.ok_or("missing p2p_tunnel_name")?;
                 Ok((tunnel_id, tname))
             }
-            ControlFrame::TunnelError { message, .. } => Err(format!("TunnelError: {message}")),
+            ControlFrame::TunnelError { message, code, .. } => {
+                Err(frame_err("TunnelError", message, code))
+            }
             other => Err(format!("unexpected frame: {other:?}")),
         }
     }

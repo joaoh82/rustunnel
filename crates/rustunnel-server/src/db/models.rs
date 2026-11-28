@@ -20,10 +20,15 @@ pub struct Token {
     pub scope: Option<String>,
 
     // ── Platform billing fields (Phase 1) ─────────────────────────────────
-    /// User that owns this token. `None` for admin and agent tokens (legacy).
+    /// User that owns this token. `None` for admin and legacy tokens.
     /// Limit checks are skipped when this is `None` for backwards compatibility.
     pub user_id: Option<Uuid>,
     /// Hard expiry timestamp. `None` means no expiry (human PAYG tokens).
+    ///
+    /// Unclaimed agent tokens are inserted with `users.created_at` plus
+    /// [`AgentPlanLimits::TOKEN_TTL_DAYS`] days. Claim (`users.claimed_at`)
+    /// clears this back to `None`. There is no column default: a default of
+    /// 7 days would expire human tokens.
     pub expires_at: Option<DateTime<Utc>>,
     /// Tier identifier: "free" | "payg" | "micro" | "standard" | "project".
     pub tier: Option<String>,
@@ -92,6 +97,41 @@ pub struct TunnelLogEntry {
     pub region_id: Option<String>,
 }
 
+/// Canonical `plans` row for agent-native accounts.
+///
+/// Seeded by `migrations/pg/20261127232000_agent_accounts.sql`.
+/// `plans.name` is unconstrained text (no enum, no name CHECK). The plan
+/// value is the row whose `name` is [`Self::NAME`].
+///
+/// platform-api `POST /agent/signup` must insert an active `subscriptions`
+/// row pointing at this plan, set `tokens.expires_at` to
+/// `users.created_at + TOKEN_TTL_DAYS`, and store a salted IP hash in
+/// `users.signup_ip_hash`. The edge reads the active plan row in
+/// `policy` (tunnel cap, protocols, custom subdomain, hard bandwidth).
+/// `billing_model` is [`Self::BILLING_MODEL`], not `"free"`, so the Hobby
+/// gate does not apply.
+pub struct AgentPlanLimits;
+
+impl AgentPlanLimits {
+    pub const NAME: &'static str = "agent";
+    pub const BILLING_MODEL: &'static str = "agent";
+    /// One concurrent tunnel (`plans.max_tunnels`).
+    pub const MAX_TUNNELS: i32 = 1;
+    /// Random subdomain only (`plans.allow_custom_subdomains`).
+    pub const ALLOW_CUSTOM_SUBDOMAINS: bool = false;
+    /// HTTP edge only. `http` is the CLI protocol; `https` is the same edge
+    /// with an https public URL. `tcp`, `udp`, and `p2p` are excluded.
+    pub const ALLOWED_PROTOCOLS: &'static [&'static str] = &["http", "https"];
+    pub const BANDWIDTH_HARD_CAP: bool = true;
+    /// 250 MB, the advertised monthly cap (`250_000_000` decimal bytes).
+    /// Not `plans.bandwidth_limit_gb` (that column is whole GiB and is a
+    /// soft warning).
+    pub const BANDWIDTH_LIMIT_BYTES: i64 = 250_000_000;
+    /// Unclaimed agent API tokens expire this many days after
+    /// `users.created_at`. Cleared to NULL when `users.claimed_at` is set.
+    pub const TOKEN_TTL_DAYS: i64 = 7;
+}
+
 /// A plan row with its live subscriber count.
 /// Returned by `GET /api/admin/plans`.
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -106,6 +146,15 @@ pub struct AdminPlan {
     pub bandwidth_limit_gb: Option<i32>,
     pub history_days: i32,
     pub is_active: bool,
+    /// When false, registration must use a random subdomain.
+    pub allow_custom_subdomains: bool,
+    /// TunnelProtocol wire names this plan may register.
+    pub allowed_protocols: Vec<String>,
+    /// When true, [`Self::bandwidth_limit_bytes`] is a hard monthly cap.
+    pub bandwidth_hard_cap: bool,
+    /// Hard monthly cap in bytes. `None` when [`Self::bandwidth_hard_cap`]
+    /// is false.
+    pub bandwidth_limit_bytes: Option<i64>,
     /// Number of subscriptions with `status = 'active'` on this plan.
     pub subscriber_count: i64,
 }

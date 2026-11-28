@@ -29,6 +29,7 @@ use rustunnel_server::dashboard::run_dashboard;
 use rustunnel_server::db;
 use rustunnel_server::edge::{run_http_edge, run_tcp_edge, run_udp_edge, HttpEdgeConfig};
 use rustunnel_server::error::Result;
+use rustunnel_server::policy::{self, AccountGate};
 use rustunnel_server::tls::CertManager;
 
 // ── constants ─────────────────────────────────────────────────────────────────
@@ -251,6 +252,12 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
 
     // ── task b: HTTP + HTTPS edge proxy ───────────────────────────────────────
 
+    let account_gate = Arc::new(AccountGate::new(
+        db.pg.clone(),
+        policy::ACCOUNT_CACHE_TTL,
+        policy::BANDWIDTH_CACHE_TTL,
+    ));
+
     let h_http = {
         let core = Arc::clone(&core);
         let domain = config.server.domain.clone();
@@ -259,6 +266,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
             rate_limit_rps: config.limits.rate_limit_rps,
             request_body_max_bytes: config.limits.request_body_max_bytes,
             plain_http_mode: config.server.plain_http_mode,
+            account_gate: Arc::clone(&account_gate),
         };
         tokio::spawn(async move {
             if let Err(e) = run_http_edge(
@@ -342,6 +350,8 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
     //
     // Writes absolute counters onto open tunnel_log rows so a crash loses at
     // most one interval. `0` disables the task. Shutdown flushes either way.
+    // The hard cap does not wait for this task: it adds these in-memory
+    // counters on top of the rows already stored.
 
     let h_meter = {
         let core = Arc::clone(&core);
@@ -402,6 +412,22 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         })
     };
 
+    // ── task: deactivation sweep + session recheck ────────────────────────────
+    // First ticks run immediately. A ban or expiry closes the session within
+    // SESSION_RECHECK_INTERVAL even when the HTTP cache is still warm. If
+    // Postgres is unreachable, the recheck uses the last cached account,
+    // including one past its TTL, and leaves the session up only when that
+    // user has never been cached.
+
+    let h_accounts = {
+        let pool = db.pg.clone();
+        let core = Arc::clone(&core);
+        let gate = Arc::clone(&account_gate);
+        tokio::spawn(async move {
+            policy::run_account_maintenance(pool, core, gate).await;
+        })
+    };
+
     // ── wait for shutdown signal ──────────────────────────────────────────────
 
     wait_for_shutdown_signal().await;
@@ -432,6 +458,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         h_metrics.abort_handle(),
         h_meter.abort_handle(),
         h_rollup.abort_handle(),
+        h_accounts.abort_handle(),
     ];
 
     // Allow up to 30 s for tasks to complete, then abort stragglers.
@@ -444,6 +471,7 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
         let _ = h_metrics.await;
         let _ = h_meter.await;
         let _ = h_rollup.await;
+        let _ = h_accounts.await;
     })
     .await;
 
