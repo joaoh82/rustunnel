@@ -78,12 +78,26 @@ async fn write_tunnel_log(write: TunnelLogWrite<'_>) -> Result<()> {
         user_id: write.user_id,
     };
     match write.hold {
+        // The advisory lock is what makes the row the source of the cap.
+        // A failed insert has to refuse the tunnel, or the next registration
+        // will not see it and both will pass.
         Some(mut tx) => {
             db::insert_tunnel_log(&mut *tx, reg).await?;
             tx.commit().await?;
             Ok(())
         }
-        None => db::log_tunnel_registered(write.pool, reg).await,
+        // Admin, direct, and self-hosted tokens have no per-user cap. A
+        // database blip must not refuse a tunnel that nothing counts.
+        None => {
+            if let Err(e) = db::log_tunnel_registered(write.pool, reg).await {
+                tracing::warn!(
+                    error = %e,
+                    tunnel_id = %write.tunnel_id,
+                    "tunnel log insert failed; registration kept"
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1626,4 +1640,71 @@ fn spawn_zero_healthy_alert(url: String, payload: crate::core::GroupAlertPayload
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DatabaseSection;
+    use crate::db::init_db;
+
+    async fn pool() -> sqlx::PgPool {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://rustunnel:test@127.0.0.1:5432/rustunnel_test".into());
+        init_db(&DatabaseSection {
+            url,
+            captured_path: ":memory:".into(),
+        })
+        .await
+        .expect("init_db")
+        .pg
+    }
+
+    async fn rows_for(pool: &sqlx::PgPool, tunnel_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM tunnel_log WHERE tunnel_id = $1")
+            .bind(tunnel_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn insert_failure_refuses_only_a_locked_registration() {
+        let pool = pool().await;
+        let missing_user = Uuid::new_v4();
+        let best_effort = Uuid::new_v4();
+        let locked = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+
+        let kept = write_tunnel_log(TunnelLogWrite {
+            pool: &pool,
+            hold: None,
+            tunnel_id: best_effort,
+            protocol: "http",
+            label: "best",
+            session_id,
+            token_id: None,
+            region_id: "test",
+            user_id: Some(missing_user),
+        })
+        .await;
+        assert!(kept.is_ok(), "a token with no cap keeps the tunnel");
+        assert_eq!(rows_for(&pool, best_effort).await, 0);
+
+        let tx = pool.begin().await.unwrap();
+        let refused = write_tunnel_log(TunnelLogWrite {
+            pool: &pool,
+            hold: Some(tx),
+            tunnel_id: locked,
+            protocol: "http",
+            label: "locked",
+            session_id,
+            token_id: None,
+            region_id: "test",
+            user_id: Some(missing_user),
+        })
+        .await;
+        assert!(refused.is_err(), "a locked registration must fail closed");
+        assert_eq!(rows_for(&pool, locked).await, 0);
+    }
 }

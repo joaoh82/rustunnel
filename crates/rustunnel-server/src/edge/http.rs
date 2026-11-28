@@ -1151,9 +1151,11 @@ async fn account_guard(
             sec_fetch_site: header_str(req, "sec-fetch-site"),
             skip_warning: header_str(req, policy::WARNING_SKIP_HEADER),
             cookie: header_str(req, "cookie"),
+            content_type: header_str(req, "content-type"),
             host,
             path_and_query,
             https: scheme == ForwardScheme::Https,
+            https_port: ctx.https_port,
         },
     );
     match action {
@@ -1166,18 +1168,22 @@ async fn account_guard(
 }
 
 fn strip_request_warning_cookies(headers: &mut hyper::HeaderMap) {
-    let Some(raw) = headers.get("cookie").and_then(|value| value.to_str().ok()) else {
+    let present: Vec<hyper::header::HeaderValue> =
+        headers.get_all("cookie").iter().cloned().collect();
+    if present.is_empty() {
         return;
-    };
-    let raw = raw.to_string();
-    match policy::without_warning_cookies(&raw) {
-        Some(kept) => {
-            if let Ok(value) = hyper::header::HeaderValue::from_str(&kept) {
-                headers.insert("cookie", value);
-            }
-        }
-        None => {
-            headers.remove("cookie");
+    }
+    headers.remove("cookie");
+    for value in present {
+        let Ok(raw) = value.to_str() else {
+            headers.append("cookie", value);
+            continue;
+        };
+        let Some(kept) = policy::without_warning_cookies(raw) else {
+            continue;
+        };
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&kept) {
+            headers.append("cookie", value);
         }
     }
 }
@@ -1705,6 +1711,47 @@ mod tests {
                 "id=1; Domain=foo.example.test".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn every_cookie_header_loses_warning_cookies() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append(
+            "cookie",
+            HeaderValue::from_static("__Host-rustunnel_warn_ok=1; visitor=1"),
+        );
+        headers.append(
+            "cookie",
+            HeaderValue::from_static("__Host-rustunnel_warn_nonce=abc"),
+        );
+        headers.append("cookie", HeaderValue::from_static("other=2"));
+        strip_request_warning_cookies(&mut headers);
+        let kept: Vec<_> = headers
+            .get_all("cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(kept, vec!["visitor=1", "other=2"]);
+    }
+
+    #[test]
+    fn a_nameless_warning_set_cookie_is_dropped() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("=__Host-rustunnel_warn_ok=1; Path=/; Secure"),
+        );
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("app_session=keep; Path=/"),
+        );
+        strip_response_warning_cookies(&mut headers);
+        let kept: Vec<_> = headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(kept, vec!["app_session=keep; Path=/"]);
     }
 
     #[test]

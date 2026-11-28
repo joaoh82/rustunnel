@@ -604,6 +604,10 @@ impl TunnelCore {
     /// Phase 1 has one-member-per-group, so every removal is the last one;
     /// this shape keeps Phase 2/3 from having to revisit the removal path.
     pub fn remove_tunnel(&self, tunnel_id: &Uuid) {
+        // Captured before the index entry is gone. A failed audit insert
+        // calls this, and the id has to leave session.tunnels or it keeps
+        // occupying a max_tunnels_per_session slot.
+        let session_id = self.tunnel_session(tunnel_id);
         let Some((_, key)) = self.tunnel_index.remove(tunnel_id) else {
             return;
         };
@@ -662,6 +666,11 @@ impl TunnelCore {
             }
             TunnelKey::P2p(name) => {
                 self.p2p_tunnels.remove(&name);
+            }
+        }
+        if let Some(session_id) = session_id {
+            if let Some(mut session) = self.sessions.get_mut(&session_id) {
+                session.tunnels.retain(|id| id != tunnel_id);
             }
         }
     }
@@ -1416,6 +1425,28 @@ mod tests {
 
         let result = core.register_http_tunnel(&session_id, None, TunnelProtocol::Http, None);
         assert!(matches!(result, Err(Error::LimitExceeded(_))));
+    }
+
+    #[test]
+    fn remove_tunnel_frees_the_session_slot() {
+        let core = TunnelCore::new([51000, 51009], [0, 0], 1, 100, 1000, 10);
+        let (session_id, _rx) = dummy_session(&core);
+        let (tunnel_id, _) = core
+            .register_http_tunnel(&session_id, None, TunnelProtocol::Http, None)
+            .unwrap();
+        assert_eq!(
+            core.sessions.get(&session_id).unwrap().tunnels,
+            vec![tunnel_id]
+        );
+        assert!(matches!(
+            core.register_http_tunnel(&session_id, None, TunnelProtocol::Http, None),
+            Err(Error::LimitExceeded(_))
+        ));
+        core.remove_tunnel(&tunnel_id);
+        assert!(core.sessions.get(&session_id).unwrap().tunnels.is_empty());
+        assert!(core
+            .register_http_tunnel(&session_id, None, TunnelProtocol::Http, None)
+            .is_ok());
     }
 
     #[test]

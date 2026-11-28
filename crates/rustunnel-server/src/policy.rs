@@ -212,10 +212,15 @@ pub struct IncomingRequest<'a> {
     pub sec_fetch_site: Option<&'a str>,
     pub skip_warning: Option<&'a str>,
     pub cookie: Option<&'a str>,
+    /// `Content-Type` when the client sent one. A form POST with no fetch
+    /// metadata is still a navigation.
+    pub content_type: Option<&'a str>,
     pub host: &'a str,
     pub path_and_query: &'a str,
     /// Public scheme of the request.
     pub https: bool,
+    /// HTTPS listener port. The plain-HTTP upgrade omits it when it is 443.
+    pub https_port: u16,
 }
 
 struct CachedView {
@@ -789,6 +794,16 @@ pub async fn reserve_plan_registration<'a>(
         );
     }
     let mut tx = pool.begin().await?;
+    // A peer that dies holding the lock must not stall this registration.
+    // lock_timeout bounds the wait; statement_timeout bounds the statements.
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'"
+    ))
+    .execute(&mut *tx)
+    .await?;
     let (key1, key2) = advisory_lock_keys(user_id);
     sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
         .bind(key1)
@@ -949,12 +964,16 @@ async fn load_account(pool: &PgPool, user_id: Uuid) -> Result<Option<AccountView
 /// `Sec-Fetch-Mode: navigate` or `Sec-Fetch-Dest: document|iframe` counts
 /// for any method, so a cross-site form POST cannot skip the warning.
 /// When the browser sent neither header, a GET whose `Accept` contains
-/// `text/html` is the fallback. `*/*` (curl) is not HTML.
+/// `text/html` is the fallback, and so is a non-GET form submission
+/// (`Accept` contains `text/html` and `Content-Type` is a form type).
+/// Browsers omit `Sec-Fetch-*` on plain HTTP. `*/*` (curl) and a JSON
+/// body are not navigations.
 pub fn is_browser_navigation(
     method: &str,
     accept: Option<&str>,
     sec_fetch_mode: Option<&str>,
     sec_fetch_dest: Option<&str>,
+    content_type: Option<&str>,
 ) -> bool {
     if sec_fetch_mode
         .map(str::trim)
@@ -972,8 +991,22 @@ pub fn is_browser_navigation(
     if sec_fetch_mode.is_some() || sec_fetch_dest.is_some() {
         return false;
     }
-    method.eq_ignore_ascii_case("GET")
-        && accept.is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+    let wants_html = accept.is_some_and(|value| value.to_ascii_lowercase().contains("text/html"));
+    if !wants_html {
+        return false;
+    }
+    method.eq_ignore_ascii_case("GET") || is_form_content_type(content_type)
+}
+
+/// HTML form encodings. The media type is the part before `;`.
+fn is_form_content_type(content_type: Option<&str>) -> bool {
+    let Some(value) = content_type else {
+        return false;
+    };
+    let media = value.split(';').next().unwrap_or(value).trim();
+    media.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        || media.eq_ignore_ascii_case("multipart/form-data")
+        || media.eq_ignore_ascii_case("text/plain")
 }
 
 pub fn warning_skipped(skip_header: Option<&str>, cookie: Option<&str>) -> bool {
@@ -1013,13 +1046,19 @@ pub fn without_warning_cookies(cookie: &str) -> Option<String> {
 }
 
 /// `true` when a `Set-Cookie` value mints a warning cookie.
+///
+/// A nameless cookie (`=__Host-rustunnel_warn_…`) counts too: some agents
+/// omit the name and put the warning cookie in the value.
 pub fn is_warning_set_cookie(value: &str) -> bool {
     let pair = value.split(';').next().unwrap_or(value).trim();
-    let name = pair
-        .split_once('=')
-        .map(|(name, _)| name.trim())
-        .unwrap_or(pair);
-    is_warning_cookie_name(name)
+    let (name, cookie_value) = match pair.split_once('=') {
+        Some((name, value)) => (name.trim(), value.trim()),
+        None => (pair, ""),
+    };
+    if is_warning_cookie_name(name) {
+        return true;
+    }
+    name.is_empty() && cookie_value.starts_with(WARNING_COOKIE_PREFIX)
 }
 
 fn cookie_value<'a>(cookie: Option<&'a str>, name: &str) -> Option<&'a str> {
@@ -1131,10 +1170,11 @@ fn safe_path(path: &str) -> &str {
     }
 }
 
-/// `https://<host><path>?<query>` for a plain-HTTP browser navigation.
+/// `https://<host>[:port]<path>?<query>` for a plain-HTTP browser navigation.
 ///
-/// The port is dropped: production HTTPS is 443, and a `:80` left on the
-/// host would send the browser back to plain HTTP. A host that is not a
+/// The incoming port is dropped so a `:80` host is not sent back to plain
+/// HTTP. The configured HTTPS port is included the same way as the generic
+/// plain-HTTP redirect, and omitted when it is 443. A host that is not a
 /// hostname, or a path that could leave this host, does not become a
 /// redirect.
 fn https_navigation(req: &IncomingRequest<'_>) -> Option<EdgeResponse> {
@@ -1146,15 +1186,20 @@ fn https_navigation(req: &IncomingRequest<'_>) -> Option<EdgeResponse> {
     {
         return None;
     }
+    let authority = if req.https_port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{}", req.https_port)
+    };
     let (path, query) = req
         .path_and_query
         .split_once('?')
         .unwrap_or((req.path_and_query, ""));
     let path = safe_path(path);
     let location = if query.is_empty() || query.chars().any(|c| c == '\r' || c == '\n') {
-        format!("https://{host}{path}")
+        format!("https://{authority}{path}")
     } else {
-        format!("https://{host}{path}?{query}")
+        format!("https://{authority}{path}?{query}")
     };
     Some(EdgeResponse {
         status: 307,
@@ -1208,6 +1253,7 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
             req.accept,
             req.sec_fetch_mode,
             req.sec_fetch_dest,
+            req.content_type,
         )
     {
         if let Some(redirect) = https_navigation(req) {
@@ -1231,6 +1277,7 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
             req.accept,
             req.sec_fetch_mode,
             req.sec_fetch_dest,
+            req.content_type,
         )
     {
         return EdgeAction::Respond(warning_page(req.host, req.path_and_query));
@@ -1245,6 +1292,7 @@ fn account_page(block: AuthBlock, req: &IncomingRequest<'_>) -> EdgeResponse {
         req.accept,
         req.sec_fetch_mode,
         req.sec_fetch_dest,
+        req.content_type,
     ) {
         let body = html_doc(
             "Tunnel unavailable",
@@ -1270,6 +1318,7 @@ fn bandwidth_page(plan: &PlanLimits, limit: i64, req: &IncomingRequest<'_>) -> E
         req.accept,
         req.sec_fetch_mode,
         req.sec_fetch_dest,
+        req.content_type,
     ) {
         let body = html_doc(
             "Bandwidth cap reached",
@@ -1904,9 +1953,11 @@ mod tests {
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
+            content_type: None,
             host,
             path_and_query: path,
             https: true,
+            https_port: 443,
         }
     }
 
@@ -1993,6 +2044,10 @@ mod tests {
             "__Host-rustunnel_warn_nonce=minted; Path=/"
         ));
         assert!(!is_warning_set_cookie("app_session=keep; Path=/"));
+        assert!(is_warning_set_cookie(
+            "=__Host-rustunnel_warn_ok=1; Path=/; Secure"
+        ));
+        assert!(!is_warning_set_cookie("=app_session=keep; Path=/"));
     }
 
     #[test]
@@ -2261,6 +2316,17 @@ mod tests {
             }
             EdgeAction::Proxy => panic!("expected the https redirect"),
         }
+        nav.https_port = 8443;
+        match edge_action(&agent, 0, &nav) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 307);
+                assert_eq!(
+                    page.location.as_deref(),
+                    Some("https://demo.example:8443/docs?x=1")
+                );
+            }
+            EdgeAction::Proxy => panic!("expected the https redirect"),
+        }
 
         let mut api = browser("demo.example", "/hook");
         api.https = false;
@@ -2278,6 +2344,38 @@ mod tests {
             edge_action(&view("human", false, "free"), 0, &human),
             EdgeAction::Proxy
         ));
+    }
+
+    #[test]
+    fn a_form_post_without_fetch_metadata_is_a_navigation() {
+        let agent = view("agent", false, "agent");
+        for content_type in [
+            "application/x-www-form-urlencoded",
+            "multipart/form-data; boundary=----x",
+            "text/plain;charset=UTF-8",
+        ] {
+            let mut post = browser("demo.example", "/submit");
+            post.https = false;
+            post.method = "POST";
+            post.sec_fetch_mode = None;
+            post.accept = Some("text/html");
+            post.content_type = Some(content_type);
+            match edge_action(&agent, 0, &post) {
+                EdgeAction::Respond(page) => assert_eq!(page.status, 307, "{content_type}"),
+                EdgeAction::Proxy => panic!("{content_type} skipped the warning"),
+            }
+        }
+
+        let mut json = browser("demo.example", "/");
+        json.https = false;
+        json.method = "POST";
+        json.sec_fetch_mode = None;
+        json.accept = Some("application/json");
+        json.content_type = Some("application/json");
+        assert!(
+            matches!(edge_action(&agent, 0, &json), EdgeAction::Proxy),
+            "a JSON webhook is proxied"
+        );
     }
 
     #[test]
@@ -2324,9 +2422,11 @@ mod tests {
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
+            content_type: None,
             host: "h.example",
             path_and_query: "/",
             https: false,
+            https_port: 443,
         };
         match edge_action(&account, AgentPlanLimits::BANDWIDTH_LIMIT_BYTES, &curl) {
             EdgeAction::Respond(page) => {
@@ -3000,9 +3100,11 @@ mod tests {
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
+            content_type: None,
             host: "h.example",
             path_and_query: "/",
             https: false,
+            https_port: 443,
         };
         match edge_action(&still_active, bytes, &curl) {
             EdgeAction::Respond(page) => {
