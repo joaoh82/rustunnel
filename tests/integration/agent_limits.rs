@@ -1254,6 +1254,55 @@ async fn warning_ack_is_not_an_open_redirect() {
     agent.cleanup().await;
 }
 
+#[tokio::test]
+async fn plain_http_navigation_redirects_to_https_and_other_requests_proxy() {
+    init_tracing();
+    let server = TestServer::start().await;
+    let (local, _shutdown) = hello().await;
+    let seed = Seed::create(&server.db.pg, "agent", "agent").await;
+    let mut client = TestClient::connect_with_token(&server, &seed.raw)
+        .await
+        .unwrap();
+    let session_id = client.session_id.unwrap();
+    let (_, subdomain, _) = client.register_http_tunnel(None).await.unwrap();
+    connect_data_bridge(&server, session_id, local)
+        .await
+        .expect("bridge");
+    let host = format!("{subdomain}.{}", server.domain);
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+
+    let nav = http
+        .get(format!("http://127.0.0.1:{}/docs?x=1", server.http_port))
+        .header("Host", &host)
+        .header("Accept", "text/html")
+        .header("Sec-Fetch-Mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nav.status(), 307);
+    assert_eq!(
+        nav.headers().get("location").unwrap().to_str().unwrap(),
+        format!("https://{host}/docs?x=1")
+    );
+
+    let hook = http
+        .post(format!("http://127.0.0.1:{}/", server.http_port))
+        .header("Host", &host)
+        .header("Accept", "*/*")
+        .body("signed")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hook.status(), 200, "a non-navigation stays on plain HTTP");
+    assert!(hook.headers().get("location").is_none());
+    assert_eq!(hook.text().await.unwrap(), "posted");
+    seed.cleanup().await;
+}
+
 fn location_leaves_host(location: &str) -> bool {
     let lower = location.to_ascii_lowercase();
     lower.starts_with("//")

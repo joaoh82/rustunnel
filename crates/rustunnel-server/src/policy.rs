@@ -920,6 +920,44 @@ fn safe_path(path: &str) -> &str {
     }
 }
 
+/// `https://<host><path>?<query>` for a plain-HTTP browser navigation.
+///
+/// The port is dropped: production HTTPS is 443, and a `:80` left on the
+/// host would send the browser back to plain HTTP. A host that is not a
+/// hostname, or a path that could leave this host, does not become a
+/// redirect.
+fn https_navigation(req: &IncomingRequest<'_>) -> Option<EdgeResponse> {
+    let host = req.host.split(':').next().unwrap_or(req.host);
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return None;
+    }
+    let (path, query) = req
+        .path_and_query
+        .split_once('?')
+        .unwrap_or((req.path_and_query, ""));
+    let path = safe_path(path);
+    let location = if query.is_empty() || query.chars().any(|c| c == '\r' || c == '\n') {
+        format!("https://{host}{path}")
+    } else {
+        format!("https://{host}{path}?{query}")
+    };
+    Some(EdgeResponse {
+        status: 307,
+        content_type: "text/plain; charset=utf-8",
+        body: String::new(),
+        set_cookie: None,
+        location: Some(location),
+        frame_options: None,
+        content_security_policy: None,
+        robots: Some("noindex"),
+        referrer_policy: Some("no-referrer"),
+    })
+}
+
 fn is_same_origin_path(path: &str) -> bool {
     let mut chars = path.chars();
     if chars.next() != Some('/') {
@@ -946,6 +984,17 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
             if month_bytes >= limit {
                 return EdgeAction::Respond(bandwidth_page(plan, limit, req));
             }
+        }
+    }
+    // `__Host-` cookies are dropped on plain HTTP, so a browser navigation
+    // of an unclaimed agent tunnel is sent to HTTPS before the warning.
+    // Webhooks and other non-navigations stay on HTTP and are proxied.
+    if unclaimed_agent_tunnel(view)
+        && !req.https
+        && is_browser_navigation(req.method, req.accept, req.sec_fetch_mode)
+    {
+        if let Some(redirect) = https_navigation(req) {
+            return EdgeAction::Respond(redirect);
         }
     }
     // The continue flag is handled only for GET on an unclaimed agent
@@ -1872,6 +1921,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kept.location.as_deref(), Some("/docs?x=1"));
+    }
+
+    #[test]
+    fn plain_http_navigation_is_sent_to_https_before_the_warning() {
+        let agent = view("agent", false, "agent");
+        let mut nav = browser("demo.example:80", "/docs?x=1");
+        nav.https = false;
+        match edge_action(&agent, 0, &nav) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 307);
+                assert_eq!(
+                    page.location.as_deref(),
+                    Some("https://demo.example/docs?x=1")
+                );
+                assert!(page.set_cookie.is_none());
+                assert_eq!(page.robots, Some("noindex"));
+            }
+            EdgeAction::Proxy => panic!("expected the https redirect"),
+        }
+
+        let mut api = browser("demo.example", "/hook");
+        api.https = false;
+        api.method = "POST";
+        api.accept = Some("*/*");
+        api.sec_fetch_mode = None;
+        assert!(
+            matches!(edge_action(&agent, 0, &api), EdgeAction::Proxy),
+            "a webhook stays on plain HTTP"
+        );
+
+        let mut human = browser("demo.example", "/");
+        human.https = false;
+        assert!(matches!(
+            edge_action(&view("human", false, "free"), 0, &human),
+            EdgeAction::Proxy
+        ));
     }
 
     #[test]
