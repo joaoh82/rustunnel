@@ -1297,7 +1297,7 @@ async fn plain_http_navigation_redirects_to_https_and_other_requests_proxy() {
     assert_eq!(nav.status(), 307);
     assert_eq!(
         nav.headers().get("location").unwrap().to_str().unwrap(),
-        format!("https://{host}/docs?x=1")
+        format!("{}/docs?x=1", https_origin(&host, server.https_port))
     );
 
     let hook = http
@@ -1347,7 +1347,7 @@ async fn plain_http_form_post_is_sent_to_https() {
     assert_eq!(form.status(), 307);
     assert_eq!(
         form.headers().get("location").unwrap().to_str().unwrap(),
-        format!("https://{host}/submit")
+        format!("{}/submit", https_origin(&host, server.https_port))
     );
     seed.cleanup().await;
 }
@@ -1503,6 +1503,14 @@ async fn concurrent_registrations_allow_exactly_one_tunnel() {
     assert_eq!(allowed, 1, "{results:?}");
     assert_eq!(limited, 1, "{results:?}");
     seed.cleanup().await;
+}
+
+fn https_origin(host: &str, https_port: u16) -> String {
+    if https_port == 443 {
+        format!("https://{host}")
+    } else {
+        format!("https://{host}:{https_port}")
+    }
 }
 
 fn location_leaves_host(location: &str) -> bool {

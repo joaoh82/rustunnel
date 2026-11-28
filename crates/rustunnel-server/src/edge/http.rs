@@ -973,6 +973,7 @@ async fn account_guard(
             host,
             path_and_query,
             https: scheme == ForwardScheme::Https,
+            https_port: ctx.https_port,
         },
     );
     match action {

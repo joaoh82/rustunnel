@@ -219,6 +219,8 @@ pub struct IncomingRequest<'a> {
     pub path_and_query: &'a str,
     /// Public scheme of the request.
     pub https: bool,
+    /// HTTPS listener port. The plain-HTTP upgrade omits it when it is 443.
+    pub https_port: u16,
 }
 
 struct CachedView {
@@ -1152,10 +1154,11 @@ fn safe_path(path: &str) -> &str {
     }
 }
 
-/// `https://<host><path>?<query>` for a plain-HTTP browser navigation.
+/// `https://<host>[:port]<path>?<query>` for a plain-HTTP browser navigation.
 ///
-/// The port is dropped: production HTTPS is 443, and a `:80` left on the
-/// host would send the browser back to plain HTTP. A host that is not a
+/// The incoming port is dropped so a `:80` host is not sent back to plain
+/// HTTP. The configured HTTPS port is included the same way as the generic
+/// plain-HTTP redirect, and omitted when it is 443. A host that is not a
 /// hostname, or a path that could leave this host, does not become a
 /// redirect.
 fn https_navigation(req: &IncomingRequest<'_>) -> Option<EdgeResponse> {
@@ -1167,15 +1170,20 @@ fn https_navigation(req: &IncomingRequest<'_>) -> Option<EdgeResponse> {
     {
         return None;
     }
+    let authority = if req.https_port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{}", req.https_port)
+    };
     let (path, query) = req
         .path_and_query
         .split_once('?')
         .unwrap_or((req.path_and_query, ""));
     let path = safe_path(path);
     let location = if query.is_empty() || query.chars().any(|c| c == '\r' || c == '\n') {
-        format!("https://{host}{path}")
+        format!("https://{authority}{path}")
     } else {
-        format!("https://{host}{path}?{query}")
+        format!("https://{authority}{path}?{query}")
     };
     Some(EdgeResponse {
         status: 307,
@@ -1933,6 +1941,7 @@ mod tests {
             host,
             path_and_query: path,
             https: true,
+            https_port: 443,
         }
     }
 
@@ -2287,6 +2296,17 @@ mod tests {
             }
             EdgeAction::Proxy => panic!("expected the https redirect"),
         }
+        nav.https_port = 8443;
+        match edge_action(&agent, 0, &nav) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 307);
+                assert_eq!(
+                    page.location.as_deref(),
+                    Some("https://demo.example:8443/docs?x=1")
+                );
+            }
+            EdgeAction::Proxy => panic!("expected the https redirect"),
+        }
 
         let mut api = browser("demo.example", "/hook");
         api.https = false;
@@ -2386,6 +2406,7 @@ mod tests {
             host: "h.example",
             path_and_query: "/",
             https: false,
+            https_port: 443,
         };
         match edge_action(&account, AgentPlanLimits::BANDWIDTH_LIMIT_BYTES, &curl) {
             EdgeAction::Respond(page) => {
@@ -3063,6 +3084,7 @@ mod tests {
             host: "h.example",
             path_and_query: "/",
             https: false,
+            https_port: 443,
         };
         match edge_action(&still_active, bytes, &curl) {
             EdgeAction::Respond(page) => {
