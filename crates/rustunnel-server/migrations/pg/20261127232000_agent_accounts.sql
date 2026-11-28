@@ -1,3 +1,12 @@
+-- The edge runs this file at startup. sqlx 0.8 wraps it in one transaction
+-- unless the file starts with `-- no-transaction`
+-- (sqlx-core migrate/source.rs). This file does not, so SET LOCAL lasts
+-- for every statement below and ends when that transaction commits.
+-- ALTER on users or tokens takes ACCESS EXCLUSIVE. A waiter in that lock
+-- queue blocks every token lookup. Five seconds fails the migration
+-- instead of holding the queue open.
+SET LOCAL lock_timeout = '5s';
+
 -- Agent-native accounts (signup ticket 1, database half).
 --
 -- Version 20261127232000 is a timestamp after 20261103143000, the newest

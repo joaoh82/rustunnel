@@ -34,7 +34,19 @@ async fn migration_is_idempotent_and_records_its_version() {
     let pool = pool().await;
     assert!(
         !MIGRATION_SQL.starts_with("-- no-transaction"),
-        "the file must stay inside sqlx's transaction"
+        "the file must stay inside sqlx's transaction so SET LOCAL applies"
+    );
+    let first_sql = MIGRATION_SQL
+        .lines()
+        .find(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("--")
+        })
+        .expect("migration has a statement");
+    assert_eq!(
+        first_sql.trim(),
+        "SET LOCAL lock_timeout = '5s';",
+        "lock_timeout must be the first statement so it covers every ALTER"
     );
     // Comments document the absence of these statements. Only the SQL counts.
     let sql_only = MIGRATION_SQL
@@ -68,6 +80,20 @@ async fn migration_is_idempotent_and_records_its_version() {
         .execute(&pool)
         .await
         .expect("replay twice");
+
+    // sqlx::migrate! runs this file on a transaction (no `-- no-transaction`
+    // opt-out). SET LOCAL must still be in force after the last statement.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::raw_sql(MIGRATION_SQL)
+        .execute(&mut *tx)
+        .await
+        .expect("migration runs inside a transaction");
+    let (lock_timeout,): (String,) = sqlx::query_as("SHOW lock_timeout")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("show lock_timeout");
+    assert_eq!(lock_timeout, "5s");
+    tx.rollback().await.expect("rollback");
 }
 
 #[tokio::test]
