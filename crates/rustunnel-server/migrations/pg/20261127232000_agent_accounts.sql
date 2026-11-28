@@ -201,8 +201,9 @@ INSERT INTO plans (
     true,
     250000000
 )
--- A replay rewrites the agent row, including bandwidth_limit_bytes, so
--- an earlier 262144000 (binary MiB) becomes 250000000.
+-- ON CONFLICT DO UPDATE resets this row to the canonical values on every
+-- replay. That overwrites a manual admin edit of the agent plan. It is
+-- intentional: the advertised limits live in this file.
 ON CONFLICT (name) DO UPDATE SET
     billing_model = EXCLUDED.billing_model,
     monthly_price_cents = EXCLUDED.monthly_price_cents,
