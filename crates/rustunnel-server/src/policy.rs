@@ -167,6 +167,11 @@ pub struct EdgeResponse {
     pub body: String,
     pub set_cookie: Option<String>,
     pub location: Option<String>,
+    /// `DENY` on HTML pages so the warning cannot be framed.
+    pub frame_options: Option<&'static str>,
+    /// `default-src 'none'` plus a hash of the inline style, and
+    /// `frame-ancestors 'none'`.
+    pub content_security_policy: Option<&'static str>,
 }
 
 /// Headers the edge already pulled off the public request.
@@ -473,6 +478,28 @@ fn hard_cap_limit(plan: &PlanLimits) -> Option<i64> {
     }
 }
 
+/// Which open `tunnel_log` rows count toward `max_tunnels`.
+///
+/// [`TunnelCountScope::all`] counts every open row. A registration passes
+/// the reconnecting token, its new session, and this edge's region so a
+/// dead or superseded session of that same token is left out.
+pub struct TunnelCountScope<'a> {
+    pub token_id: Option<&'a str>,
+    pub session_id: Uuid,
+    pub region_id: &'a str,
+}
+
+impl TunnelCountScope<'static> {
+    /// Count every open row. Callers with no token use this.
+    pub fn all() -> Self {
+        Self {
+            token_id: None,
+            session_id: Uuid::nil(),
+            region_id: "",
+        }
+    }
+}
+
 /// Load the active plan and apply [`plan_registration_denial`].
 ///
 /// No active subscription means no plan gate (admin, legacy, and direct
@@ -484,6 +511,7 @@ pub async fn evaluate_plan_registration(
     protocol: &str,
     requested_subdomain: Option<&str>,
     core: &TunnelCore,
+    scope: TunnelCountScope<'_>,
 ) -> Result<Option<RegistrationDenial>> {
     let Some(view) = load_account(pool, user_id).await? else {
         return Ok(None);
@@ -503,7 +531,7 @@ pub async fn evaluate_plan_registration(
     let open_tunnels = if hobby || plan.max_tunnels.is_none() {
         0
     } else {
-        count_open_tunnels(pool, user_id).await?
+        count_open_tunnels(pool, user_id, core, scope).await?
     };
     let month_bytes = if hard_cap_limit(&plan).is_some() {
         // The open row stays at 0 until the meter flush or close. Add the
@@ -522,15 +550,70 @@ pub async fn evaluate_plan_registration(
     ))
 }
 
-async fn count_open_tunnels(pool: &PgPool, user_id: Uuid) -> Result<i64> {
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM tunnel_log \
+#[derive(sqlx::FromRow)]
+struct OpenTunnelRow {
+    session_id: String,
+    token_id: Option<String>,
+    region_id: Option<String>,
+}
+
+async fn count_open_tunnels(
+    pool: &PgPool,
+    user_id: Uuid,
+    core: &TunnelCore,
+    scope: TunnelCountScope<'_>,
+) -> Result<i64> {
+    let rows: Vec<OpenTunnelRow> = sqlx::query_as(
+        "SELECT session_id, token_id, region_id FROM tunnel_log \
          WHERE user_id = $1 AND unregistered_at IS NULL",
     )
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(count)
+    let Some(token_id) = scope.token_id else {
+        return Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX));
+    };
+    let current = scope.session_id.to_string();
+    let mut live = std::collections::HashSet::new();
+    let mut superseded = std::collections::HashSet::new();
+    for entry in core.sessions.iter() {
+        let id = entry.key().to_string();
+        if entry.db_token_id.as_deref() == Some(token_id) && id != current {
+            superseded.insert(id.clone());
+        }
+        live.insert(id);
+    }
+    let count = rows
+        .iter()
+        .filter(|row| {
+            counts_toward_tunnel_limit(row, token_id, &current, scope.region_id, &live, &superseded)
+        })
+        .count();
+    Ok(i64::try_from(count).unwrap_or(i64::MAX))
+}
+
+/// A row counts unless it is this token's superseded session, or this
+/// token's row on this region whose session is already gone.
+///
+/// Another token still counts. The same token on another region still
+/// counts: that session is live somewhere else, not dead on this edge.
+fn counts_toward_tunnel_limit(
+    row: &OpenTunnelRow,
+    token_id: &str,
+    current_session: &str,
+    region_id: &str,
+    live: &std::collections::HashSet<String>,
+    superseded: &std::collections::HashSet<String>,
+) -> bool {
+    if row.token_id.as_deref() != Some(token_id) || row.session_id == current_session {
+        return true;
+    }
+    if superseded.contains(&row.session_id) {
+        return false;
+    }
+    let dead_on_this_region =
+        row.region_id.as_deref() == Some(region_id) && !live.contains(&row.session_id);
+    !dead_on_this_region
 }
 
 #[derive(sqlx::FromRow)]
@@ -644,6 +727,8 @@ pub fn warning_acknowledgement(path_and_query: &str, https: bool) -> Option<Edge
         body: String::new(),
         set_cookie: Some(warning_cookie(https)),
         location: Some(location),
+        frame_options: None,
+        content_security_policy: None,
     })
 }
 
@@ -822,6 +907,8 @@ fn html_response(status: u16, body: String) -> EdgeResponse {
         body,
         set_cookie: None,
         location: None,
+        frame_options: Some("DENY"),
+        content_security_policy: Some(content_security_policy()),
     }
 }
 
@@ -832,7 +919,61 @@ fn json_response(status: u16, error_code: &str, message: &str) -> EdgeResponse {
         body: json!({ "code": error_code, "error": message }).to_string(),
         set_cookie: None,
         location: None,
+        frame_options: None,
+        content_security_policy: None,
     }
+}
+
+/// Inline stylesheet. The CSP hash is the SHA-256 of these exact bytes.
+const PAGE_STYLE: &str = "body{font-family:sans-serif;background:#fff;color:#1a1a1a;margin:0}\
+main{max-width:36rem;margin:4rem auto;padding:0 1.25rem}\
+h1{font-size:1.4rem}\
+.host{font-family:ui-monospace,monospace;background:#f4f4f4;padding:0.15rem 0.4rem}\
+.continue{display:inline-block;margin-top:0.5rem;background:#111;color:#fff;padding:0.6rem 1rem;text-decoration:none;border-radius:4px}\
+.warn{border-left:4px solid #b45309;padding-left:0.75rem}";
+
+fn content_security_policy() -> &'static str {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(PAGE_STYLE.as_bytes());
+        format!(
+            "default-src 'none'; style-src 'sha256-{}'; frame-ancestors 'none'",
+            base64_encode(&digest)
+        )
+    })
+    .as_str()
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n =
+            (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push(TABLE[(n & 63) as usize] as char);
+        i += 3;
+    }
+    if i < bytes.len() {
+        let mut n = u32::from(bytes[i]) << 16;
+        if i + 1 < bytes.len() {
+            n |= u32::from(bytes[i + 1]) << 8;
+        }
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if i + 1 < bytes.len() {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        } else {
+            out.push('=');
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn html_doc(title: &str, main: &str) -> String {
@@ -843,15 +984,7 @@ fn html_doc(title: &str, main: &str) -> String {
          <meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{}</title>\
-         <style>\
-         body{{font-family:sans-serif;background:#fff;color:#1a1a1a;margin:0}}\
-         main{{max-width:36rem;margin:4rem auto;padding:0 1.25rem}}\
-         h1{{font-size:1.4rem}}\
-         .host{{font-family:ui-monospace,monospace;background:#f4f4f4;padding:0.15rem 0.4rem}}\
-         .continue{{display:inline-block;margin-top:0.5rem;background:#111;color:#fff;\
-           padding:0.6rem 1rem;text-decoration:none;border-radius:4px}}\
-         .warn{{border-left:4px solid #b45309;padding-left:0.75rem}}\
-         </style>\
+         <style>{PAGE_STYLE}</style>\
          </head>\
          <body><main>{main}</main></body></html>",
         escape_html(title)
@@ -1368,6 +1501,30 @@ mod tests {
     }
 
     #[test]
+    fn warning_page_cannot_be_framed() {
+        use sha2::{Digest, Sha256};
+
+        match edge_action(
+            &view("agent", false, "agent"),
+            0,
+            &browser("h.example", "/"),
+        ) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.frame_options, Some("DENY"));
+                let csp = page.content_security_policy.unwrap();
+                assert!(csp.starts_with("default-src 'none'"));
+                assert!(csp.contains("frame-ancestors 'none'"));
+                assert!(!csp.contains("unsafe-inline"));
+                let digest = Sha256::digest(PAGE_STYLE.as_bytes());
+                let hash = format!("sha256-{}", base64_encode(&digest));
+                assert!(csp.contains(&hash), "{csp}");
+                assert!(page.body.contains(&format!("<style>{PAGE_STYLE}</style>")));
+            }
+            EdgeAction::Proxy => panic!("expected the warning"),
+        }
+    }
+
+    #[test]
     fn continue_sets_a_host_scoped_cookie_and_strips_only_the_ack() {
         let ack = warning_acknowledgement("/docs?x=1&rustunnel_warn_continue=1", true).unwrap();
         assert_eq!(ack.status, 303);
@@ -1567,19 +1724,40 @@ mod tests {
         let pool = pool().await;
         let core = idle_core();
         let fixture = Fixture::insert(&pool, "agent", "agent", false, "active").await;
-        let none = evaluate_plan_registration(&pool, fixture.user_id, "http", None, &core)
-            .await
-            .unwrap();
+        let none = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "http",
+            None,
+            &core,
+            TunnelCountScope::all(),
+        )
+        .await
+        .unwrap();
         assert!(none.is_none());
-        let tcp = evaluate_plan_registration(&pool, fixture.user_id, "tcp", Some("name"), &core)
-            .await
-            .unwrap()
-            .unwrap();
+        let tcp = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "tcp",
+            Some("name"),
+            &core,
+            TunnelCountScope::all(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(tcp.code, code::PROTOCOL_NOT_ALLOWED);
-        let sub = evaluate_plan_registration(&pool, fixture.user_id, "http", Some("myapp"), &core)
-            .await
-            .unwrap()
-            .unwrap();
+        let sub = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "http",
+            Some("myapp"),
+            &core,
+            TunnelCountScope::all(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(sub.code, code::CUSTOM_SUBDOMAIN_NOT_ALLOWED);
 
         let tunnel_id = Uuid::new_v4().to_string();
@@ -1597,10 +1775,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = evaluate_plan_registration(&pool, fixture.user_id, "https", None, &core)
-            .await
-            .unwrap()
-            .unwrap();
+        let second = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "https",
+            None,
+            &core,
+            TunnelCountScope::all(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(second.code, code::TUNNEL_LIMIT);
 
         sqlx::query(
@@ -1614,12 +1799,170 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let capped = evaluate_plan_registration(&pool, fixture.user_id, "http", None, &core)
-            .await
-            .unwrap()
-            .unwrap();
+        let capped = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "http",
+            None,
+            &core,
+            TunnelCountScope::all(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(capped.code, code::BANDWIDTH_CAP_REACHED);
         fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_ignores_the_same_tokens_dead_or_superseded_session() {
+        let pool = pool().await;
+        let fixture = Fixture::insert(&pool, "agent", "agent", false, "active").await;
+        let token_id = Uuid::new_v4().to_string();
+        let other_token = Uuid::new_v4().to_string();
+        for id in [&token_id, &other_token] {
+            sqlx::query(
+                "INSERT INTO tokens (id, token_hash, label, created_at, user_id, status) \
+                 VALUES ($1, $2, 't', NOW(), $3, 'active')",
+            )
+            .bind(id)
+            .bind(format!("hash-{id}"))
+            .bind(fixture.user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let core = idle_core();
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+        let old_session = core.register_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "old".into(),
+            Some(token_id.clone()),
+            Some(fixture.user_id),
+            old_tx,
+        );
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
+        let new_session = core.register_session(
+            "127.0.0.1:10".parse().unwrap(),
+            "new".into(),
+            Some(token_id.clone()),
+            Some(fixture.user_id),
+            new_tx,
+        );
+        open_row(
+            &pool,
+            fixture.user_id,
+            &old_session,
+            Some(&token_id),
+            "test",
+        )
+        .await;
+
+        let scope = TunnelCountScope {
+            token_id: Some(&token_id),
+            session_id: new_session,
+            region_id: "test",
+        };
+        let superseded =
+            evaluate_plan_registration(&pool, fixture.user_id, "http", None, &core, scope)
+                .await
+                .unwrap();
+        assert!(
+            superseded.is_none(),
+            "the still-connected old session must not count"
+        );
+
+        core.remove_session(&old_session);
+        let dead = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "http",
+            None,
+            &core,
+            TunnelCountScope {
+                token_id: Some(&token_id),
+                session_id: new_session,
+                region_id: "test",
+            },
+        )
+        .await
+        .unwrap();
+        assert!(dead.is_none(), "a dead row on this region must not count");
+
+        let elsewhere = Uuid::new_v4();
+        open_row(&pool, fixture.user_id, &elsewhere, Some(&token_id), "eu").await;
+        let other_region = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "http",
+            None,
+            &core,
+            TunnelCountScope {
+                token_id: Some(&token_id),
+                session_id: new_session,
+                region_id: "test",
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(other_region.code, code::TUNNEL_LIMIT);
+        sqlx::query("DELETE FROM tunnel_log WHERE session_id = $1")
+            .bind(elsewhere.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let other_session = Uuid::new_v4();
+        open_row(
+            &pool,
+            fixture.user_id,
+            &other_session,
+            Some(&other_token),
+            "test",
+        )
+        .await;
+        let other = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "http",
+            None,
+            &core,
+            TunnelCountScope {
+                token_id: Some(&token_id),
+                session_id: new_session,
+                region_id: "test",
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(other.code, code::TUNNEL_LIMIT);
+        fixture.cleanup().await;
+    }
+
+    async fn open_row(
+        pool: &PgPool,
+        user_id: Uuid,
+        session_id: &Uuid,
+        token_id: Option<&str>,
+        region_id: &str,
+    ) {
+        let tunnel_id = Uuid::new_v4().to_string();
+        crate::db::log_tunnel_registered(
+            pool,
+            crate::db::TunnelRegistration {
+                tunnel_id: &tunnel_id,
+                protocol: "http",
+                label: "abcd1234",
+                session_id: &session_id.to_string(),
+                token_id,
+                region_id,
+                user_id: Some(user_id),
+            },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1817,9 +2160,16 @@ mod tests {
         assert!(gate.view(uncached_id).await.is_err());
         assert!(gate.month_bytes(uncached_id, &core).await.is_err());
         assert!(
-            evaluate_plan_registration(&pool, capped_id, "http", None, &core)
-                .await
-                .is_err(),
+            evaluate_plan_registration(
+                &pool,
+                capped_id,
+                "http",
+                None,
+                &core,
+                TunnelCountScope::all()
+            )
+            .await
+            .is_err(),
             "registration stays fail-closed"
         );
         let token = crate::db::models::Token {
@@ -1920,10 +2270,16 @@ mod tests {
         let pool = pool().await;
         let core = idle_core();
         let fixture = Fixture::insert(&pool, "human", "free", false, "active").await;
-        let denial =
-            evaluate_plan_registration(&pool, fixture.user_id, "tcp", Some("myapp"), &core)
-                .await
-                .unwrap();
+        let denial = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "tcp",
+            Some("myapp"),
+            &core,
+            TunnelCountScope::all(),
+        )
+        .await
+        .unwrap();
         assert!(denial.is_none());
         fixture.cleanup().await;
     }

@@ -642,15 +642,39 @@ where
                             );
                             registration_notice = Some(warning.message(surface));
                         }
-                        if let Some(denial) = crate::policy::evaluate_plan_registration(
+                        let denial = match crate::policy::evaluate_plan_registration(
                             &db.pg,
                             user_id,
                             crate::policy::protocol_name(&protocol),
                             subdomain.as_deref(),
                             core,
+                            crate::policy::TunnelCountScope {
+                                token_id: db_token_id.as_deref(),
+                                session_id,
+                                region_id: &config.region.id,
+                            },
                         )
-                        .await?
+                        .await
                         {
+                            Ok(denial) => denial,
+                            Err(e) => {
+                                // The tunnel is refused, and the websocket stays
+                                // up. Dropping the session here made a database
+                                // blip look like a disconnect.
+                                tracing::warn!(
+                                    error = %e,
+                                    %session_id,
+                                    "plan registration check failed"
+                                );
+                                send_frame(
+                                    ws,
+                                    &tunnel_error(request_id, "tunnel registration failed", None),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                        };
+                        if let Some(denial) = denial {
                             send_frame(
                                 ws,
                                 &tunnel_error(request_id, denial.message, Some(denial.code)),
