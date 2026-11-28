@@ -81,6 +81,9 @@ pub const WARNING_NONCE_COOKIE: &str = "__Host-rustunnel_warn_nonce";
 /// `__Host-` cookie set once the nonce matches. The browser stores it for
 /// the tunnel host, so a visitor is not warned again on that host for this long.
 pub const WARNING_COOKIE_NAME: &str = "__Host-rustunnel_warn_ok";
+/// Prefix of every warning cookie. Proxied agent tunnels cannot set or
+/// observe these; the edge strips them in both directions.
+pub const WARNING_COOKIE_PREFIX: &str = "__Host-rustunnel_warn_";
 pub const WARNING_COOKIE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// Query flag the Continue link uses. Its value is the nonce from
 /// [`WARNING_NONCE_COOKIE`]. The edge answers it itself and does not
@@ -827,6 +830,44 @@ pub fn warning_skipped(skip_header: Option<&str>, cookie: Option<&str>) -> bool 
 
 pub fn cookie_has_warning_ack(cookie: Option<&str>) -> bool {
     cookie_value(cookie, WARNING_COOKIE_NAME) == Some("1")
+}
+
+pub fn is_warning_cookie_name(name: &str) -> bool {
+    name.trim().starts_with(WARNING_COOKIE_PREFIX)
+}
+
+/// `Cookie` header with every warning cookie removed. `None` when the
+/// header would be empty.
+pub fn without_warning_cookies(cookie: &str) -> Option<String> {
+    let kept: Vec<&str> = cookie
+        .split(';')
+        .map(str::trim)
+        .filter(|part| {
+            if part.is_empty() {
+                return false;
+            }
+            let name = part
+                .split_once('=')
+                .map(|(name, _)| name.trim())
+                .unwrap_or(part);
+            !is_warning_cookie_name(name)
+        })
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join("; "))
+    }
+}
+
+/// `true` when a `Set-Cookie` value mints a warning cookie.
+pub fn is_warning_set_cookie(value: &str) -> bool {
+    let pair = value.split(';').next().unwrap_or(value).trim();
+    let name = pair
+        .split_once('=')
+        .map(|(name, _)| name.trim())
+        .unwrap_or(pair);
+    is_warning_cookie_name(name)
 }
 
 fn cookie_value<'a>(cookie: Option<&'a str>, name: &str) -> Option<&'a str> {
@@ -1766,6 +1807,26 @@ mod tests {
         let mut acked = browser("h.example", "/");
         acked.cookie = Some("other=1; __Host-rustunnel_warn_ok=1");
         assert!(matches!(edge_action(&agent, 0, &acked), EdgeAction::Proxy));
+    }
+
+    #[test]
+    fn warning_cookies_are_stripped_in_both_directions() {
+        assert_eq!(
+            without_warning_cookies(
+                "__Host-rustunnel_warn_ok=1; visitor=1; __Host-rustunnel_warn_nonce=abc"
+            )
+            .as_deref(),
+            Some("visitor=1")
+        );
+        assert!(without_warning_cookies("__Host-rustunnel_warn_ok=1").is_none());
+        assert!(without_warning_cookies("").is_none());
+        assert!(is_warning_set_cookie(
+            "__Host-rustunnel_warn_ok=1; Path=/; Secure"
+        ));
+        assert!(is_warning_set_cookie(
+            "__Host-rustunnel_warn_nonce=minted; Path=/"
+        ));
+        assert!(!is_warning_set_cookie("app_session=keep; Path=/"));
     }
 
     #[test]

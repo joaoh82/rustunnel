@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use axum::http::HeaderMap;
 use axum::{routing::get, routing::post, Router};
 use common::*;
 use rustunnel_protocol::{ControlFrame, TunnelProtocol};
@@ -1300,6 +1301,93 @@ async fn plain_http_navigation_redirects_to_https_and_other_requests_proxy() {
     assert_eq!(hook.status(), 200, "a non-navigation stays on plain HTTP");
     assert!(hook.headers().get("location").is_none());
     assert_eq!(hook.text().await.unwrap(), "posted");
+    seed.cleanup().await;
+}
+
+#[tokio::test]
+async fn agent_tunnels_cannot_mint_or_see_warning_cookies() {
+    init_tracing();
+    let server = TestServer::start().await;
+    let app = Router::new().route(
+        "/",
+        get(|headers: HeaderMap| async move {
+            let cookie = headers
+                .get("cookie")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            axum::response::Response::builder()
+                .header("set-cookie", "__Host-rustunnel_warn_ok=1; Path=/; Secure")
+                .header(
+                    "set-cookie",
+                    "__Host-rustunnel_warn_nonce=minted; Path=/; Secure",
+                )
+                .header("set-cookie", "app_session=keep; Path=/")
+                .header("x-got-cookie", cookie)
+                .body(axum::body::Body::from("ok"))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let seed = Seed::create(&server.db.pg, "agent", "agent").await;
+    let mut client = TestClient::connect_with_token(&server, &seed.raw)
+        .await
+        .unwrap();
+    let session_id = client.session_id.unwrap();
+    let (_, subdomain, _) = client.register_http_tunnel(None).await.unwrap();
+    connect_data_bridge(&server, session_id, local)
+        .await
+        .expect("bridge");
+    let host = format!("{subdomain}.{}", server.domain);
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+    let response = http
+        .get(format!("https://127.0.0.1:{}/", server.https_port))
+        .header("Host", &host)
+        .header("Accept", "*/*")
+        .header(
+            "Cookie",
+            "__Host-rustunnel_warn_ok=1; visitor=1; __Host-rustunnel_warn_nonce=abc",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let got = response
+        .headers()
+        .get("x-got-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(got, "visitor=1");
+    let set_cookies: Vec<_> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        set_cookies
+            .iter()
+            .any(|value| value.starts_with("app_session=")),
+        "{set_cookies:?}"
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .all(|value| !value.starts_with("__Host-rustunnel_warn_")),
+        "{set_cookies:?}"
+    );
+    assert_eq!(response.text().await.unwrap(), "ok");
     seed.cleanup().await;
 }
 

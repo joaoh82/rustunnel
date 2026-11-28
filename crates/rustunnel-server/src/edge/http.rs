@@ -405,9 +405,11 @@ async fn proxy_request(
     // ── 2b2. Plan cap, ban, and the unclaimed-agent warning ──────────────
     // Before a stream is opened, so a blocked request never reaches the
     // local service. The acknowledgement redirect is answered here too.
-    if let Some(response) = account_guard(&ctx, &req, &tunnel_info, scheme).await {
+    let guard = account_guard(&ctx, &req, &tunnel_info, scheme).await;
+    if let Some(response) = guard.response {
         return response;
     }
+    let strip_warning_cookies = guard.strip_warning_cookies;
 
     // ── 2c. Concurrent connection limit ──────────────────────────────────
     let _permit = match tunnel_info.conn_semaphore.clone().try_acquire_owned() {
@@ -500,6 +502,7 @@ async fn proxy_request(
                 path,
                 request_bytes,
                 start,
+                strip_warning_cookies,
             },
         ),
     )
@@ -619,6 +622,7 @@ struct HttpCaptureCtx {
     path: String,
     request_bytes: u64,
     start: Instant,
+    strip_warning_cookies: bool,
 }
 
 /// RAII guard that emits the capture event when dropped.
@@ -692,6 +696,9 @@ where
     // Strip hop-by-hop headers before forwarding upstream.
     let (mut parts, body) = req.into_parts();
     remove_hop_by_hop(&mut parts.headers);
+    if capture.strip_warning_cookies {
+        strip_request_warning_cookies(&mut parts.headers);
+    }
     set_forwarded_headers(&mut parts.headers, peer, scheme, original_host);
     let fwd_req = Request::from_parts(parts, body);
 
@@ -700,6 +707,9 @@ where
     let (mut resp_parts, resp_body) = upstream.into_parts();
     let status = resp_parts.status.as_u16();
     remove_hop_by_hop(&mut resp_parts.headers);
+    if capture.strip_warning_cookies {
+        strip_response_warning_cookies(&mut resp_parts.headers);
+    }
 
     // Shared counter incremented per body frame; read by CaptureGuard on drop.
     let rsp_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -890,12 +900,22 @@ fn header_str<'a>(req: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
     req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
+struct AccountGuard {
+    response: Option<Response<BoxBody>>,
+    /// Agent tunnels must not see or mint the warning cookies.
+    strip_warning_cookies: bool,
+}
+
 async fn account_guard(
     ctx: &ProxyCtx,
     req: &Request<Incoming>,
     tunnel: &crate::core::TunnelInfo,
     scheme: ForwardScheme,
-) -> Option<Response<BoxBody>> {
+) -> AccountGuard {
+    let allow = |strip_warning_cookies| AccountGuard {
+        response: None,
+        strip_warning_cookies,
+    };
     let path_and_query = req
         .uri()
         .path_and_query()
@@ -906,15 +926,18 @@ async fn account_guard(
         .sessions
         .get(&tunnel.session_id)
         .and_then(|session| session.user_id);
-    let user_id = user_id?;
+    let Some(user_id) = user_id else {
+        return allow(false);
+    };
     let view = match ctx.account_gate.view(user_id).await {
         Ok(Some(view)) => view,
-        Ok(None) => return None,
+        Ok(None) => return allow(false),
         Err(e) => {
             warn!(error = %e, %user_id, "account lookup failed with no cache; proxying");
-            return None;
+            return allow(false);
         }
     };
+    let strip_warning_cookies = view.kind == "agent";
     let month_bytes = if view
         .plan
         .as_ref()
@@ -952,8 +975,48 @@ async fn account_guard(
         },
     );
     match action {
-        EdgeAction::Proxy => None,
-        EdgeAction::Respond(response) => Some(edge_response(response)),
+        EdgeAction::Proxy => allow(strip_warning_cookies),
+        EdgeAction::Respond(response) => AccountGuard {
+            response: Some(edge_response(response)),
+            strip_warning_cookies,
+        },
+    }
+}
+
+fn strip_request_warning_cookies(headers: &mut hyper::HeaderMap) {
+    let Some(raw) = headers.get("cookie").and_then(|value| value.to_str().ok()) else {
+        return;
+    };
+    let raw = raw.to_string();
+    match policy::without_warning_cookies(&raw) {
+        Some(kept) => {
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&kept) {
+                headers.insert("cookie", value);
+            }
+        }
+        None => {
+            headers.remove("cookie");
+        }
+    }
+}
+
+fn strip_response_warning_cookies(headers: &mut hyper::HeaderMap) {
+    let kept: Vec<hyper::header::HeaderValue> = headers
+        .get_all("set-cookie")
+        .iter()
+        .filter(|value| match value.to_str() {
+            Ok(text) => !policy::is_warning_set_cookie(text),
+            Err(_) => true,
+        })
+        .cloned()
+        .collect();
+    let present = headers.get_all("set-cookie").iter().count();
+    if kept.len() == present {
+        return;
+    }
+    headers.remove("set-cookie");
+    for value in kept {
+        headers.append("set-cookie", value);
     }
 }
 
@@ -1235,6 +1298,7 @@ mod tests {
                             path: "/hook".into(),
                             request_bytes: 0,
                             start: Instant::now(),
+                            strip_warning_cookies: false,
                         },
                     )
                     .await
@@ -1449,6 +1513,7 @@ hello\r\n\
                             path: "/hook".into(),
                             request_bytes: 0,
                             start: Instant::now(),
+                            strip_warning_cookies: false,
                         },
                     )
                     .await
