@@ -35,12 +35,24 @@
 //! WebSocket upgrade
 //! ──────────────────
 //! Detected via `Upgrade: websocket`; after the 101 response the upgraded
-//! connection is bridged to the yamux stream via copy_bidirectional.
+//! connection is bridged to the yamux stream via copy_bidirectional. The
+//! 101 headers go through the same `Set-Cookie` domain filter as a proxied
+//! HTTP response.
+//!
+//! Upstream cookies
+//! ────────────────
+//! On a tunnel whose host is `rustunnel.com` or a subdomain of it, a proxied
+//! `Set-Cookie` is dropped when its `Domain` is anything other than that
+//! exact host. That stops the tunnel's own app from planting a cookie on
+//! the dashboard, the API, or every other tunnel (`Domain=.rustunnel.com`).
+//! Host-only cookies and a `Domain` of the exact tunnel host are forwarded
+//! unchanged. A host that is not under `rustunnel.com` is left alone.
 
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
@@ -464,8 +476,16 @@ async fn proxy_request(
 
     // ── 6. WebSocket upgrade fast-path ────────────────────────────────────
     if is_ws {
-        return handle_ws_upgrade(req, yamux_stream, conn_id, &ctx, start, tunnel_info.meter())
-            .await;
+        return handle_ws_upgrade(
+            req,
+            yamux_stream,
+            conn_id,
+            &ctx,
+            start,
+            tunnel_info.meter(),
+            &host,
+        )
+        .await;
     }
 
     // ── 7. HTTP proxy ─────────────────────────────────────────────────────
@@ -700,6 +720,10 @@ where
     let (mut resp_parts, resp_body) = upstream.into_parts();
     let status = resp_parts.status.as_u16();
     remove_hop_by_hop(&mut resp_parts.headers);
+    // HTTP and HTTPS both land here. Drop a Domain that would be shared
+    // with the dashboard or another tunnel. Custom-domain hosts are skipped
+    // inside the helper.
+    scrub_upstream_set_cookies(&mut resp_parts.headers, original_host);
 
     // Shared counter incremented per body frame; read by CaptureGuard on drop.
     let rsp_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -764,6 +788,7 @@ async fn handle_ws_upgrade(
     ctx: &ProxyCtx,
     start: Instant,
     meter: crate::core::tunnel::TransferMeter,
+    tunnel_host: &str,
 ) -> Response<BoxBody> {
     debug!(%conn_id, "WebSocket upgrade");
 
@@ -805,12 +830,17 @@ async fn handle_ws_upgrade(
         },
     );
 
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")
         .body(empty())
-        .unwrap()
+        .unwrap();
+    // The 101 we synthesize has no upstream cookie today. The same filter
+    // still runs, so a Set-Cookie added to this response cannot carry a
+    // parent Domain.
+    scrub_upstream_set_cookies(response.headers_mut(), tunnel_host);
+    response
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -847,6 +877,132 @@ fn remove_hop_by_hop(headers: &mut hyper::HeaderMap) {
     for &name in HOP_BY_HOP {
         headers.remove(name);
     }
+}
+
+/// Registrable domain of the public edge. A tunnel host under this name
+/// shares a cookie jar with the dashboard and every sibling tunnel when an
+/// upstream `Set-Cookie` sets `Domain` to the parent.
+const PLATFORM_DOMAIN: &str = "rustunnel.com";
+
+/// Upstream `Set-Cookie` headers dropped because `Domain` was not the tunnel host.
+static UPSTREAM_SET_COOKIE_DOMAINS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Cookies dropped by [`scrub_upstream_set_cookies`] since process start.
+pub fn upstream_set_cookie_domains_dropped() -> u64 {
+    UPSTREAM_SET_COOKIE_DOMAINS_DROPPED.load(Ordering::Relaxed)
+}
+
+/// Drop proxied `Set-Cookie` headers whose `Domain` is not `tunnel_host`.
+///
+/// Runs for every tunnel, not only agent tunnels. Host-only cookies and a
+/// `Domain` of the exact host (case-insensitive, leading dots ignored) are
+/// left byte-for-byte. A host that is not under [`PLATFORM_DOMAIN`] is not
+/// filtered. Returns how many headers were removed.
+fn scrub_upstream_set_cookies(headers: &mut hyper::HeaderMap, tunnel_host: &str) -> u64 {
+    let host = canonical_host(tunnel_host);
+    if !host_under_platform(host) {
+        return 0;
+    }
+    let existing: Vec<hyper::header::HeaderValue> =
+        headers.get_all("set-cookie").iter().cloned().collect();
+    if existing.is_empty() {
+        return 0;
+    }
+    let mut kept = Vec::with_capacity(existing.len());
+    let mut dropped = 0u64;
+    for value in existing {
+        if set_cookie_domain_is_foreign(value.as_bytes(), host) {
+            dropped += 1;
+        } else {
+            kept.push(value);
+        }
+    }
+    if dropped == 0 {
+        return 0;
+    }
+    headers.remove("set-cookie");
+    for value in kept {
+        headers.append("set-cookie", value);
+    }
+    UPSTREAM_SET_COOKIE_DOMAINS_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+    // Count and host only. The cookie name and value stay out of the log.
+    info!(
+        tunnel_host = host,
+        dropped, "dropped upstream Set-Cookie headers whose Domain was not the tunnel host"
+    );
+    dropped
+}
+
+fn canonical_host(host: &str) -> &str {
+    let host = host.trim();
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    host.trim_end_matches('.')
+}
+
+fn host_under_platform(host: &str) -> bool {
+    const SUFFIX: &[u8] = b".rustunnel.com";
+    if host.eq_ignore_ascii_case(PLATFORM_DOMAIN) {
+        return true;
+    }
+    host.len() > SUFFIX.len()
+        && host.as_bytes()[host.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+}
+
+/// `true` when any `Domain` attribute is present and, after trimming and
+/// ignoring a leading dot, is not exactly `tunnel_host`.
+fn set_cookie_domain_is_foreign(header: &[u8], tunnel_host: &str) -> bool {
+    let mut parts = header.split(|byte| *byte == b';');
+    let _cookie_pair = parts.next();
+    for part in parts {
+        let part = trim_ascii(part);
+        let (name, value) = match part.iter().position(|byte| *byte == b'=') {
+            Some(eq) => (trim_ascii(&part[..eq]), trim_ascii(&part[eq + 1..])),
+            None => (part, &b""[..]),
+        };
+        if !name.eq_ignore_ascii_case(b"domain") {
+            continue;
+        }
+        if !domain_equals_host(value, tunnel_host) {
+            return true;
+        }
+    }
+    false
+}
+
+fn domain_equals_host(domain: &[u8], tunnel_host: &str) -> bool {
+    let domain = trim_ascii(domain);
+    let domain = strip_matching_quotes(domain);
+    let mut domain = trim_ascii(domain);
+    while let Some(rest) = domain.strip_prefix(b".") {
+        domain = rest;
+    }
+    let domain = trim_ascii(domain);
+    !domain.is_empty() && domain.eq_ignore_ascii_case(tunnel_host.as_bytes())
+}
+
+fn strip_matching_quotes(value: &[u8]) -> &[u8] {
+    if value.len() >= 2 && value[0] == b'"' && value[value.len() - 1] == b'"' {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn trim_ascii(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &value[start..end]
 }
 
 /// Add the standard reverse-proxy forwarding headers.
@@ -1136,6 +1292,269 @@ mod tests {
                 "edge Set-Cookie must be host-only: {cookie}"
             );
         }
+    }
+
+    fn apply_cookies(host: &str, cookies: &[&str]) -> (Vec<String>, u64) {
+        let mut headers = hyper::HeaderMap::new();
+        for cookie in cookies {
+            headers.append("set-cookie", HeaderValue::from_str(cookie).unwrap());
+        }
+        let before = upstream_set_cookie_domains_dropped();
+        let dropped = scrub_upstream_set_cookies(&mut headers, host);
+        let after = upstream_set_cookie_domains_dropped();
+        assert!(
+            after >= before + dropped,
+            "dropped count must move the metric"
+        );
+        let kept = headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        (kept, dropped)
+    }
+
+    #[test]
+    fn upstream_set_cookie_domain_filter() {
+        let host = "foo.rustunnel.com";
+        let secret = "planted-refresh-token-value";
+        let parent = format!("refresh_token={secret}; Domain=.rustunnel.com");
+        let parent_apex = format!("refresh_token={secret}; Domain=rustunnel.com");
+        let exact = "id=1; Domain=foo.rustunnel.com; Path=/; HttpOnly";
+        let exact_dotted = "id=1; Domain=.Foo.Rustunnel.COM; Path=/";
+        let host_only = "session=abc; Path=/; HttpOnly; Secure";
+        let sibling = "refresh_token=other; Domain=bar.rustunnel.com";
+        let mixed_case = format!("refresh_token={secret}; dOmAiN=.RuStUnNeL.CoM");
+        let spaced = format!("refresh_token={secret};  dOmAiN =  .rustunnel.com  ");
+
+        let (kept, dropped) = apply_cookies(host, &[parent.as_str()]);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(dropped, 1);
+
+        let (kept, dropped) = apply_cookies(host, &[parent_apex.as_str()]);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(dropped, 1);
+
+        let (kept, dropped) = apply_cookies("foo.rustunnel.com:443", &[exact]);
+        assert_eq!(kept, vec![exact]);
+        assert_eq!(dropped, 0);
+
+        let (kept, dropped) = apply_cookies(host, &[exact_dotted]);
+        assert_eq!(kept, vec![exact_dotted]);
+        assert_eq!(dropped, 0);
+
+        let (kept, dropped) = apply_cookies(host, &[host_only]);
+        assert_eq!(kept, vec![host_only]);
+        assert_eq!(dropped, 0);
+
+        let (kept, dropped) = apply_cookies(host, &[host_only, parent.as_str(), exact, sibling]);
+        assert_eq!(kept, vec![host_only, exact]);
+        assert_eq!(dropped, 2);
+
+        let (kept, dropped) = apply_cookies(host, &[mixed_case.as_str()]);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(dropped, 1);
+
+        let (kept, dropped) = apply_cookies(host, &[spaced.as_str()]);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(dropped, 1);
+
+        let (kept, dropped) = apply_cookies(host, &[sibling]);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(dropped, 1);
+
+        let custom = "app.example.com";
+        let foreign = format!("refresh_token={secret}; Domain=.rustunnel.com");
+        let (kept, dropped) = apply_cookies(custom, &[foreign.as_str(), sibling, host_only]);
+        assert_eq!(
+            kept,
+            vec![foreign.as_str(), sibling, host_only],
+            "a custom-domain tunnel is not filtered"
+        );
+        assert_eq!(dropped, 0);
+
+        // The upgrade response uses the same filter when it carries Set-Cookie.
+        let mut upgrade = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("set-cookie", parent.as_str())
+            .header("set-cookie", host_only)
+            .body(empty())
+            .unwrap();
+        let dropped = scrub_upstream_set_cookies(upgrade.headers_mut(), host);
+        assert_eq!(dropped, 1);
+        let kept: Vec<_> = upgrade
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(kept, vec![host_only]);
+
+        let recorded = Arc::new(std::sync::Mutex::new(String::new()));
+        let writer = Arc::clone(&recorded);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || LogBuf(Arc::clone(&writer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = apply_cookies(host, &[parent.as_str()]);
+        });
+        let log = recorded.lock().unwrap().clone();
+        assert!(log.contains(host), "{log}");
+        assert!(log.contains("dropped"), "{log}");
+        assert!(!log.contains("refresh_token"), "{log}");
+        assert!(!log.contains(secret), "{log}");
+    }
+
+    struct LogBuf(Arc<std::sync::Mutex<String>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn proxy_cookies(
+        scheme: ForwardScheme,
+        host: &'static str,
+        cookies: Vec<String>,
+    ) -> Vec<String> {
+        use crate::core::TunnelInfo;
+
+        let info = TunnelInfo::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            rustunnel_protocol::TunnelProtocol::Http,
+            Some("app".into()),
+            None,
+            8,
+        );
+        let (edge_io, local_io) = tokio::io::duplex(1024 * 1024);
+        let (public_client, public_server) = tokio::io::duplex(1024 * 1024);
+
+        tokio::spawn(async move {
+            let io = TokioIo::new(local_io);
+            let svc = service_fn(move |_req: Request<Incoming>| {
+                let cookies = cookies.clone();
+                async move {
+                    let mut resp = Response::new(Full::new(Bytes::from_static(b"ok")));
+                    for cookie in cookies {
+                        resp.headers_mut()
+                            .append("set-cookie", HeaderValue::from_str(&cookie).unwrap());
+                    }
+                    Ok::<_, Infallible>(resp)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
+
+        let meter = info.meter();
+        let edge_slot = Arc::new(tokio::sync::Mutex::new(Some(edge_io)));
+        tokio::spawn(async move {
+            let io = TokioIo::new(public_server);
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let edge_slot = Arc::clone(&edge_slot);
+                let meter = meter.clone();
+                async move {
+                    let upstream = edge_slot.lock().await.take().expect("one upstream stream");
+                    let peer: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+                    let resp = forward_http(
+                        req,
+                        upstream,
+                        meter,
+                        peer,
+                        scheme,
+                        host,
+                        HttpCaptureCtx {
+                            tx: None,
+                            conn_id: Uuid::new_v4(),
+                            tunnel_id: Uuid::new_v4(),
+                            tunnel_label: "app".into(),
+                            method: "GET".into(),
+                            path: "/".into(),
+                            request_bytes: 0,
+                            start: Instant::now(),
+                        },
+                    )
+                    .await
+                    .expect("forward_http");
+                    Ok::<_, Infallible>(resp)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .with_upgrades()
+                .await;
+        });
+
+        let io = TokioIo::new(public_client);
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(io)
+            .await
+            .expect("public client handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", host)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = timeout(Duration::from_secs(5), sender.send_request(req))
+            .await
+            .expect("proxy timed out")
+            .expect("public response");
+        let kept = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        let _ = timeout(Duration::from_secs(5), resp.into_body().collect()).await;
+        kept
+    }
+
+    #[tokio::test]
+    async fn proxied_responses_drop_a_parent_domain_on_http_and_https() {
+        let cookies = vec![
+            "session=abc; Path=/; HttpOnly".to_string(),
+            "refresh_token=secret; Domain=.rustunnel.com".to_string(),
+            "id=1; Domain=foo.rustunnel.com".to_string(),
+            "refresh_token=other; Domain=bar.rustunnel.com".to_string(),
+        ];
+        let expect = vec![
+            "session=abc; Path=/; HttpOnly".to_string(),
+            "id=1; Domain=foo.rustunnel.com".to_string(),
+        ];
+        for scheme in [ForwardScheme::Http, ForwardScheme::Https] {
+            let kept = proxy_cookies(scheme, "foo.rustunnel.com", cookies.clone()).await;
+            assert_eq!(kept, expect, "{scheme:?}");
+        }
+        let custom = proxy_cookies(
+            ForwardScheme::Https,
+            "app.example.com",
+            vec!["refresh_token=secret; Domain=.rustunnel.com".into()],
+        )
+        .await;
+        assert_eq!(
+            custom,
+            vec!["refresh_token=secret; Domain=.rustunnel.com".to_string()]
+        );
     }
 
     #[test]
