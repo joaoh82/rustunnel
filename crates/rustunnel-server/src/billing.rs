@@ -425,6 +425,7 @@ async fn post_hobby_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::AgentPlanLimits;
 
     const TUNNEL_CLI: &str = "\
 Hobby plan limit: 2 concurrent tunnels. Pay-as-you-go removes the cap ($3/mo min).\n\
@@ -458,6 +459,24 @@ Upgrade: https://rustunnel.com/dashboard/billing?upgrade=1&utm_source=cli&utm_ca
         let sub = HobbyReason::CustomSubdomain.message(Surface::Mcp);
         assert!(sub.contains("utm_source=mcp"));
         assert!(sub.contains("utm_content=subdomain"));
+    }
+
+    #[test]
+    fn agent_billing_model_is_not_a_hobby_gate() {
+        // The deployed server only hobby-gates billing_model = "free".
+        // The agent plan is billing_model = "agent", so this binary does
+        // not attach Hobby upgrade copy. Ticket 2 enforces the plan row.
+        let gate = gate_for_plan(
+            AgentPlanLimits::BILLING_MODEL,
+            Some(AgentPlanLimits::MAX_TUNNELS),
+            5,
+            AgentPlanLimits::ALLOW_CUSTOM_SUBDOMAINS,
+            Some("requested-name"),
+            AgentPlanLimits::BANDWIDTH_LIMIT_BYTES,
+            None,
+        );
+        assert!(gate.block.is_none());
+        assert!(gate.notice.is_none());
     }
 
     #[test]

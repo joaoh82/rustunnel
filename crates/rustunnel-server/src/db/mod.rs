@@ -74,7 +74,7 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub use models::{AdminPlan, AdminTunnelEntry};
+pub use models::{AdminPlan, AdminTunnelEntry, AgentPlanLimits};
 use models::{Region, Token, TokenWithCount, TunnelLogEntry};
 
 /// Hash a raw token value with SHA-256.
@@ -322,6 +322,20 @@ pub struct AdminUser {
     pub status: String,
     pub auth_method: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `'human'` or `'agent'`. Existing accounts are `'human'`.
+    pub kind: String,
+    /// When a human claimed an agent account. `None` while unclaimed.
+    pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Salted hash of the signup IP. Never a raw address.
+    pub signup_ip_hash: Option<String>,
+    /// Signup surface (`cli`, `mcp`, `api`, or a later value). `None` for
+    /// accounts created before agent signup.
+    pub source: Option<String>,
+    /// Terms version accepted at signup.
+    pub terms_version: Option<String>,
+    /// Set when an expired unclaimed account is deactivated. The row stays
+    /// in this list: deactivation is not a delete.
+    pub deactivated_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Number of API tokens belonging to this user.
     pub token_count: i64,
     /// The user's *effective* plan. A canceled subscription drops the user back
@@ -352,7 +366,8 @@ pub struct AdminUserFilters<'a> {
     pub auth_method: Option<&'a str>,
     /// User account status, e.g. "active" | "banned".
     pub status: Option<&'a str>,
-    /// Only users who were on a paid plan and have since canceled.
+    /// Only users who were on a paid plan (`metered` or `subscription`) and
+    /// have since canceled. `agent` is not a paid billing model.
     pub previously_paid: bool,
 }
 
@@ -416,10 +431,11 @@ const TOKEN_LATERAL: &str = "
 /// Projection shared by the list and detail queries.
 const ADMIN_USER_COLS: &str = "
     u.id, u.email, u.display_name, u.email_verified, u.status, u.auth_method, u.created_at,
+    u.kind, u.claimed_at, u.signup_ip_hash, u.source, u.terms_version, u.deactivated_at,
     tc.token_count,
     CASE WHEN sub.status = 'canceled' THEN 'free' ELSE sub.plan_name END AS plan_name,
     sub.status AS subscription_status,
-    CASE WHEN sub.status = 'canceled' AND sub.billing_model <> 'free'
+    CASE WHEN sub.status = 'canceled' AND sub.billing_model IN ('metered', 'subscription')
          THEN sub.plan_name END AS previous_plan_name,
     CASE WHEN sub.status = 'canceled' THEN sub.canceled_at END AS canceled_at,
     tc.last_active_at";
@@ -433,7 +449,7 @@ const ADMIN_USER_FILTERS: &str = "
       AND ($3::text IS NULL OR u.auth_method = $3)
       AND ($4::text IS NULL OR u.status = $4)
       AND ($5::bool IS NOT TRUE OR (sub.status = 'canceled'
-                                    AND sub.billing_model <> 'free'))";
+                                    AND sub.billing_model IN ('metered', 'subscription')))";
 
 /// Paginated, filterable list of users.
 pub async fn list_admin_users(
@@ -520,6 +536,8 @@ pub async fn list_admin_plans(pool: &PgPool) -> Result<Vec<AdminPlan>> {
         "SELECT p.id, p.name, p.billing_model, p.monthly_price_cents,
                 p.max_tunnels, p.max_connections, p.rate_limit_rps,
                 p.bandwidth_limit_gb, p.history_days, p.is_active,
+                p.allow_custom_subdomains, p.allowed_protocols,
+                p.bandwidth_hard_cap, p.bandwidth_limit_bytes,
                 COUNT(s.id)::bigint AS subscriber_count
          FROM plans p
          LEFT JOIN subscriptions s ON s.plan_id = p.id AND s.status = 'active'
@@ -671,3 +689,6 @@ pub async fn list_user_tokens(pool: &PgPool, user_id: &uuid::Uuid) -> Result<Vec
     .await?;
     Ok(rows)
 }
+
+#[cfg(test)]
+mod agent_schema;
