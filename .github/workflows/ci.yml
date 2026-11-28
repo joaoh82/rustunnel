@@ -2,12 +2,7 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      # PR #114 targets cursor/agent-plan-enforcement-9172, so the
-      # pull_request filter below does not start CI. This push filter
-      # runs the same checks on that head. Drop the line once #114 merges.
-      - cursor/tunnel-84-host-only-cookies-dcaf
+    branches: [main]
   pull_request:
     branches: [main]
 
