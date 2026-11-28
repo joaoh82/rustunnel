@@ -794,6 +794,16 @@ pub async fn reserve_plan_registration<'a>(
         );
     }
     let mut tx = pool.begin().await?;
+    // A peer that dies holding the lock must not stall this registration.
+    // lock_timeout bounds the wait; statement_timeout bounds the statements.
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'"
+    ))
+    .execute(&mut *tx)
+    .await?;
     let (key1, key2) = advisory_lock_keys(user_id);
     sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
         .bind(key1)
