@@ -1029,6 +1029,9 @@ fn edge_response(response: EdgeResponse) -> Response<BoxBody> {
     if let Some(cookie) = response.set_cookie {
         builder = builder.header("set-cookie", cookie);
     }
+    if let Some(cookie) = response.clear_cookie {
+        builder = builder.header("set-cookie", cookie);
+    }
     if let Some(location) = response.location {
         builder = builder.header("location", location);
     }

@@ -185,6 +185,8 @@ pub struct EdgeResponse {
     pub content_type: &'static str,
     pub body: String,
     pub set_cookie: Option<String>,
+    /// Second `Set-Cookie`, used to expire the warning nonce after Continue.
+    pub clear_cookie: Option<String>,
     pub location: Option<String>,
     /// `DENY` on HTML pages so the warning cannot be framed.
     pub frame_options: Option<&'static str>,
@@ -903,9 +905,7 @@ const ACCOUNT_SELECT: &str = "SELECT u.id, u.status, u.kind, u.claimed_at, u.dea
          LIMIT 1 \
      ) p ON TRUE";
 
-fn flight_outcome(
-    flight: &AccountFlight,
-) -> Option<std::result::Result<Option<AccountView>, ()>> {
+fn flight_outcome(flight: &AccountFlight) -> Option<std::result::Result<Option<AccountView>, ()>> {
     flight
         .outcome
         .lock()
@@ -1060,6 +1060,7 @@ pub fn warning_acknowledgement(
         content_type: "text/plain; charset=utf-8",
         body: String::new(),
         set_cookie: Some(warning_cookie()),
+        clear_cookie: Some(clear_nonce_cookie()),
         location: Some(location),
         frame_options: None,
         content_security_policy: None,
@@ -1072,6 +1073,10 @@ pub fn warning_cookie() -> String {
     format!(
         "{WARNING_COOKIE_NAME}=1; Path=/; Max-Age={WARNING_COOKIE_MAX_AGE_SECS}; SameSite=Lax; HttpOnly; Secure"
     )
+}
+
+fn clear_nonce_cookie() -> String {
+    format!("{WARNING_NONCE_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure")
 }
 
 fn nonce_cookie(nonce: &str) -> String {
@@ -1156,6 +1161,7 @@ fn https_navigation(req: &IncomingRequest<'_>) -> Option<EdgeResponse> {
         content_type: "text/plain; charset=utf-8",
         body: String::new(),
         set_cookie: None,
+        clear_cookie: None,
         location: Some(location),
         frame_options: None,
         content_security_policy: None,
@@ -1332,6 +1338,7 @@ fn html_response(status: u16, body: String) -> EdgeResponse {
         content_type: "text/html; charset=utf-8",
         body,
         set_cookie: None,
+        clear_cookie: None,
         location: None,
         frame_options: Some("DENY"),
         content_security_policy: Some(content_security_policy()),
@@ -1346,6 +1353,7 @@ fn json_response(status: u16, error_code: &str, message: &str) -> EdgeResponse {
         content_type: "application/json",
         body: json!({ "code": error_code, "error": message }).to_string(),
         set_cookie: None,
+        clear_cookie: None,
         location: None,
         frame_options: None,
         content_security_policy: None,
@@ -2110,6 +2118,12 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(!cookie.to_ascii_lowercase().contains("domain="));
+        let cleared = ack.clear_cookie.unwrap();
+        assert!(cleared.starts_with("__Host-rustunnel_warn_nonce=;"));
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.contains("Path=/"));
+        assert!(cleared.contains("Secure"));
+        assert!(!cleared.to_ascii_lowercase().contains("domain="));
         assert!(acknowledged("/docs?x=1", nonce, Some("same-origin")).is_none());
         assert_eq!(
             acknowledged(
@@ -2192,6 +2206,9 @@ mod tests {
                 assert!(set.starts_with("__Host-rustunnel_warn_ok=1; Path=/;"));
                 assert!(set.contains("Secure"));
                 assert!(!set.to_ascii_lowercase().contains("domain="));
+                let cleared = ack.clear_cookie.unwrap();
+                assert!(cleared.contains("Max-Age=0"));
+                assert!(cleared.starts_with("__Host-rustunnel_warn_nonce=;"));
             }
             EdgeAction::Proxy => panic!("a matching same-origin nonce should acknowledge"),
         }

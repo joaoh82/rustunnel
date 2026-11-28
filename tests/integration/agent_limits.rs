@@ -933,18 +933,28 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
         .await
         .unwrap();
     assert_eq!(ack.status(), 303);
-    let cookie = ack
+    let cookies: Vec<_> = ack
         .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(cookie.starts_with("__Host-rustunnel_warn_ok=1"));
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    let cookie = cookies
+        .iter()
+        .find(|value| value.starts_with("__Host-rustunnel_warn_ok=1"))
+        .expect("ack cookie");
     assert!(cookie.contains("Path=/"));
     assert!(cookie.contains("Max-Age=86400"));
     assert!(cookie.contains("Secure"));
     assert!(!cookie.to_ascii_lowercase().contains("domain="));
+    let cleared = cookies
+        .iter()
+        .find(|value| value.starts_with("__Host-rustunnel_warn_nonce="))
+        .expect("cleared nonce");
+    assert!(cleared.contains("Max-Age=0"));
+    assert!(cleared.contains("Path=/"));
+    assert!(cleared.contains("Secure"));
+    assert!(!cleared.to_ascii_lowercase().contains("domain="));
     assert_eq!(
         ack.headers().get("location").unwrap().to_str().unwrap(),
         "/"
