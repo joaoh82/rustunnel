@@ -1023,6 +1023,121 @@ mod tests {
     use super::*;
     use hyper::header::HeaderValue;
 
+    /// A `Set-Cookie` attribute named `Domain`, in any case. The cookie value
+    /// itself is not an attribute, so a value that contains the word "domain"
+    /// does not count.
+    fn set_cookie_has_domain(header: &str) -> bool {
+        header.split(';').skip(1).any(|part| {
+            part.split_once('=')
+                .map(|(name, _)| name)
+                .unwrap_or(part)
+                .trim()
+                .eq_ignore_ascii_case("domain")
+        })
+    }
+
+    fn agent_view(status: &str) -> policy::AccountView {
+        policy::AccountView {
+            status: status.into(),
+            kind: "agent".into(),
+            claimed_at: None,
+            deactivated_at: None,
+            plan: Some(policy::PlanLimits {
+                name: "agent".into(),
+                billing_model: "agent".into(),
+                max_tunnels: Some(1),
+                allow_custom_subdomains: false,
+                allowed_protocols: vec!["http".into()],
+                bandwidth_hard_cap: false,
+                bandwidth_limit_bytes: None,
+            }),
+        }
+    }
+
+    fn navigation<'a>(path: &'a str, cookie: Option<&'a str>) -> policy::IncomingRequest<'a> {
+        policy::IncomingRequest {
+            method: "GET",
+            accept: Some("text/html,application/xhtml+xml"),
+            sec_fetch_mode: Some("navigate"),
+            sec_fetch_site: Some("same-origin"),
+            skip_warning: None,
+            cookie,
+            host: "h.example",
+            path_and_query: path,
+            https: true,
+        }
+    }
+
+    fn emitted_set_cookies(action: policy::EdgeAction) -> Vec<String> {
+        let policy::EdgeAction::Respond(response) = action else {
+            return Vec::new();
+        };
+        edge_response(response)
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn edge_set_cookie_headers_have_no_domain_attribute() {
+        let warning = emitted_set_cookies(policy::edge_action(
+            &agent_view("active"),
+            0,
+            &navigation("/", None),
+        ));
+        assert_eq!(warning.len(), 1, "{warning:?}");
+        let nonce = warning[0]
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1
+            .to_string();
+        let nonce_cookie = format!("{}={nonce}", policy::WARNING_NONCE_COOKIE);
+        let continue_path = format!("/?{}={nonce}", policy::WARNING_ACK_PARAM);
+        let ack = emitted_set_cookies(policy::edge_action(
+            &agent_view("active"),
+            0,
+            &navigation(&continue_path, Some(&nonce_cookie)),
+        ));
+
+        let mut capped = agent_view("active");
+        capped.plan.as_mut().unwrap().bandwidth_hard_cap = true;
+        capped.plan.as_mut().unwrap().bandwidth_limit_bytes = Some(1);
+        let bandwidth =
+            emitted_set_cookies(policy::edge_action(&capped, 1, &navigation("/", None)));
+        let banned = emitted_set_cookies(policy::edge_action(
+            &agent_view("banned"),
+            0,
+            &navigation("/", None),
+        ));
+
+        let cookies = warning.into_iter().chain(ack).collect::<Vec<_>>();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with(&format!("{}=", policy::WARNING_NONCE_COOKIE))),
+            "{cookies:?}"
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with(&format!("{}=", policy::WARNING_COOKIE_NAME))),
+            "{cookies:?}"
+        );
+        assert!(bandwidth.is_empty(), "{bandwidth:?}");
+        assert!(banned.is_empty(), "{banned:?}");
+        for cookie in &cookies {
+            assert!(
+                !set_cookie_has_domain(cookie),
+                "edge Set-Cookie must be host-only: {cookie}"
+            );
+        }
+    }
+
     #[test]
     fn subdomain_extraction() {
         assert_eq!(
