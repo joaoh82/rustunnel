@@ -233,8 +233,46 @@ struct CachedBytes {
 struct AccountFlight {
     notify: tokio::sync::Notify,
     /// `Ok` is the loaded row (`None` means the user does not exist).
-    /// `Err` means the lookup failed or timed out.
+    /// `Err` means the lookup failed, timed out, or the leader was dropped.
     outcome: std::sync::Mutex<Option<std::result::Result<Option<AccountView>, ()>>>,
+}
+
+/// Releases the in-flight slot when the leader is cancelled mid-lookup.
+///
+/// Without this, dropping the leader leaves the slot occupied and every
+/// later request for that user waits out [`ACCOUNT_LOOKUP_TIMEOUT`] forever.
+struct InflightGuard<'a> {
+    user_id: Uuid,
+    flight: Arc<AccountFlight>,
+    inflight: &'a DashMap<Uuid, Arc<AccountFlight>>,
+    finished: bool,
+}
+
+impl InflightGuard<'_> {
+    fn finish(&mut self, stored: std::result::Result<Option<AccountView>, ()>) {
+        self.publish(stored);
+        self.finished = true;
+    }
+
+    fn publish(&self, stored: std::result::Result<Option<AccountView>, ()>) {
+        *self
+            .flight
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
+        self.flight.notify.notify_waiters();
+        self.inflight.remove(&self.user_id);
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // No backoff. The next request should become a new leader.
+        self.publish(Err(()));
+    }
 }
 
 /// Short-lived cache in front of account and bandwidth reads.
@@ -292,17 +330,17 @@ impl AccountGate {
             }
         };
         let flight = role.expect("vacant entry inserts a flight");
+        let mut guard = InflightGuard {
+            user_id,
+            flight,
+            inflight: &self.inflight,
+            finished: false,
+        };
         let result = self.load_view(user_id).await;
-        let stored = match &result {
+        guard.finish(match &result {
             Ok(view) => Ok(view.clone()),
             Err(_) => Err(()),
-        };
-        *flight
-            .outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
-        flight.notify.notify_waiters();
-        self.inflight.remove(&user_id);
+        });
         result
     }
 
@@ -311,15 +349,30 @@ impl AccountGate {
         user_id: Uuid,
         flight: Arc<AccountFlight>,
     ) -> Result<Option<AccountView>> {
-        let _ = tokio::time::timeout(ACCOUNT_LOOKUP_TIMEOUT, flight.notify.notified()).await;
-        let outcome = flight
-            .outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        // Subscribe before reading the outcome. A leader that finished
+        // between the occupied-entry check and this wait would otherwise
+        // leave the waiter asleep for the whole timeout.
+        let notified = flight.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(outcome) = flight_outcome(&flight) {
+            return self.lookup_outcome(user_id, outcome);
+        }
+        let _ = tokio::time::timeout(ACCOUNT_LOOKUP_TIMEOUT, notified).await;
+        match flight_outcome(&flight) {
+            Some(outcome) => self.lookup_outcome(user_id, outcome),
+            None => self.cached_or_err(user_id),
+        }
+    }
+
+    fn lookup_outcome(
+        &self,
+        user_id: Uuid,
+        outcome: std::result::Result<Option<AccountView>, ()>,
+    ) -> Result<Option<AccountView>> {
         match outcome {
-            Some(Ok(view)) => Ok(view),
-            Some(Err(())) | None => self.cached_or_err(user_id),
+            Ok(view) => Ok(view),
+            Err(()) => self.cached_or_err(user_id),
         }
     }
 
@@ -849,6 +902,16 @@ const ACCOUNT_SELECT: &str = "SELECT u.id, u.status, u.kind, u.claimed_at, u.dea
          ORDER BY s.created_at DESC \
          LIMIT 1 \
      ) p ON TRUE";
+
+fn flight_outcome(
+    flight: &AccountFlight,
+) -> Option<std::result::Result<Option<AccountView>, ()>> {
+    flight
+        .outcome
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
 
 fn view_from_row(row: AccountRow) -> AccountView {
     let plan = row.plan_name.map(|name| PlanLimits {
@@ -2797,6 +2860,46 @@ mod tests {
             .unwrap();
         let read = move || accepted.load(Ordering::Relaxed);
         (read, pool)
+    }
+
+    #[tokio::test]
+    async fn a_dropped_account_lookup_lets_the_next_one_through() {
+        let (accepted, pool) = hung_pool().await;
+        let gate = Arc::new(AccountGate::new(pool, Duration::ZERO, Duration::ZERO));
+        let user_id = Uuid::new_v4();
+        let leader = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.view(user_id).await })
+        };
+        let started = Instant::now();
+        while gate.inflight.get(&user_id).is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "leader never started the lookup"
+            );
+            tokio::task::yield_now().await;
+        }
+        leader.abort();
+        let _ = leader.await;
+        assert!(
+            gate.inflight.get(&user_id).is_none(),
+            "a dropped leader must release the in-flight slot"
+        );
+        let before = accepted();
+        let follower = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.view(user_id).await })
+        };
+        let again = Instant::now();
+        while accepted() <= before {
+            assert!(
+                again.elapsed() < Duration::from_secs(2),
+                "the next lookup never reached the database"
+            );
+            tokio::task::yield_now().await;
+        }
+        follower.abort();
+        let _ = follower.await;
     }
 
     #[tokio::test]
