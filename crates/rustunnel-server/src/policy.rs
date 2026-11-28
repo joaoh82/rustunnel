@@ -199,6 +199,9 @@ pub struct IncomingRequest<'a> {
     pub method: &'a str,
     pub accept: Option<&'a str>,
     pub sec_fetch_mode: Option<&'a str>,
+    /// `Sec-Fetch-Dest` when the browser sent it. `document` and `iframe`
+    /// are navigations even when the method is not GET.
+    pub sec_fetch_dest: Option<&'a str>,
     /// `Sec-Fetch-Site` when the browser sent it. The acknowledgement
     /// accepts `same-origin` and also a request that omits the header.
     pub sec_fetch_site: Option<&'a str>,
@@ -786,26 +789,36 @@ async fn load_account(pool: &PgPool, user_id: Uuid) -> Result<Option<AccountView
     Ok(row.map(view_from_row))
 }
 
-/// GET navigations that ask for HTML. `Sec-Fetch-Mode` must be `navigate`
-/// when the browser sent it. `*/*` (curl) is not HTML.
+/// A top-level or framed document navigation.
+///
+/// `Sec-Fetch-Mode: navigate` or `Sec-Fetch-Dest: document|iframe` counts
+/// for any method, so a cross-site form POST cannot skip the warning.
+/// When the browser sent neither header, a GET whose `Accept` contains
+/// `text/html` is the fallback. `*/*` (curl) is not HTML.
 pub fn is_browser_navigation(
     method: &str,
     accept: Option<&str>,
     sec_fetch_mode: Option<&str>,
+    sec_fetch_dest: Option<&str>,
 ) -> bool {
-    if !method.eq_ignore_ascii_case("GET") {
+    if sec_fetch_mode
+        .map(str::trim)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("navigate"))
+    {
+        return true;
+    }
+    if sec_fetch_dest.map(str::trim).is_some_and(|dest| {
+        dest.eq_ignore_ascii_case("document") || dest.eq_ignore_ascii_case("iframe")
+    }) {
+        return true;
+    }
+    // A fetch header that is present and is not a navigation wins over
+    // Accept, so a CORS GET is proxied.
+    if sec_fetch_mode.is_some() || sec_fetch_dest.is_some() {
         return false;
     }
-    let Some(accept) = accept else {
-        return false;
-    };
-    if !accept.to_ascii_lowercase().contains("text/html") {
-        return false;
-    }
-    !matches!(
-        sec_fetch_mode.map(str::trim),
-        Some(mode) if !mode.eq_ignore_ascii_case("navigate")
-    )
+    method.eq_ignore_ascii_case("GET")
+        && accept.is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
 }
 
 pub fn warning_skipped(skip_header: Option<&str>, cookie: Option<&str>) -> bool {
@@ -991,7 +1004,12 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
     // Webhooks and other non-navigations stay on HTTP and are proxied.
     if unclaimed_agent_tunnel(view)
         && !req.https
-        && is_browser_navigation(req.method, req.accept, req.sec_fetch_mode)
+        && is_browser_navigation(
+            req.method,
+            req.accept,
+            req.sec_fetch_mode,
+            req.sec_fetch_dest,
+        )
     {
         if let Some(redirect) = https_navigation(req) {
             return EdgeAction::Respond(redirect);
@@ -1009,7 +1027,12 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
     }
     if unclaimed_agent_tunnel(view)
         && !warning_skipped(req.skip_warning, req.cookie)
-        && is_browser_navigation(req.method, req.accept, req.sec_fetch_mode)
+        && is_browser_navigation(
+            req.method,
+            req.accept,
+            req.sec_fetch_mode,
+            req.sec_fetch_dest,
+        )
     {
         return EdgeAction::Respond(warning_page(req.host, req.path_and_query));
     }
@@ -1018,7 +1041,12 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
 
 fn account_page(block: AuthBlock, req: &IncomingRequest<'_>) -> EdgeResponse {
     let message = block.message();
-    if is_browser_navigation(req.method, req.accept, req.sec_fetch_mode) {
+    if is_browser_navigation(
+        req.method,
+        req.accept,
+        req.sec_fetch_mode,
+        req.sec_fetch_dest,
+    ) {
         let body = html_doc(
             "Tunnel unavailable",
             &format!(
@@ -1038,7 +1066,12 @@ fn bandwidth_page(plan: &PlanLimits, limit: i64, req: &IncomingRequest<'_>) -> E
         "{} plan monthly bandwidth cap reached ({limit} bytes)",
         plan.name
     );
-    if is_browser_navigation(req.method, req.accept, req.sec_fetch_mode) {
+    if is_browser_navigation(
+        req.method,
+        req.accept,
+        req.sec_fetch_mode,
+        req.sec_fetch_dest,
+    ) {
         let body = html_doc(
             "Bandwidth cap reached",
             &format!(
@@ -1660,6 +1693,7 @@ mod tests {
             method: "GET",
             accept: Some("text/html,application/xhtml+xml"),
             sec_fetch_mode: Some("navigate"),
+            sec_fetch_dest: None,
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
@@ -1709,11 +1743,17 @@ mod tests {
 
         let mut json = browser("h.example", "/");
         json.accept = Some("application/json");
+        json.sec_fetch_mode = None;
         assert!(matches!(edge_action(&agent, 0, &json), EdgeAction::Proxy));
 
         let mut post = browser("h.example", "/");
         post.method = "POST";
-        assert!(matches!(edge_action(&agent, 0, &post), EdgeAction::Proxy));
+        post.sec_fetch_mode = None;
+        post.accept = Some("text/html");
+        assert!(
+            matches!(edge_action(&agent, 0, &post), EdgeAction::Proxy),
+            "a POST without fetch metadata is not a navigation"
+        );
 
         let mut cors = browser("h.example", "/");
         cors.sec_fetch_mode = Some("cors");
@@ -1726,6 +1766,51 @@ mod tests {
         let mut acked = browser("h.example", "/");
         acked.cookie = Some("other=1; __Host-rustunnel_warn_ok=1");
         assert!(matches!(edge_action(&agent, 0, &acked), EdgeAction::Proxy));
+    }
+
+    #[test]
+    fn a_post_navigation_without_an_ack_gets_the_warning_or_a_block() {
+        let agent = view("agent", false, "agent");
+        let mut posted = browser("h.example", "/");
+        posted.method = "POST";
+        posted.accept = Some("*/*");
+        posted.sec_fetch_mode = Some("navigate");
+        match edge_action(&agent, 0, &posted) {
+            EdgeAction::Respond(page) => assert_eq!(page.status, 200),
+            EdgeAction::Proxy => panic!("Sec-Fetch-Mode: navigate must not be proxied"),
+        }
+
+        let mut framed = browser("h.example", "/");
+        framed.method = "POST";
+        framed.sec_fetch_mode = None;
+        framed.sec_fetch_dest = Some("iframe");
+        match edge_action(&agent, 0, &framed) {
+            EdgeAction::Respond(page) => assert_eq!(page.status, 200),
+            EdgeAction::Proxy => panic!("an iframe destination must not be proxied"),
+        }
+
+        let mut document = browser("h.example", "/pay");
+        document.method = "POST";
+        document.sec_fetch_mode = None;
+        document.sec_fetch_dest = Some("document");
+        document.path_and_query = "/pay?rustunnel_warn_continue=1";
+        match edge_action(&agent, 0, &document) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 200);
+                assert!(page.location.is_none());
+            }
+            EdgeAction::Proxy => panic!("a document POST must not acknowledge itself"),
+        }
+
+        let mut banned = agent.clone();
+        banned.status = "banned".into();
+        match edge_action(&banned, 0, &posted) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 403);
+                assert!(page.body.contains("account banned"));
+            }
+            EdgeAction::Proxy => panic!("a banned navigation must be a 403"),
+        }
     }
 
     #[test]
@@ -1967,9 +2052,10 @@ mod tests {
 
         let mut post = browser("h.example", flagged);
         post.method = "POST";
+        post.sec_fetch_mode = None;
         assert!(
             matches!(edge_action(&agent, 0, &post), EdgeAction::Proxy),
-            "a POST carrying the flag is proxied"
+            "a POST without fetch metadata is proxied"
         );
 
         let human_get = browser("h.example", "/?rustunnel_warn_continue=1");
@@ -1998,6 +2084,7 @@ mod tests {
             method: "GET",
             accept: Some("*/*"),
             sec_fetch_mode: None,
+            sec_fetch_dest: None,
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
@@ -2633,6 +2720,7 @@ mod tests {
             method: "GET",
             accept: Some("application/json"),
             sec_fetch_mode: None,
+            sec_fetch_dest: None,
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,

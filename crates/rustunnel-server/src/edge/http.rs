@@ -942,6 +942,7 @@ async fn account_guard(
             method: req.method().as_str(),
             accept: header_str(req, "accept"),
             sec_fetch_mode: header_str(req, "sec-fetch-mode"),
+            sec_fetch_dest: header_str(req, "sec-fetch-dest"),
             sec_fetch_site: header_str(req, "sec-fetch-site"),
             skip_warning: header_str(req, policy::WARNING_SKIP_HEADER),
             cookie: header_str(req, "cookie"),
