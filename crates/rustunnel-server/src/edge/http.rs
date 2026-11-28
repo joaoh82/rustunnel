@@ -1298,9 +1298,11 @@ mod tests {
             sec_fetch_site: Some("same-origin"),
             skip_warning: None,
             cookie,
+            content_type: None,
             host: "h.example",
             path_and_query: path,
             https: true,
+            https_port: 443,
         }
     }
 
@@ -1745,7 +1747,7 @@ mod tests {
             "set-cookie",
             HeaderValue::from_static("app_session=keep; Path=/"),
         );
-        strip_response_warning_cookies(&mut headers);
+        filter_proxied_set_cookies(&mut headers, "foo.rustunnel.com", "rustunnel.com", true);
         let kept: Vec<_> = headers
             .get_all("set-cookie")
             .iter()
