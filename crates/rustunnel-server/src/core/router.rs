@@ -279,7 +279,8 @@ impl TunnelCore {
     ///
     /// If `subdomain` is `None` an 8-character random hex label is generated.
     /// User-supplied subdomains are validated: alphanumeric + hyphens only,
-    /// 3–63 characters, no leading or trailing hyphens.
+    /// 3–63 characters, no leading or trailing hyphens, and not a reserved
+    /// platform or nameserver label (`admin`, `ns1`, …).
     ///
     /// When `group` is `None` (the only case before TUNNEL-7 Phase 2): the
     /// subdomain is owned by exactly one tunnel, mirroring historical
@@ -1102,13 +1103,68 @@ impl TunnelCore {
 
 // ── utility ───────────────────────────────────────────────────────────────────
 
+/// Platform labels a customer tunnel must not claim. Occupying
+/// `admin.rustunnel.com` or `login.rustunnel.com` is a phishing risk.
+///
+/// Compared as ASCII-lowercase. Nameserver labels are not listed here:
+/// [`is_reserved_nameserver_label`] reserves `ns` plus an optional digit
+/// suffix (`ns`, `ns1`, `ns42`). A word that only starts with those letters
+/// (`nsfoo`) is allowed — it is not an `ns` / `ns<digits>` platform name.
+const RESERVED_SUBDOMAINS: &[&str] = &[
+    "www",
+    "api",
+    "app",
+    "dashboard",
+    "admin",
+    "login",
+    "auth",
+    "billing",
+    "status",
+    "docs",
+    "mail",
+];
+
+/// `true` when `lower` is `ns` or `ns` followed only by digits.
+///
+/// `lower` must already be ASCII-lowercase. `nsfoo` and `ns-1` are not
+/// nameserver labels: the suffix has to be empty or entirely digits.
+fn is_reserved_nameserver_label(lower: &str) -> bool {
+    match lower.strip_prefix("ns") {
+        Some(rest) => rest.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+fn is_reserved_subdomain(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    RESERVED_SUBDOMAINS.contains(&lower.as_str()) || is_reserved_nameserver_label(&lower)
+}
+
 /// Validate a user-supplied subdomain label.
 ///
 /// Rules:
 /// * Length: 3–63 characters.
 /// * Characters: ASCII alphanumeric or hyphens only.
 /// * No leading or trailing hyphens.
+/// * Not a reserved platform label ([`RESERVED_SUBDOMAINS`]) and not an
+///   `ns` / `ns<digits>` nameserver label. The reserved check uses an
+///   ASCII-lowercase copy of the label; the caller's string is not rewritten.
+///   `nsfoo` passes. A well-formed reserved label reports
+///   `subdomain_reserved` even when it is shorter than 3 characters (`ns`).
 fn validate_subdomain(s: &str) -> Result<()> {
+    // Structural checks still win for malformed input (`-admin`, `ad min`).
+    // A label that is otherwise well-formed — including the 2-character
+    // nameserver label `ns` — is rejected as reserved before the length rule,
+    // so the CLI sees `subdomain_reserved` rather than a length error.
+    if is_reserved_subdomain(s)
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(Error::Tunnel(format!(
+            "subdomain_reserved: subdomain '{s}' is reserved"
+        )));
+    }
     if !(3..=63).contains(&s.len()) {
         return Err(Error::Tunnel(format!(
             "subdomain '{s}' must be 3–63 characters long"
@@ -1474,6 +1530,90 @@ mod tests {
             ),
             Err(Error::Tunnel(_))
         ));
+    }
+
+    #[test]
+    fn reserved_subdomains_are_rejected() {
+        for s in [
+            "www",
+            "api",
+            "app",
+            "dashboard",
+            "admin",
+            "login",
+            "auth",
+            "billing",
+            "status",
+            "docs",
+            "mail",
+        ] {
+            let err = validate_subdomain(s).expect_err(s);
+            assert!(
+                err.to_string().contains("subdomain_reserved"),
+                "{s} => {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_subdomains_are_case_insensitive() {
+        for s in ["WWW", "Api", "ADMIN", "Login", "BiLlInG", "Ns42"] {
+            let err = validate_subdomain(s).expect_err(s);
+            assert!(
+                err.to_string().contains("subdomain_reserved"),
+                "{s} => {err}"
+            );
+        }
+        assert_eq!(
+            validate_subdomain("admin").unwrap_err().to_string(),
+            "tunnel error: subdomain_reserved: subdomain 'admin' is reserved"
+        );
+    }
+
+    #[test]
+    fn nameserver_labels_are_reserved() {
+        // `ns` plus an optional digit suffix only. Mixed case is the same label.
+        for s in ["ns", "ns1", "ns42", "NS", "Ns1", "NS42"] {
+            let err = validate_subdomain(s).expect_err(s);
+            assert!(
+                err.to_string().contains("subdomain_reserved"),
+                "{s} => {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ns_prefixed_words_are_not_reserved() {
+        // `nsfoo` starts with `ns` but the rest is not digits, so it is a
+        // normal custom subdomain. Same for a hyphenated label.
+        assert!(validate_subdomain("nsfoo").is_ok());
+        assert!(validate_subdomain("ns-1").is_ok());
+        assert!(validate_subdomain("myapp").is_ok());
+    }
+
+    #[test]
+    fn generated_hex_subdomains_are_not_reserved() {
+        // random_subdomain() is 8 lowercase hex digits. Every reserved label
+        // contains a non-hex letter (`n`/`s` on nameserver labels, and at
+        // least one of w/p/i/m/… on the static list), so a generated label
+        // cannot collide with the reserved set.
+        let generated = random_subdomain();
+        assert_eq!(generated.len(), 8);
+        assert!(generated.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(validate_subdomain(&generated).is_ok(), "{generated}");
+        assert!(validate_subdomain("deadbeef").is_ok());
+        assert!(validate_subdomain("01234567").is_ok());
+    }
+
+    #[test]
+    fn register_http_tunnel_rejects_reserved_subdomain() {
+        let core = make_core();
+        let (sid, _rx) = dummy_session(&core);
+        let err = core
+            .register_http_tunnel(&sid, Some("admin".into()), TunnelProtocol::Http, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("subdomain_reserved"), "{err}");
+        assert!(!core.http_routes.contains_key("admin"));
     }
 
     // ── NAT classification ───────────────────────────────────────────────
