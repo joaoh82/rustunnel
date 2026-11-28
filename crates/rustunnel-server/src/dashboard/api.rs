@@ -1468,6 +1468,8 @@ struct AdminUsersQuery {
     /// Only users who were on a paid plan and have since canceled.
     #[serde(default)]
     previously_paid: bool,
+    /// `human` or `agent`. Omitted returns both, including deactivated rows.
+    kind: Option<String>,
     /// "created" (default) | "last_active" | "email". Unknown values fall back
     /// to the default rather than erroring.
     sort: Option<String>,
@@ -1499,6 +1501,7 @@ async fn admin_list_users(
         auth_method: q.auth_method.as_deref(),
         status: q.status.as_deref(),
         previously_paid: q.previously_paid,
+        kind: q.kind.as_deref(),
     };
     let sort = q
         .sort

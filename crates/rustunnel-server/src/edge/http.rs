@@ -65,6 +65,7 @@ use rustunnel_protocol::TunnelProtocol;
 use crate::core::{ControlMessage, TunnelCore};
 use crate::edge::capture::{CaptureEvent, CaptureTx};
 use crate::net::bind_reuse;
+use crate::policy::{self, AccountGate, EdgeAction, EdgeResponse, IncomingRequest};
 
 // ── timeouts ──────────────────────────────────────────────────────────────────
 
@@ -120,6 +121,8 @@ pub struct HttpEdgeConfig {
     pub rate_limit_rps: u32,
     pub request_body_max_bytes: usize,
     pub plain_http_mode: PlainHttpMode,
+    /// Account and bandwidth cache. A zero TTL reads Postgres on every request.
+    pub account_gate: Arc<AccountGate>,
 }
 
 #[derive(Clone)]
@@ -132,6 +135,7 @@ struct ProxyCtx {
     plain_http_mode: PlainHttpMode,
     /// Public HTTPS port, used to build redirect Locations (omitted when 443).
     https_port: u16,
+    account_gate: Arc<AccountGate>,
 }
 
 // ── public entry point ────────────────────────────────────────────────────────
@@ -154,6 +158,7 @@ pub async fn run_http_edge(
         request_body_max_bytes: limits.request_body_max_bytes,
         plain_http_mode: limits.plain_http_mode,
         https_port: https_addr.port(),
+        account_gate: limits.account_gate,
     };
 
     tokio::select! {
@@ -395,6 +400,13 @@ async fn proxy_request(
         if content_length > ctx.request_body_max_bytes {
             return err_response(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large");
         }
+    }
+
+    // ── 2b2. Plan cap, ban, and the unclaimed-agent warning ──────────────
+    // Before a stream is opened, so a blocked request never reaches the
+    // local service. The acknowledgement redirect is answered here too.
+    if let Some(response) = account_guard(&ctx, &req, &tunnel_info, scheme).await {
+        return response;
     }
 
     // ── 2c. Concurrent connection limit ──────────────────────────────────
@@ -872,6 +884,91 @@ fn set_forwarded_headers(
     if let Ok(v) = HeaderValue::from_str(original_host) {
         headers.insert("x-forwarded-host", v);
     }
+}
+
+fn header_str<'a>(req: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
+    req.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+async fn account_guard(
+    ctx: &ProxyCtx,
+    req: &Request<Incoming>,
+    tunnel: &crate::core::TunnelInfo,
+    scheme: ForwardScheme,
+) -> Option<Response<BoxBody>> {
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    if let Some(ack) =
+        policy::warning_acknowledgement(path_and_query, scheme == ForwardScheme::Https)
+    {
+        return Some(edge_response(ack));
+    }
+
+    let user_id = ctx
+        .core
+        .sessions
+        .get(&tunnel.session_id)
+        .and_then(|session| session.user_id);
+    let user_id = user_id?;
+    let view = match ctx.account_gate.view(user_id).await {
+        Ok(Some(view)) => view,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(error = %e, %user_id, "account lookup failed; proxying");
+            return None;
+        }
+    };
+    let month_bytes = if view
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.bandwidth_hard_cap)
+    {
+        match ctx.account_gate.month_bytes(user_id).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(error = %e, %user_id, "bandwidth lookup failed; proxying");
+                0
+            }
+        }
+    } else {
+        0
+    };
+    let host = header_str(req, "host").unwrap_or("");
+    let action = policy::edge_action(
+        &view,
+        month_bytes,
+        &IncomingRequest {
+            method: req.method().as_str(),
+            accept: header_str(req, "accept"),
+            sec_fetch_mode: header_str(req, "sec-fetch-mode"),
+            skip_warning: header_str(req, policy::WARNING_SKIP_HEADER),
+            cookie: header_str(req, "cookie"),
+            host,
+            path_and_query,
+        },
+    );
+    match action {
+        EdgeAction::Proxy => None,
+        EdgeAction::Respond(response) => Some(edge_response(response)),
+    }
+}
+
+fn edge_response(response: EdgeResponse) -> Response<BoxBody> {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", response.content_type)
+        .header("cache-control", "no-store");
+    if let Some(cookie) = response.set_cookie {
+        builder = builder.header("set-cookie", cookie);
+    }
+    if let Some(location) = response.location {
+        builder = builder.header("location", location);
+    }
+    builder.body(full(response.body)).unwrap()
 }
 
 fn err_response(status: StatusCode, msg: &str) -> Response<BoxBody> {

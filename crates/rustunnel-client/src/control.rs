@@ -297,7 +297,7 @@ pub async fn connect(
             }
             (session_id, supports_lb)
         }
-        ControlFrame::AuthError { message } => {
+        ControlFrame::AuthError { message, .. } => {
             sp.finish_and_clear();
             let token_desc = if config.auth_token.as_deref().unwrap_or("").is_empty() {
                 "no auth token was provided".to_string()

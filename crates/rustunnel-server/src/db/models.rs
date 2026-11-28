@@ -106,9 +106,10 @@ pub struct TunnelLogEntry {
 /// platform-api `POST /agent/signup` must insert an active `subscriptions`
 /// row pointing at this plan, set `tokens.expires_at` to
 /// `users.created_at + TOKEN_TTL_DAYS`, and store a salted IP hash in
-/// `users.signup_ip_hash`. The edge does not enforce these limits until
-/// ticket 2. `billing_model` is [`Self::BILLING_MODEL`], not `"free"`, so
-/// the deployed hobby gate does not apply.
+/// `users.signup_ip_hash`. The edge reads the active plan row in
+/// `policy` (tunnel cap, protocols, custom subdomain, hard bandwidth).
+/// `billing_model` is [`Self::BILLING_MODEL`], not `"free"`, so the Hobby
+/// gate does not apply.
 pub struct AgentPlanLimits;
 
 impl AgentPlanLimits {

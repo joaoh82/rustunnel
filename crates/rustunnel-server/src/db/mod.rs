@@ -369,6 +369,8 @@ pub struct AdminUserFilters<'a> {
     /// Only users who were on a paid plan (`metered` or `subscription`) and
     /// have since canceled. `agent` is not a paid billing model.
     pub previously_paid: bool,
+    /// `human` or `agent`. `None` keeps every kind, including deactivated rows.
+    pub kind: Option<&'a str>,
 }
 
 /// Sort orders accepted by the admin user list.
@@ -441,7 +443,10 @@ const ADMIN_USER_COLS: &str = "
     tc.last_active_at";
 
 /// Filter predicates. Bind order: $1 search, $2 plan, $3 auth_method,
-/// $4 status, $5 previously_paid.
+/// $4 status, $5 previously_paid, $6 kind.
+///
+/// Deactivated rows stay in the result. `deactivated_at` is a column on the
+/// row, not a reason to hide it.
 const ADMIN_USER_FILTERS: &str = "
     WHERE ($1::text IS NULL OR u.email ILIKE '%' || $1 || '%')
       AND ($2::text IS NULL OR (CASE WHEN sub.status = 'canceled'
@@ -449,7 +454,8 @@ const ADMIN_USER_FILTERS: &str = "
       AND ($3::text IS NULL OR u.auth_method = $3)
       AND ($4::text IS NULL OR u.status = $4)
       AND ($5::bool IS NOT TRUE OR (sub.status = 'canceled'
-                                    AND sub.billing_model IN ('metered', 'subscription')))";
+                                    AND sub.billing_model IN ('metered', 'subscription')))
+      AND ($6::text IS NULL OR u.kind = $6)";
 
 /// Paginated, filterable list of users.
 pub async fn list_admin_users(
@@ -460,7 +466,7 @@ pub async fn list_admin_users(
     sort: AdminUserSort,
 ) -> Result<Vec<AdminUser>> {
     let sql = format!(
-        "SELECT {cols} FROM users u {tokens} {sub} {filters} {order} LIMIT $6 OFFSET $7",
+        "SELECT {cols} FROM users u {tokens} {sub} {filters} {order} LIMIT $7 OFFSET $8",
         cols = ADMIN_USER_COLS,
         tokens = TOKEN_LATERAL,
         sub = SUB_LATERAL,
@@ -473,6 +479,7 @@ pub async fn list_admin_users(
         .bind(filters.auth_method)
         .bind(filters.status)
         .bind(filters.previously_paid)
+        .bind(filters.kind)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
@@ -496,6 +503,7 @@ pub async fn count_admin_users(pool: &PgPool, filters: AdminUserFilters<'_>) -> 
         .bind(filters.auth_method)
         .bind(filters.status)
         .bind(filters.previously_paid)
+        .bind(filters.kind)
         .fetch_one(pool)
         .await?;
     Ok(count)

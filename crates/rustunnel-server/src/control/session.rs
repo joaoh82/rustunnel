@@ -44,6 +44,25 @@ const DATA_PING_INTERVAL: Duration = Duration::from_secs(20);
 const DATA_PONG_DEADLINE: Duration = Duration::from_secs(10);
 const CTRL_CHANNEL_SIZE: usize = 64;
 
+fn auth_error(message: impl Into<String>, code: Option<&str>) -> ControlFrame {
+    ControlFrame::AuthError {
+        message: message.into(),
+        code: code.map(str::to_string),
+    }
+}
+
+fn tunnel_error(
+    request_id: String,
+    message: impl Into<String>,
+    code: Option<&str>,
+) -> ControlFrame {
+    ControlFrame::TunnelError {
+        request_id,
+        message: message.into(),
+        code: code.map(str::to_string),
+    }
+}
+
 // ── session context ───────────────────────────────────────────────────────────
 
 /// Bundles the per-session immutable references that are needed throughout
@@ -184,13 +203,7 @@ where
             client_version,
         } => (token, client_version),
         other => {
-            let _ = send_frame(
-                &mut ws,
-                &ControlFrame::AuthError {
-                    message: "expected Auth frame".into(),
-                },
-            )
-            .await;
+            let _ = send_frame(&mut ws, &auth_error("expected Auth frame", None)).await;
             let _ = audit_tx.try_send(AuditEvent::AuthAttempt {
                 peer: peer_addr.to_string(),
                 success: false,
@@ -203,13 +216,7 @@ where
     // Throttle before touching any secret: a peer that has burned through its
     // failed-attempt budget never reaches the token comparison.
     if core.auth_limiter.is_limited(peer_addr.ip()) {
-        let _ = send_frame(
-            &mut ws,
-            &ControlFrame::AuthError {
-                message: "too many failed auth attempts".into(),
-            },
-        )
-        .await;
+        let _ = send_frame(&mut ws, &auth_error("too many failed auth attempts", None)).await;
         let _ = audit_tx.try_send(AuditEvent::AuthAttempt {
             peer: peer_addr.to_string(),
             success: false,
@@ -245,19 +252,33 @@ where
 
     if !authed {
         core.auth_limiter.record_failure(peer_addr.ip());
-        let _ = send_frame(
-            &mut ws,
-            &ControlFrame::AuthError {
-                message: "invalid token".into(),
-            },
-        )
-        .await;
+        let _ = send_frame(&mut ws, &auth_error("invalid token", None)).await;
         let _ = audit_tx.try_send(AuditEvent::AuthAttempt {
             peer: peer_addr.to_string(),
             success: false,
             token_id: None,
         });
         return Err(Error::Auth("invalid token".into()));
+    }
+
+    if let Some(token) = db_token.as_ref() {
+        match crate::policy::token_auth_block(&db.pg, token).await {
+            Ok(Some(block)) => {
+                let _ = send_frame(&mut ws, &auth_error(block.message(), Some(block.code()))).await;
+                let _ = audit_tx.try_send(AuditEvent::AuthAttempt {
+                    peer: peer_addr.to_string(),
+                    success: false,
+                    token_id: Some(token.id.clone()),
+                });
+                return Err(Error::Auth(block.message().into()));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "account access check failed");
+                let _ = send_frame(&mut ws, &auth_error("account check failed", None)).await;
+                return Err(Error::Auth("account check failed".into()));
+            }
+        }
     }
 
     let token_id = token.clone();
@@ -565,10 +586,11 @@ where
                 if token.status != "active" {
                     send_frame(
                         ws,
-                        &ControlFrame::TunnelError {
+                        &tunnel_error(
                             request_id,
-                            message: "token is suspended or revoked".into(),
-                        },
+                            "token is suspended or revoked",
+                            Some(crate::policy::code::TOKEN_INACTIVE),
+                        ),
                     )
                     .await?;
                     return Ok(());
@@ -578,10 +600,11 @@ where
                         if Utc::now() > exp {
                             send_frame(
                                 ws,
-                                &ControlFrame::TunnelError {
+                                &tunnel_error(
                                     request_id,
-                                    message: "token has expired".into(),
-                                },
+                                    "api token expired",
+                                    Some(crate::policy::code::TOKEN_EXPIRED),
+                                ),
                             )
                             .await?;
                             return Ok(());
@@ -606,14 +629,7 @@ where
                                 &block,
                                 surface,
                             );
-                            send_frame(
-                                ws,
-                                &ControlFrame::TunnelError {
-                                    request_id,
-                                    message,
-                                },
-                            )
-                            .await?;
+                            send_frame(ws, &tunnel_error(request_id, message, None)).await?;
                             return Ok(());
                         }
                         if let Some(warning) = gate.notice {
@@ -625,6 +641,21 @@ where
                                 surface,
                             );
                             registration_notice = Some(warning.message(surface));
+                        }
+                        if let Some(denial) = crate::policy::evaluate_plan_registration(
+                            &db.pg,
+                            user_id,
+                            crate::policy::protocol_name(&protocol),
+                            subdomain.as_deref(),
+                        )
+                        .await?
+                        {
+                            send_frame(
+                                ws,
+                                &tunnel_error(request_id, denial.message, Some(denial.code)),
+                            )
+                            .await?;
+                            return Ok(());
                         }
                     }
                 }
@@ -681,14 +712,7 @@ where
                             .await?;
                         }
                         Err(e) => {
-                            send_frame(
-                                ws,
-                                &ControlFrame::TunnelError {
-                                    request_id,
-                                    message: e.to_string(),
-                                },
-                            )
-                            .await?;
+                            send_frame(ws, &tunnel_error(request_id, e.to_string(), None)).await?;
                         }
                     }
                 }
@@ -729,14 +753,7 @@ where
                         .await?;
                     }
                     Err(e) => {
-                        send_frame(
-                            ws,
-                            &ControlFrame::TunnelError {
-                                request_id,
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
+                        send_frame(ws, &tunnel_error(request_id, e.to_string(), None)).await?;
                     }
                 },
                 TunnelProtocol::Tcp => match core.register_tcp_tunnel(&session_id, group_spec) {
@@ -776,24 +793,18 @@ where
                         .await?;
                     }
                     Err(e) => {
-                        send_frame(
-                            ws,
-                            &ControlFrame::TunnelError {
-                                request_id,
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
+                        send_frame(ws, &tunnel_error(request_id, e.to_string(), None)).await?;
                     }
                 },
                 TunnelProtocol::P2p => {
                     if !config.p2p.enabled {
                         send_frame(
                             ws,
-                            &ControlFrame::TunnelError {
+                            &tunnel_error(
                                 request_id,
-                                message: "P2P tunnels are not enabled on this server".into(),
-                            },
+                                "P2P tunnels are not enabled on this server",
+                                None,
+                            ),
                         )
                         .await?;
                         return Ok(());
@@ -803,10 +814,11 @@ where
                         None => {
                             send_frame(
                                 ws,
-                                &ControlFrame::TunnelError {
+                                &tunnel_error(
                                     request_id,
-                                    message: "P2P tunnel requires a name (p2p_name)".into(),
-                                },
+                                    "P2P tunnel requires a name (p2p_name)",
+                                    None,
+                                ),
                             )
                             .await?;
                             return Ok(());
@@ -817,11 +829,11 @@ where
                         None => {
                             send_frame(
                                 ws,
-                                &ControlFrame::TunnelError {
+                                &tunnel_error(
                                     request_id,
-                                    message: "P2P tunnel requires a secret hash (p2p_secret_hash)"
-                                        .into(),
-                                },
+                                    "P2P tunnel requires a secret hash (p2p_secret_hash)",
+                                    None,
+                                ),
                             )
                             .await?;
                             return Ok(());
@@ -863,14 +875,7 @@ where
                             .await?;
                         }
                         Err(e) => {
-                            send_frame(
-                                ws,
-                                &ControlFrame::TunnelError {
-                                    request_id,
-                                    message: e.to_string(),
-                                },
-                            )
-                            .await?;
+                            send_frame(ws, &tunnel_error(request_id, e.to_string(), None)).await?;
                         }
                     }
                 }
