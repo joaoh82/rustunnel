@@ -24,14 +24,17 @@
 //! cap. An open stream therefore stops on the next pass even when the meter
 //! flush is disabled. A database error on that pass or on a proxied request
 //! serves the last cached account and byte total, including one past its
-//! TTL. The request is proxied, and the session stays up, only when this
-//! process has no cached entry at all.
+//! TTL. The account lookup itself waits at most [`ACCOUNT_LOOKUP_TIMEOUT`]
+//! and, after a failure, is not tried again for that user for
+//! [`ACCOUNT_LOOKUP_BACKOFF`]. The request is proxied, and the session stays
+//! up, only when this process has no cached entry at all.
 //!
 //! # Deactivation sweep
 //!
 //! [`deactivate_expired_unclaimed_agents`] is one `UPDATE`. Every edge may
 //! run it. It never deletes a user or a token.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -45,7 +48,7 @@ use rustunnel_protocol::TunnelProtocol;
 use crate::billing::month_bytes_including_live;
 use crate::core::{ControlMessage, TunnelCore};
 use crate::db::models::{AgentPlanLimits, Token};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Per-request account snapshot. The session recheck still reads Postgres.
 /// When that read fails it uses this snapshot, including after the TTL.
@@ -60,26 +63,28 @@ pub const SESSION_RECHECK_INTERVAL: Duration = Duration::from_secs(20);
 /// month-byte read the hard cap uses. A stuck database returns in this time
 /// instead of holding the recheck loop.
 const STATEMENT_TIMEOUT: &str = "2s";
+/// How long a proxied request waits for the account row before using the
+/// cached snapshot, or failing open when there is none. The pool's own
+/// acquire timeout is much longer; this is the bound the edge actually uses.
+const ACCOUNT_LOOKUP_TIMEOUT: Duration = Duration::from_millis(400);
+/// After a timed-out or failed account lookup, how long further requests
+/// for that user skip Postgres. One request every few seconds is enough to
+/// notice the database is back.
+const ACCOUNT_LOOKUP_BACKOFF: Duration = Duration::from_secs(3);
 /// How often expired unclaimed agent accounts are marked `deactivated_at`.
 pub const DEACTIVATION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Unprefixed continue cookie.
-///
-/// Written on plain HTTP. A `__Host-` cookie has to be `Secure`, and
-/// browsers drop it on `http`. Readers also accept this name for one
-/// release after HTTPS moved to [`WARNING_COOKIE_HOST_NAME`], so a cookie
-/// already stored still skips the warning. Drop that read in the following
-/// release: another host on `rustunnel.com` can set this name with
-/// `Domain`, which [`WARNING_COOKIE_HOST_NAME`] cannot.
-pub const WARNING_COOKIE_NAME: &str = "rustunnel_warn_ok";
-/// HTTPS continue cookie. `__Host-` requires `Secure`, `Path=/`, and no
-/// `Domain`, so the browser stores it for the tunnel host that set it and
-/// rejects a `Domain` attribute.
-pub const WARNING_COOKIE_HOST_NAME: &str = "__Host-rustunnel_warn_ok";
-/// How long either continue cookie skips the warning on that host.
+/// `__Host-` cookie the warning page sets. Continue sends the same value
+/// back as [`WARNING_ACK_PARAM`]. The browser only stores a `__Host-` cookie
+/// that is `Secure`, `Path=/`, and has no `Domain`.
+pub const WARNING_NONCE_COOKIE: &str = "__Host-rustunnel_warn_nonce";
+/// `__Host-` cookie set once the nonce matches. The browser stores it for
+/// the tunnel host, so a visitor is not warned again on that host for this long.
+pub const WARNING_COOKIE_NAME: &str = "__Host-rustunnel_warn_ok";
 pub const WARNING_COOKIE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
-/// Query flag the Continue link uses. The edge answers it itself and does
-/// not forward it to the local service.
+/// Query flag the Continue link uses. Its value is the nonce from
+/// [`WARNING_NONCE_COOKIE`]. The edge answers it itself and does not
+/// forward it to the local service.
 pub const WARNING_ACK_PARAM: &str = "rustunnel_warn_continue";
 /// `rustunnel-skip-warning: 1` proxies the request with no interstitial.
 pub const WARNING_SKIP_HEADER: &str = "rustunnel-skip-warning";
@@ -183,6 +188,10 @@ pub struct EdgeResponse {
     /// `default-src 'none'` plus a hash of the inline style, and
     /// `frame-ancestors 'none'`.
     pub content_security_policy: Option<&'static str>,
+    /// `noindex` on the warning page and its acknowledgement.
+    pub robots: Option<&'static str>,
+    /// `no-referrer` on the warning page and its acknowledgement.
+    pub referrer_policy: Option<&'static str>,
 }
 
 /// Headers the edge already pulled off the public request.
@@ -190,12 +199,14 @@ pub struct IncomingRequest<'a> {
     pub method: &'a str,
     pub accept: Option<&'a str>,
     pub sec_fetch_mode: Option<&'a str>,
+    /// `Sec-Fetch-Site` when the browser sent it. The acknowledgement
+    /// accepts `same-origin` and also a request that omits the header.
+    pub sec_fetch_site: Option<&'a str>,
     pub skip_warning: Option<&'a str>,
     pub cookie: Option<&'a str>,
     pub host: &'a str,
     pub path_and_query: &'a str,
-    /// Public scheme. HTTPS writes [`WARNING_COOKIE_HOST_NAME`] with
-    /// `Secure`. Plain HTTP writes [`WARNING_COOKIE_NAME`] without `Secure`.
+    /// Public scheme of the request.
     pub https: bool,
 }
 
@@ -212,6 +223,14 @@ struct CachedBytes {
     live: Vec<(Uuid, u64)>,
 }
 
+/// One in-flight account lookup, shared by every request for that user.
+struct AccountFlight {
+    notify: tokio::sync::Notify,
+    /// `Ok` is the loaded row (`None` means the user does not exist).
+    /// `Err` means the lookup failed or timed out.
+    outcome: std::sync::Mutex<Option<std::result::Result<Option<AccountView>, ()>>>,
+}
+
 /// Short-lived cache in front of account and bandwidth reads.
 pub struct AccountGate {
     pool: PgPool,
@@ -219,6 +238,9 @@ pub struct AccountGate {
     bandwidth_ttl: Duration,
     accounts: DashMap<Uuid, CachedView>,
     bandwidth: DashMap<Uuid, CachedBytes>,
+    /// `user_id` → do not query again until this instant.
+    lookup_not_before: DashMap<Uuid, Instant>,
+    inflight: DashMap<Uuid, Arc<AccountFlight>>,
 }
 
 impl AccountGate {
@@ -229,20 +251,78 @@ impl AccountGate {
             bandwidth_ttl,
             accounts: DashMap::new(),
             bandwidth: DashMap::new(),
+            lookup_not_before: DashMap::new(),
+            inflight: DashMap::new(),
         }
     }
 
     /// Account row plus the active plan. `None` when the user does not exist.
     ///
-    /// A database error returns the last cached snapshot, including one past
-    /// [`ACCOUNT_CACHE_TTL`]. The error is returned only when this user has
-    /// never been cached.
+    /// The lookup waits at most [`ACCOUNT_LOOKUP_TIMEOUT`]. A timeout or
+    /// database error returns the last cached snapshot, including one past
+    /// [`ACCOUNT_CACHE_TTL`], and skips Postgres for
+    /// [`ACCOUNT_LOOKUP_BACKOFF`]. The error is returned only when this user
+    /// has never been cached. Concurrent misses share one lookup.
     pub async fn view(&self, user_id: Uuid) -> Result<Option<AccountView>> {
         if let Some(hit) = self.fresh_view(user_id) {
             return Ok(Some(hit));
         }
-        match load_account(&self.pool, user_id).await {
-            Ok(loaded) => {
+        if self.lookup_deferred(user_id) {
+            return self.cached_or_err(user_id);
+        }
+        let flight = Arc::new(AccountFlight {
+            notify: tokio::sync::Notify::new(),
+            outcome: std::sync::Mutex::new(None),
+        });
+        let role = match self.inflight.entry(user_id) {
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&flight));
+                Some(flight)
+            }
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let existing = Arc::clone(entry.get());
+                drop(entry);
+                return self.wait_for_lookup(user_id, existing).await;
+            }
+        };
+        let flight = role.expect("vacant entry inserts a flight");
+        let result = self.load_view(user_id).await;
+        let stored = match &result {
+            Ok(view) => Ok(view.clone()),
+            Err(_) => Err(()),
+        };
+        *flight
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
+        flight.notify.notify_waiters();
+        self.inflight.remove(&user_id);
+        result
+    }
+
+    async fn wait_for_lookup(
+        &self,
+        user_id: Uuid,
+        flight: Arc<AccountFlight>,
+    ) -> Result<Option<AccountView>> {
+        let _ = tokio::time::timeout(ACCOUNT_LOOKUP_TIMEOUT, flight.notify.notified()).await;
+        let outcome = flight
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match outcome {
+            Some(Ok(view)) => Ok(view),
+            Some(Err(())) | None => self.cached_or_err(user_id),
+        }
+    }
+
+    async fn load_view(&self, user_id: Uuid) -> Result<Option<AccountView>> {
+        let loaded =
+            tokio::time::timeout(ACCOUNT_LOOKUP_TIMEOUT, load_account(&self.pool, user_id)).await;
+        match loaded {
+            Ok(Ok(loaded)) => {
+                self.lookup_not_before.remove(&user_id);
                 if !self.account_ttl.is_zero() {
                     if let Some(ref view) = loaded {
                         self.accounts.insert(
@@ -258,17 +338,40 @@ impl AccountGate {
                 }
                 Ok(loaded)
             }
-            Err(e) => match self.any_view(user_id) {
-                Some(view) => {
-                    tracing::warn!(
-                        error = %e,
-                        %user_id,
-                        "account lookup failed; using cached account"
-                    );
-                    Ok(Some(view))
-                }
-                None => Err(e),
-            },
+            Ok(Err(e)) => self.failed_lookup(user_id, e),
+            Err(_elapsed) => {
+                tracing::warn!(%user_id, "account lookup timed out");
+                self.failed_lookup(user_id, lookup_timeout_error())
+            }
+        }
+    }
+
+    fn failed_lookup(&self, user_id: Uuid, error: Error) -> Result<Option<AccountView>> {
+        self.lookup_not_before
+            .insert(user_id, Instant::now() + ACCOUNT_LOOKUP_BACKOFF);
+        match self.any_view(user_id) {
+            Some(view) => {
+                tracing::warn!(
+                    error = %error,
+                    %user_id,
+                    "account lookup failed; using cached account"
+                );
+                Ok(Some(view))
+            }
+            None => Err(error),
+        }
+    }
+
+    fn lookup_deferred(&self, user_id: Uuid) -> bool {
+        self.lookup_not_before
+            .get(&user_id)
+            .is_some_and(|until| Instant::now() < *until)
+    }
+
+    fn cached_or_err(&self, user_id: Uuid) -> Result<Option<AccountView>> {
+        match self.any_view(user_id) {
+            Some(view) => Ok(Some(view)),
+            None => Err(lookup_timeout_error()),
         }
     }
 
@@ -494,7 +597,8 @@ fn hard_cap_limit(plan: &PlanLimits) -> Option<i64> {
 ///
 /// [`TunnelCountScope::all`] counts every open row. A registration passes
 /// the reconnecting token, its new session, and this edge's region so a
-/// dead or superseded session of that same token is left out.
+/// dead session of that same token is left out. A second live session of
+/// the same token still counts.
 pub struct TunnelCountScope<'a> {
     pub token_id: Option<&'a str>,
     pub session_id: Uuid,
@@ -586,26 +690,21 @@ async fn count_open_tunnels(
         return Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX));
     };
     let current = scope.session_id.to_string();
-    let mut live = std::collections::HashSet::new();
-    let mut superseded = std::collections::HashSet::new();
-    for entry in core.sessions.iter() {
-        let id = entry.key().to_string();
-        if entry.db_token_id.as_deref() == Some(token_id) && id != current {
-            superseded.insert(id.clone());
-        }
-        live.insert(id);
-    }
+    let live: std::collections::HashSet<String> = core
+        .sessions
+        .iter()
+        .map(|entry| entry.key().to_string())
+        .collect();
     let count = rows
         .iter()
-        .filter(|row| {
-            counts_toward_tunnel_limit(row, token_id, &current, scope.region_id, &live, &superseded)
-        })
+        .filter(|row| counts_toward_tunnel_limit(row, token_id, &current, scope.region_id, &live))
         .count();
     Ok(i64::try_from(count).unwrap_or(i64::MAX))
 }
 
-/// A row counts unless it is this token's superseded session, or this
-/// token's row on this region whose session is already gone.
+/// A row counts unless it belongs to this token, is on this region, and its
+/// session is already gone. Another live session of the same token still
+/// counts, so one token cannot open a tunnel per websocket.
 ///
 /// Another token still counts. The same token on another region still
 /// counts: that session is live somewhere else, not dead on this edge.
@@ -615,13 +714,9 @@ fn counts_toward_tunnel_limit(
     current_session: &str,
     region_id: &str,
     live: &std::collections::HashSet<String>,
-    superseded: &std::collections::HashSet<String>,
 ) -> bool {
     if row.token_id.as_deref() != Some(token_id) || row.session_id == current_session {
         return true;
-    }
-    if superseded.contains(&row.session_id) {
-        return false;
     }
     let dead_on_this_region =
         row.region_id.as_deref() == Some(region_id) && !live.contains(&row.session_id);
@@ -679,6 +774,10 @@ fn view_from_row(row: AccountRow) -> AccountView {
     }
 }
 
+fn lookup_timeout_error() -> Error {
+    Error::Db(sqlx::Error::PoolTimedOut)
+}
+
 async fn load_account(pool: &PgPool, user_id: Uuid) -> Result<Option<AccountView>> {
     let row: Option<AccountRow> = sqlx::query_as(&format!("{ACCOUNT_SELECT} WHERE u.id = $1"))
         .bind(user_id)
@@ -714,97 +813,69 @@ pub fn warning_skipped(skip_header: Option<&str>, cookie: Option<&str>) -> bool 
 }
 
 pub fn cookie_has_warning_ack(cookie: Option<&str>) -> bool {
-    let Some(cookie) = cookie else {
-        return false;
-    };
-    cookie.split(';').any(|part| {
-        let mut kv = part.trim().splitn(2, '=');
-        let name = kv.next().unwrap_or("");
-        let value = kv.next().map(str::trim).unwrap_or("");
-        value == "1" && is_warning_cookie_name(name)
+    cookie_value(cookie, WARNING_COOKIE_NAME) == Some("1")
+}
+
+fn cookie_value<'a>(cookie: Option<&'a str>, name: &str) -> Option<&'a str> {
+    let cookie = cookie?;
+    cookie.split(';').find_map(|part| {
+        let part = part.trim();
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        (key == name).then_some(value.trim())
     })
 }
 
-fn is_warning_cookie_name(name: &str) -> bool {
-    name == WARNING_COOKIE_HOST_NAME || name == WARNING_COOKIE_NAME
-}
-
-/// Continue link target. `None` when this request is not the acknowledgement.
+/// Continue link target. `None` unless the query carries the nonce from
+/// [`WARNING_NONCE_COOKIE`].
 ///
-/// The caller must invoke this only for a GET on an unclaimed agent tunnel.
+/// When the browser sends `Sec-Fetch-Site`, the value has to be
+/// `same-origin`. A request that omits the header is still accepted, so a
+/// client that does not send fetch metadata can complete the click. The
+/// caller must invoke this only for a GET on an unclaimed agent tunnel.
 /// Any other request, including one that carries the query flag, is proxied
 /// with that flag still on it. The returned path drops only
 /// [`WARNING_ACK_PARAM`] and stays on this host.
-pub fn warning_acknowledgement(path_and_query: &str, https: bool) -> Option<EdgeResponse> {
-    let location = strip_ack_param(path_and_query)?;
+pub fn warning_acknowledgement(
+    path_and_query: &str,
+    cookie: Option<&str>,
+    sec_fetch_site: Option<&str>,
+) -> Option<EdgeResponse> {
+    if let Some(site) = sec_fetch_site {
+        if !site.trim().eq_ignore_ascii_case("same-origin") {
+            return None;
+        }
+    }
+    let (location, nonce) = strip_ack_param(path_and_query)?;
+    if cookie_value(cookie, WARNING_NONCE_COOKIE) != Some(nonce.as_str()) {
+        return None;
+    }
     Some(EdgeResponse {
         status: 303,
         content_type: "text/plain; charset=utf-8",
         body: String::new(),
-        set_cookie: Some(warning_cookie(https)),
+        set_cookie: Some(warning_cookie()),
         location: Some(location),
         frame_options: None,
         content_security_policy: None,
+        robots: Some("noindex"),
+        referrer_policy: Some("no-referrer"),
     })
 }
 
-pub fn warning_cookie(https: bool) -> String {
-    // `__Host-` is only valid with `Secure`. Plain HTTP keeps the unprefixed
-    // name so the browser will store the cookie. Neither form has a Domain
-    // attribute: that would share it with every tunnel and the dashboard.
-    let name = if https {
-        WARNING_COOKIE_HOST_NAME
-    } else {
-        WARNING_COOKIE_NAME
-    };
-    let mut cookie =
-        format!("{name}=1; Path=/; Max-Age={WARNING_COOKIE_MAX_AGE_SECS}; SameSite=Lax; HttpOnly");
-    if https {
-        cookie.push_str("; Secure");
-    }
-    debug_assert!(
-        !set_cookie_has_domain(&cookie),
-        "continue cookie must be host-only"
-    );
-    cookie
+pub fn warning_cookie() -> String {
+    format!(
+        "{WARNING_COOKIE_NAME}=1; Path=/; Max-Age={WARNING_COOKIE_MAX_AGE_SECS}; SameSite=Lax; HttpOnly; Secure"
+    )
 }
 
-/// `true` when `set_cookie` has a `Domain` attribute, in any case.
-///
-/// The first `name=value` pair is the cookie. Later pairs are attributes.
-/// A value that contains the word "domain" is not an attribute.
-pub fn set_cookie_has_domain(set_cookie: &str) -> bool {
-    set_cookie
-        .split(';')
-        .skip(1)
-        .any(|part| attribute_name(part).eq_ignore_ascii_case("domain"))
+fn nonce_cookie(nonce: &str) -> String {
+    format!("{WARNING_NONCE_COOKIE}={nonce}; Path=/; SameSite=Lax; HttpOnly; Secure")
 }
 
-/// Copy of `set_cookie` with any `Domain` attribute removed.
-///
-/// `Path`, `Secure`, `HttpOnly`, `SameSite`, and `Max-Age` are kept. The
-/// string is unchanged when it was already host-only.
-pub fn without_domain_attribute(set_cookie: String) -> String {
-    if !set_cookie_has_domain(&set_cookie) {
-        return set_cookie;
-    }
-    set_cookie
-        .split(';')
-        .enumerate()
-        .filter(|(index, part)| *index == 0 || !attribute_name(part).eq_ignore_ascii_case("domain"))
-        .map(|(_, part)| part)
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
-fn attribute_name(part: &str) -> &str {
-    part.split_once('=')
-        .map(|(name, _)| name)
-        .unwrap_or(part)
-        .trim()
-}
-
-fn strip_ack_param(path_and_query: &str) -> Option<String> {
+/// Location with [`WARNING_ACK_PARAM`] removed, and the nonce it carried.
+/// An empty value is not a nonce: `?rustunnel_warn_continue=1` alone does
+/// not acknowledge the warning.
+fn strip_ack_param(path_and_query: &str) -> Option<(String, String)> {
     let (path, query) = path_and_query
         .split_once('?')
         .unwrap_or((path_and_query, ""));
@@ -812,27 +883,28 @@ fn strip_ack_param(path_and_query: &str) -> Option<String> {
         return None;
     }
     let mut kept = Vec::new();
-    let mut found = false;
+    let mut nonce = None;
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
         }
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if key == WARNING_ACK_PARAM && (value == "1" || value.is_empty()) {
-            found = true;
+        if key == WARNING_ACK_PARAM {
+            if nonce.is_none() && !value.is_empty() {
+                nonce = Some(value.to_string());
+            }
             continue;
         }
         kept.push(pair);
     }
-    if !found {
-        return None;
-    }
+    let nonce = nonce?;
     let path = safe_path(path);
-    if kept.is_empty() {
-        Some(path.to_string())
+    let location = if kept.is_empty() {
+        path.to_string()
     } else {
-        Some(format!("{path}?{}", kept.join("&")))
-    }
+        format!("{path}?{}", kept.join("&"))
+    };
+    Some((location, nonce))
 }
 
 /// Same-origin path, or `/` when `path` could leave this host.
@@ -880,7 +952,9 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
     // tunnel. A human tunnel, a POST, or any other request keeps the query
     // string and is proxied.
     if req.method.eq_ignore_ascii_case("GET") && unclaimed_agent_tunnel(view) {
-        if let Some(ack) = warning_acknowledgement(req.path_and_query, req.https) {
+        if let Some(ack) =
+            warning_acknowledgement(req.path_and_query, req.cookie, req.sec_fetch_site)
+        {
             return EdgeAction::Respond(ack);
         }
     }
@@ -932,7 +1006,8 @@ fn bandwidth_page(plan: &PlanLimits, limit: i64, req: &IncomingRequest<'_>) -> E
 }
 
 fn warning_page(host: &str, path_and_query: &str) -> EdgeResponse {
-    let href = continue_href(path_and_query);
+    let nonce = Uuid::new_v4().simple().to_string();
+    let href = continue_href(path_and_query, &nonce);
     let body = html_doc(
         "Temporary unverified tunnel",
         &format!(
@@ -946,19 +1021,33 @@ fn warning_page(host: &str, path_and_query: &str) -> EdgeResponse {
             escape_html(&href)
         ),
     );
-    html_response(200, body)
+    let mut response = html_response(200, body);
+    response.set_cookie = Some(nonce_cookie(&nonce));
+    response.robots = Some("noindex");
+    response.referrer_policy = Some("no-referrer");
+    response
 }
 
-fn continue_href(path_and_query: &str) -> String {
+fn continue_href(path_and_query: &str, nonce: &str) -> String {
     let (path, query) = path_and_query
         .split_once('?')
         .unwrap_or((path_and_query, ""));
     let path = safe_path(path);
-    let extra = format!("{WARNING_ACK_PARAM}=1");
-    if query.is_empty() {
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            if pair.is_empty() {
+                return false;
+            }
+            let (key, _) = pair.split_once('=').unwrap_or((pair, ""));
+            key != WARNING_ACK_PARAM
+        })
+        .collect();
+    let extra = format!("{WARNING_ACK_PARAM}={nonce}");
+    if kept.is_empty() {
         format!("{path}?{extra}")
     } else {
-        format!("{path}?{query}&{extra}")
+        format!("{path}?{}&{extra}", kept.join("&"))
     }
 }
 
@@ -971,6 +1060,8 @@ fn html_response(status: u16, body: String) -> EdgeResponse {
         location: None,
         frame_options: Some("DENY"),
         content_security_policy: Some(content_security_policy()),
+        robots: None,
+        referrer_policy: None,
     }
 }
 
@@ -983,6 +1074,8 @@ fn json_response(status: u16, error_code: &str, message: &str) -> EdgeResponse {
         location: None,
         frame_options: None,
         content_security_policy: None,
+        robots: None,
+        referrer_policy: None,
     }
 }
 
@@ -1147,6 +1240,40 @@ async fn over_hard_cap(
     }
 }
 
+/// Same decision as [`over_hard_cap`] using only the byte cache. The batch
+/// load has already failed, so this must not open another Postgres query.
+fn cached_over_hard_cap(
+    gate: &AccountGate,
+    core: &TunnelCore,
+    view: &AccountView,
+    user_id: Uuid,
+) -> bool {
+    let Some(plan) = view.plan.as_ref() else {
+        return false;
+    };
+    let Some(limit) = hard_cap_limit(plan) else {
+        return false;
+    };
+    gate.any_month_bytes(user_id, core)
+        .is_some_and(|bytes| bytes >= limit)
+}
+
+fn remember_accounts(gate: &AccountGate, accounts: &std::collections::HashMap<Uuid, AccountView>) {
+    if gate.account_ttl.is_zero() {
+        return;
+    }
+    let now = Instant::now();
+    for (user_id, view) in accounts {
+        gate.accounts.insert(
+            *user_id,
+            CachedView {
+                view: view.clone(),
+                at: now,
+            },
+        );
+    }
+}
+
 /// Tokens and their users, one round trip, bounded by [`STATEMENT_TIMEOUT`].
 async fn load_recheck_rows(
     pool: &PgPool,
@@ -1200,8 +1327,10 @@ async fn load_recheck_rows(
 /// every session. The hard cap adds this process's unflushed counters
 /// ([`TunnelCore::live_bytes_proxied_for_user`], the same totals
 /// [`TunnelCore::get_tunnel_bytes_proxied`] reports) to the committed month
-/// sum. A database error uses `gate`'s last account and byte snapshot,
-/// including one past its TTL. With no snapshot the session stays up.
+/// sum. A successful load is written into `gate` so the proxy does not
+/// immediately read those users again. A database error uses `gate`'s last
+/// account and byte snapshot, including one past its TTL, and does not
+/// query Postgres again for the cap. With no snapshot the session stays up.
 /// Sends [`ControlMessage::Shutdown`]; the session task drops its tunnels.
 pub async fn disconnect_blocked_sessions(
     pool: &PgPool,
@@ -1224,6 +1353,7 @@ pub async fn disconnect_blocked_sessions(
     let token_ids: Vec<String> = snapshot.iter().map(|(_, id)| id.clone()).collect();
     match load_recheck_rows(pool, &token_ids).await {
         Ok((tokens, accounts)) => {
+            remember_accounts(gate, &accounts);
             let mut closed = 0usize;
             let mut over_cap: std::collections::HashMap<Uuid, bool> =
                 std::collections::HashMap::new();
@@ -1287,7 +1417,7 @@ pub async fn disconnect_blocked_sessions(
                     || match over_cap.get(&user_id).copied() {
                         Some(over) => over,
                         None => {
-                            let over = over_hard_cap(gate, core, &view, user_id).await;
+                            let over = cached_over_hard_cap(gate, core, &view, user_id);
                             over_cap.insert(user_id, over);
                             over
                         }
@@ -1481,6 +1611,7 @@ mod tests {
             method: "GET",
             accept: Some("text/html,application/xhtml+xml"),
             sec_fetch_mode: Some("navigate"),
+            sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
             host,
@@ -1498,7 +1629,7 @@ mod tests {
                 assert!(page.body.contains("automated agent"));
                 assert!(page.body.contains("demo.example"));
                 assert!(page.body.contains("passwords"));
-                assert!(page.body.contains("rustunnel_warn_continue=1"));
+                assert_warning_nonce(&page);
                 assert!(!page.body.contains("http://"));
                 assert!(!page.body.contains("https://"));
                 assert!(!page.body.contains("src="));
@@ -1544,15 +1675,8 @@ mod tests {
         assert!(matches!(edge_action(&agent, 0, &skip), EdgeAction::Proxy));
 
         let mut acked = browser("h.example", "/");
-        acked.cookie = Some("other=1; rustunnel_warn_ok=1");
+        acked.cookie = Some("other=1; __Host-rustunnel_warn_ok=1");
         assert!(matches!(edge_action(&agent, 0, &acked), EdgeAction::Proxy));
-        acked.cookie = Some("__Host-rustunnel_warn_ok=1");
-        assert!(matches!(edge_action(&agent, 0, &acked), EdgeAction::Proxy));
-        acked.cookie = Some("rustunnel_warn_ok=0");
-        assert!(matches!(
-            edge_action(&agent, 0, &acked),
-            EdgeAction::Respond(_)
-        ));
     }
 
     #[test]
@@ -1563,7 +1687,7 @@ mod tests {
                 assert!(!page.body.contains("<script>"));
                 assert!(page.body.contains("&lt;script&gt;"));
                 assert!(page.body.contains("&quot;"));
-                assert!(page.body.contains("rustunnel_warn_continue=1"));
+                assert_warning_nonce(&page);
             }
             EdgeAction::Proxy => panic!("expected the warning"),
         }
@@ -1593,79 +1717,142 @@ mod tests {
         }
     }
 
+    fn nonce_cookie_header(nonce: &str) -> String {
+        format!("{WARNING_NONCE_COOKIE}={nonce}")
+    }
+
+    fn acknowledged(path: &str, nonce: &str, site: Option<&str>) -> Option<EdgeResponse> {
+        let cookie = nonce_cookie_header(nonce);
+        warning_acknowledgement(path, Some(&cookie), site)
+    }
+
+    fn assert_warning_nonce(page: &EdgeResponse) {
+        let cookie = page.set_cookie.as_deref().expect("nonce cookie");
+        assert!(cookie.starts_with(&format!("{WARNING_NONCE_COOKIE}=")));
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("Secure"));
+        assert!(!cookie.to_ascii_lowercase().contains("domain="));
+        let nonce = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        assert!(!nonce.is_empty());
+        assert!(page.body.contains(&format!("{WARNING_ACK_PARAM}={nonce}")));
+        assert_eq!(page.robots, Some("noindex"));
+        assert_eq!(page.referrer_policy, Some("no-referrer"));
+    }
+
     #[test]
     fn continue_sets_a_host_scoped_cookie_and_strips_only_the_ack() {
-        let ack = warning_acknowledgement("/docs?x=1&rustunnel_warn_continue=1", true).unwrap();
+        let nonce = "abc123";
+        let ack = acknowledged(
+            &format!("/docs?x=1&{WARNING_ACK_PARAM}={nonce}"),
+            nonce,
+            Some("same-origin"),
+        )
+        .unwrap();
         assert_eq!(ack.status, 303);
         assert_eq!(ack.location.as_deref(), Some("/docs?x=1"));
-        assert_warning_set_cookie(&ack.set_cookie.unwrap(), true);
-        let plain = warning_acknowledgement("/?rustunnel_warn_continue=1", false).unwrap();
-        assert_eq!(plain.location.as_deref(), Some("/"));
-        assert_warning_set_cookie(&plain.set_cookie.unwrap(), false);
-        assert!(warning_acknowledgement("/docs?x=1", false).is_none());
+        assert_eq!(ack.robots, Some("noindex"));
+        assert_eq!(ack.referrer_policy, Some("no-referrer"));
+        let cookie = ack.set_cookie.unwrap();
+        assert!(cookie.starts_with("__Host-rustunnel_warn_ok=1; Path=/;"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Secure"));
+        assert!(!cookie.to_ascii_lowercase().contains("domain="));
+        assert!(acknowledged("/docs?x=1", nonce, Some("same-origin")).is_none());
+        assert_eq!(
+            acknowledged(
+                &format!("/?{WARNING_ACK_PARAM}={nonce}"),
+                nonce,
+                Some("same-origin"),
+            )
+            .unwrap()
+            .location
+            .as_deref(),
+            Some("/")
+        );
     }
 
     #[test]
-    fn set_cookie_domain_attribute_is_detected_and_removed() {
-        assert!(!set_cookie_has_domain(
-            "session=Domain=rustunnel.com; Path=/"
-        ));
-        assert!(!set_cookie_has_domain(
-            "rustunnel_warn_ok=1; Path=/; Secure"
-        ));
-        assert!(set_cookie_has_domain(
-            "rustunnel_warn_ok=1; Domain=rustunnel.com; Path=/"
-        ));
-        assert!(set_cookie_has_domain(
-            "rustunnel_warn_ok=1; domain=.rustunnel.com"
-        ));
-        assert!(set_cookie_has_domain("rustunnel_warn_ok=1; Domain"));
-        let scoped = "rustunnel_warn_ok=1; Domain=rustunnel.com; Path=/; HttpOnly; Secure";
-        assert_eq!(
-            without_domain_attribute(scoped.into()),
-            "rustunnel_warn_ok=1; Path=/; HttpOnly; Secure"
-        );
-        let host_only = "rustunnel_warn_ok=1; Path=/; Secure";
-        assert_eq!(without_domain_attribute(host_only.into()), host_only);
-    }
+    fn continue_requires_the_issued_nonce_and_same_origin() {
+        let nonce = "abc123";
+        let path = format!("/?{WARNING_ACK_PARAM}={nonce}");
+        let cookie = nonce_cookie_header(nonce);
 
-    fn assert_warning_set_cookie(cookie: &str, https: bool) {
         assert!(
-            !set_cookie_has_domain(cookie),
-            "Set-Cookie must not carry a Domain attribute: {cookie}"
+            warning_acknowledgement(&path, None, Some("same-origin")).is_none(),
+            "a missing nonce cookie must not acknowledge"
         );
-        assert!(cookie.contains("Path=/"), "{cookie}");
         assert!(
-            cookie.contains(&format!("Max-Age={WARNING_COOKIE_MAX_AGE_SECS}")),
-            "{cookie}"
+            warning_acknowledgement(
+                &format!("/?{WARNING_ACK_PARAM}=1"),
+                Some(&cookie),
+                Some("same-origin"),
+            )
+            .is_none(),
+            "the bare continue flag must not acknowledge"
         );
-        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
-        assert!(cookie.contains("HttpOnly"), "{cookie}");
-        if https {
-            assert_eq!(WARNING_COOKIE_HOST_NAME, "__Host-rustunnel_warn_ok");
-            assert!(
-                cookie.starts_with("__Host-rustunnel_warn_ok=1; Path=/;"),
-                "{cookie}"
-            );
-            assert!(cookie.contains("Secure"), "{cookie}");
-        } else {
-            assert_eq!(WARNING_COOKIE_NAME, "rustunnel_warn_ok");
-            assert!(
-                cookie.starts_with("rustunnel_warn_ok=1; Path=/;"),
-                "{cookie}"
-            );
-            assert!(
-                !cookie
-                    .split(';')
-                    .any(|part| part.trim().eq_ignore_ascii_case("secure")),
-                "{cookie}"
-            );
-            assert!(!cookie.contains("__Host-"), "{cookie}");
+        assert!(
+            warning_acknowledgement(
+                &format!("/?{WARNING_ACK_PARAM}=other"),
+                Some(&cookie),
+                Some("same-origin"),
+            )
+            .is_none(),
+            "a wrong nonce must not acknowledge"
+        );
+        assert!(
+            warning_acknowledgement(&path, Some(&cookie), Some("cross-site")).is_none(),
+            "a cross-site fetch must not acknowledge"
+        );
+
+        let page = match edge_action(
+            &view("agent", false, "agent"),
+            0,
+            &browser("h.example", "/"),
+        ) {
+            EdgeAction::Respond(page) => page,
+            EdgeAction::Proxy => panic!("expected the warning"),
+        };
+        assert_warning_nonce(&page);
+        let issued = page
+            .set_cookie
+            .as_deref()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1
+            .to_string();
+        let href = format!("/?{WARNING_ACK_PARAM}={issued}");
+        let click_cookie = nonce_cookie_header(&issued);
+        let mut click = browser("h.example", &href);
+        click.cookie = Some(&click_cookie);
+        click.sec_fetch_site = Some("same-origin");
+        match edge_action(&view("agent", false, "agent"), 0, &click) {
+            EdgeAction::Respond(ack) => {
+                assert_eq!(ack.status, 303);
+                assert_eq!(ack.location.as_deref(), Some("/"));
+                assert_eq!(ack.robots, Some("noindex"));
+                assert_eq!(ack.referrer_policy, Some("no-referrer"));
+                let set = ack.set_cookie.unwrap();
+                assert!(set.starts_with("__Host-rustunnel_warn_ok=1; Path=/;"));
+                assert!(set.contains("Secure"));
+                assert!(!set.to_ascii_lowercase().contains("domain="));
+            }
+            EdgeAction::Proxy => panic!("a matching same-origin nonce should acknowledge"),
         }
+        let mut skip = browser("h.example", "/");
+        skip.cookie = Some("__Host-rustunnel_warn_ok=1");
+        assert!(matches!(
+            edge_action(&view("agent", false, "agent"), 0, &skip),
+            EdgeAction::Proxy
+        ));
     }
 
     #[test]
     fn continue_stays_on_this_host() {
+        let nonce = "abc123";
         for path in [
             "/\\evil.com",
             "/%5Cevil.com",
@@ -1673,12 +1860,17 @@ mod tests {
             "//evil.com",
             "https://evil.com",
         ] {
-            let ack = warning_acknowledgement(&format!("{path}?rustunnel_warn_continue=1"), false)
-                .unwrap();
+            let ack =
+                acknowledged(&format!("{path}?{WARNING_ACK_PARAM}={nonce}"), nonce, None).unwrap();
             let location = ack.location.unwrap();
             assert_eq!(location, "/", "{path} redirected to {location}");
         }
-        let kept = warning_acknowledgement("/docs?rustunnel_warn_continue=1&x=1", false).unwrap();
+        let kept = acknowledged(
+            &format!("/docs?{WARNING_ACK_PARAM}={nonce}&x=1"),
+            nonce,
+            None,
+        )
+        .unwrap();
         assert_eq!(kept.location.as_deref(), Some("/docs?x=1"));
     }
 
@@ -1703,10 +1895,11 @@ mod tests {
 
         match edge_action(&agent, 0, &browser("h.example", flagged)) {
             EdgeAction::Respond(page) => {
-                assert_eq!(page.status, 303);
-                assert_eq!(page.location.as_deref(), Some("/"));
+                assert_eq!(page.status, 200);
+                assert!(page.location.is_none());
+                assert_warning_nonce(&page);
             }
-            EdgeAction::Proxy => panic!("an unclaimed agent GET should acknowledge"),
+            EdgeAction::Proxy => panic!("an unclaimed agent GET still shows the warning"),
         }
     }
 
@@ -1720,6 +1913,7 @@ mod tests {
             method: "GET",
             accept: Some("*/*"),
             sec_fetch_mode: None,
+            sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
             host: "h.example",
@@ -1935,7 +2129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_ignores_the_same_tokens_dead_or_superseded_session() {
+    async fn a_second_live_session_hits_the_tunnel_limit_and_a_dead_one_does_not() {
         let pool = pool().await;
         let fixture = Fixture::insert(&pool, "agent", "agent", false, "active").await;
         let token_id = Uuid::new_v4().to_string();
@@ -1978,19 +2172,22 @@ mod tests {
         )
         .await;
 
-        let scope = TunnelCountScope {
-            token_id: Some(&token_id),
-            session_id: new_session,
-            region_id: "test",
-        };
-        let superseded =
-            evaluate_plan_registration(&pool, fixture.user_id, "http", None, &core, scope)
-                .await
-                .unwrap();
-        assert!(
-            superseded.is_none(),
-            "the still-connected old session must not count"
-        );
+        let live = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "http",
+            None,
+            &core,
+            TunnelCountScope {
+                token_id: Some(&token_id),
+                session_id: new_session,
+                region_id: "test",
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(live.code, code::TUNNEL_LIMIT);
 
         core.remove_session(&old_session);
         let dead = evaluate_plan_registration(
@@ -2178,6 +2375,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hung_database_serves_the_cached_account_within_the_timeout() {
+        let (accepted, pool) = hung_pool().await;
+        let gate = AccountGate::new(pool, ACCOUNT_CACHE_TTL, BANDWIDTH_CACHE_TTL);
+        let user_id = Uuid::new_v4();
+        let cached = view("human", true, "pro");
+        gate.accounts.insert(
+            user_id,
+            CachedView {
+                view: cached.clone(),
+                at: Instant::now() - Duration::from_secs(3600),
+            },
+        );
+
+        let started = Instant::now();
+        let got = gate.view(user_id).await.unwrap().unwrap();
+        assert_eq!(got, cached);
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "lookup waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(accepted(), 1);
+
+        let again = Instant::now();
+        assert_eq!(gate.view(user_id).await.unwrap().unwrap(), cached);
+        assert!(
+            again.elapsed() < Duration::from_millis(50),
+            "backoff still queried the database"
+        );
+        assert_eq!(accepted(), 1, "backoff must not open another connection");
+    }
+
+    #[tokio::test]
+    async fn a_hung_database_fails_open_and_backs_off_when_nothing_is_cached() {
+        let (accepted, pool) = hung_pool().await;
+        let gate = AccountGate::new(pool, ACCOUNT_CACHE_TTL, BANDWIDTH_CACHE_TTL);
+        let user_id = Uuid::new_v4();
+
+        let started = Instant::now();
+        assert!(gate.view(user_id).await.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "lookup waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(accepted(), 1);
+
+        assert!(gate.view(user_id).await.is_err());
+        assert_eq!(accepted(), 1, "backoff must not open another connection");
+    }
+
+    #[tokio::test]
+    async fn concurrent_account_misses_share_one_database_lookup() {
+        let (accepted, pool) = hung_pool().await;
+        let gate = Arc::new(AccountGate::new(
+            pool,
+            ACCOUNT_CACHE_TTL,
+            BANDWIDTH_CACHE_TTL,
+        ));
+        let user_id = Uuid::new_v4();
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let gate = Arc::clone(&gate);
+            tasks.push(tokio::spawn(async move { gate.view(user_id).await }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap().is_err());
+        }
+        assert_eq!(accepted(), 1, "four misses must share one lookup");
+    }
+
+    /// A listener that accepts and never speaks Postgres. `accepted` counts
+    /// TCP connections, which is the number of times the pool reached the
+    /// database.
+    async fn hung_pool() -> (impl Fn() -> usize, PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                count.fetch_add(1, Ordering::Relaxed);
+                held.push(sock);
+            }
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_lazy(&format!(
+                "postgres://rustunnel:test@127.0.0.1:{port}/rustunnel_test"
+            ))
+            .unwrap();
+        let read = move || accepted.load(Ordering::Relaxed);
+        (read, pool)
+    }
+
+    #[tokio::test]
     async fn stale_cache_keeps_limits_when_the_database_fails() {
         use std::sync::atomic::Ordering;
 
@@ -2248,6 +2548,7 @@ mod tests {
             method: "GET",
             accept: Some("application/json"),
             sec_fetch_mode: None,
+            sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
             host: "h.example",
@@ -2310,6 +2611,49 @@ mod tests {
             token_auth_block(&pool, &token).await.is_err(),
             "token auth stays fail-closed"
         );
+    }
+
+    #[tokio::test]
+    async fn recheck_seeds_the_account_cache() {
+        let pool = pool().await;
+        let fixture = Fixture::insert(&pool, "human", "free", false, "active").await;
+        let user_id = fixture.user_id;
+        let token_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO tokens (id, token_hash, label, created_at, user_id, status) \
+             VALUES ($1, $2, 't', NOW(), $3, 'active')",
+        )
+        .bind(&token_id)
+        .bind(format!("hash-{token_id}"))
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let core = idle_core();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        core.register_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "seed".into(),
+            Some(token_id),
+            Some(user_id),
+            tx,
+        );
+        let gate = AccountGate::new(pool.clone(), ACCOUNT_CACHE_TTL, BANDWIDTH_CACHE_TTL);
+        let closed = disconnect_blocked_sessions(&pool, &core, &gate)
+            .await
+            .unwrap();
+        assert_eq!(closed, 0);
+        assert!(gate.accounts.get(&user_id).is_some());
+        fixture.cleanup().await;
+        pool.close().await;
+        let started = Instant::now();
+        let view = gate.view(user_id).await.unwrap().unwrap();
+        assert_eq!(view.status, "active");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "seeded cache still queried the database"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

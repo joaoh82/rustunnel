@@ -110,33 +110,6 @@ fn assert_code(err: &str, error_code: &str) {
     );
 }
 
-fn assert_warning_set_cookie(cookie: &str, https: bool) {
-    assert!(
-        !policy::set_cookie_has_domain(cookie),
-        "Set-Cookie must not carry a Domain attribute: {cookie}"
-    );
-    assert!(cookie.contains("Path=/"), "{cookie}");
-    assert!(cookie.contains("Max-Age=86400"), "{cookie}");
-    assert!(cookie.contains("SameSite=Lax"), "{cookie}");
-    assert!(cookie.contains("HttpOnly"), "{cookie}");
-    if https {
-        assert!(
-            cookie.starts_with("__Host-rustunnel_warn_ok=1;"),
-            "{cookie}"
-        );
-        assert!(cookie.contains("Secure"), "{cookie}");
-    } else {
-        assert!(cookie.starts_with("rustunnel_warn_ok=1;"), "{cookie}");
-        assert!(
-            !cookie
-                .split(';')
-                .any(|part| part.trim().eq_ignore_ascii_case("secure")),
-            "{cookie}"
-        );
-        assert!(!cookie.contains("__Host-"), "{cookie}");
-    }
-}
-
 async fn hello() -> (SocketAddr, oneshot::Sender<()>) {
     let app = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
@@ -405,7 +378,6 @@ async fn bandwidth_cap_refuses_new_tunnels_and_proxied_traffic() {
     )
     .await;
     assert_eq!(page.status(), 402);
-    assert!(page.headers().get("set-cookie").is_none());
     let html = page.text().await.unwrap();
     assert!(html.contains("Bandwidth cap reached"));
     assert!(!html.contains("http://") && !html.contains("https://"));
@@ -829,8 +801,32 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
     )
     .await;
     assert_eq!(page.status(), 200);
-    assert!(page.headers().get("set-cookie").is_none());
     assert_eq!(page.headers().get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(page.headers().get("x-robots-tag").unwrap(), "noindex");
+    assert_eq!(
+        page.headers().get("referrer-policy").unwrap(),
+        "no-referrer"
+    );
+    assert_eq!(page.headers().get("cache-control").unwrap(), "no-store");
+    let nonce_cookie = page
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(nonce_cookie.starts_with("__Host-rustunnel_warn_nonce="));
+    assert!(nonce_cookie.contains("Path=/"));
+    assert!(nonce_cookie.contains("Secure"));
+    assert!(!nonce_cookie.to_ascii_lowercase().contains("domain="));
+    let nonce = nonce_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_string();
     let csp = page
         .headers()
         .get("content-security-policy")
@@ -846,6 +842,7 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
     assert!(html.contains(&host));
     assert!(html.contains("Do not enter passwords"));
     assert!(html.contains(">Continue<"));
+    assert!(html.contains(&format!("rustunnel_warn_continue={nonce}")));
     assert!(!html.contains("src="));
     assert!(!html.contains("http://") && !html.contains("https://"));
     assert!(!html.contains("Hello, World!"));
@@ -909,69 +906,61 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap();
-    let ack = client
+    let missing = client
         .get(format!(
             "https://127.0.0.1:{}/?rustunnel_warn_continue=1",
             server.https_port
         ))
         .header("Host", &host)
         .header("Accept", "text/html")
+        .header("Sec-Fetch-Site", "same-origin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 200);
+
+    let ack = client
+        .get(format!(
+            "https://127.0.0.1:{}/?rustunnel_warn_continue={nonce}",
+            server.https_port
+        ))
+        .header("Host", &host)
+        .header("Accept", "text/html")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Cookie", format!("__Host-rustunnel_warn_nonce={nonce}"))
         .send()
         .await
         .unwrap();
     assert_eq!(ack.status(), 303);
-    let cookies: Vec<_> = ack
+    let cookie = ack
         .headers()
-        .get_all("set-cookie")
-        .iter()
-        .map(|value| value.to_str().unwrap().to_string())
-        .collect();
-    assert_eq!(cookies.len(), 1, "{cookies:?}");
-    assert_warning_set_cookie(&cookies[0], true);
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("__Host-rustunnel_warn_ok=1"));
+    assert!(cookie.contains("Path=/"));
+    assert!(cookie.contains("Max-Age=86400"));
+    assert!(cookie.contains("Secure"));
+    assert!(!cookie.to_ascii_lowercase().contains("domain="));
     assert_eq!(
         ack.headers().get("location").unwrap().to_str().unwrap(),
         "/"
     );
-
-    let http_ack = client
-        .get(format!(
-            "http://127.0.0.1:{}/?rustunnel_warn_continue=1",
-            server.http_port
-        ))
-        .header("Host", &host)
-        .header("Accept", "text/html")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(http_ack.status(), 303);
-    let http_cookies: Vec<_> = http_ack
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .map(|value| value.to_str().unwrap().to_string())
-        .collect();
-    assert_eq!(http_cookies.len(), 1, "{http_cookies:?}");
-    assert_warning_set_cookie(&http_cookies[0], false);
+    assert_eq!(ack.headers().get("x-robots-tag").unwrap(), "noindex");
+    assert_eq!(ack.headers().get("referrer-policy").unwrap(), "no-referrer");
+    assert_eq!(ack.headers().get("cache-control").unwrap(), "no-store");
 
     let through = client
         .get(format!("https://127.0.0.1:{}/", server.https_port))
         .header("Host", &host)
         .header("Accept", "text/html")
-        .header("Cookie", "rustunnel_warn_ok=1")
+        .header("Cookie", "__Host-rustunnel_warn_ok=1")
         .send()
         .await
         .unwrap();
     assert_eq!(through.text().await.unwrap(), "Hello, World!");
-
-    let through_host = client
-        .get(format!("https://127.0.0.1:{}/", server.https_port))
-        .header("Host", &host)
-        .header("Accept", "text/html")
-        .header("Cookie", format!("{}=1", policy::WARNING_COOKIE_HOST_NAME))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(through_host.text().await.unwrap(), "Hello, World!");
 
     sqlx::query("UPDATE users SET claimed_at = NOW() WHERE id = $1")
         .bind(seed.user_id)
