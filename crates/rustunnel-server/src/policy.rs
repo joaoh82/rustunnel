@@ -17,12 +17,13 @@
 //! a tunnel that crosses the cap is refused on the following request,
 //! inside the cache window. The column itself is written on the meter flush
 //! (default 60s) and when the tunnel closes. Registration and token auth read
-//! Postgres directly. A background pass every [`SESSION_RECHECK_INTERVAL`]
-//! re-reads tokens and users and closes sessions that are no longer allowed,
-//! so a ban or deactivation lands within about a minute even when the
-//! per-request cache is warm. A database error on that pass or on a proxied
-//! request leaves the session up (a blip must not drop every tunnel).
-//! Registration fails closed: a plan lookup error refuses the tunnel.
+//! Postgres directly and fail closed. A background pass every
+//! [`SESSION_RECHECK_INTERVAL`] re-reads tokens and users and closes sessions
+//! that are no longer allowed, so a ban or deactivation lands within about a
+//! minute even when the per-request cache is warm. A database error on that
+//! pass or on a proxied request serves the last cached account and byte
+//! total, including one past its TTL. The request is proxied, and the
+//! session stays up, only when this process has no cached entry at all.
 //!
 //! # Deactivation sweep
 //!
@@ -44,8 +45,8 @@ use crate::core::{ControlMessage, TunnelCore};
 use crate::db::models::{AgentPlanLimits, Token};
 use crate::error::Result;
 
-/// Per-request account snapshot. A ban still closes the session on the
-/// shorter [`SESSION_RECHECK_INTERVAL`] pass, which does not use this cache.
+/// Per-request account snapshot. The session recheck still reads Postgres.
+/// When that read fails it uses this snapshot, including after the TTL.
 pub const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30);
 /// How long a committed month-byte total is reused. Bytes the live tunnel
 /// proxies after that snapshot are still counted on the next request.
@@ -207,24 +208,43 @@ impl AccountGate {
     }
 
     /// Account row plus the active plan. `None` when the user does not exist.
+    ///
+    /// A database error returns the last cached snapshot, including one past
+    /// [`ACCOUNT_CACHE_TTL`]. The error is returned only when this user has
+    /// never been cached.
     pub async fn view(&self, user_id: Uuid) -> Result<Option<AccountView>> {
         if let Some(hit) = self.fresh_view(user_id) {
             return Ok(Some(hit));
         }
-        let loaded = load_account(&self.pool, user_id).await?;
-        if self.account_ttl.is_zero() {
-            return Ok(loaded);
+        match load_account(&self.pool, user_id).await {
+            Ok(loaded) => {
+                if !self.account_ttl.is_zero() {
+                    if let Some(ref view) = loaded {
+                        self.accounts.insert(
+                            user_id,
+                            CachedView {
+                                view: view.clone(),
+                                at: Instant::now(),
+                            },
+                        );
+                    } else {
+                        self.accounts.remove(&user_id);
+                    }
+                }
+                Ok(loaded)
+            }
+            Err(e) => match self.any_view(user_id) {
+                Some(view) => {
+                    tracing::warn!(
+                        error = %e,
+                        %user_id,
+                        "account lookup failed; using cached account"
+                    );
+                    Ok(Some(view))
+                }
+                None => Err(e),
+            },
         }
-        if let Some(ref view) = loaded {
-            self.accounts.insert(
-                user_id,
-                CachedView {
-                    view: view.clone(),
-                    at: Instant::now(),
-                },
-            );
-        }
-        Ok(loaded)
     }
 
     /// UTC-month bytes for `user_id`, including this process's unflushed counters.
@@ -232,24 +252,40 @@ impl AccountGate {
     /// A fresh cache entry keeps the total from when it was stored and adds
     /// whatever those tunnels have proxied since. Crossing the cap therefore
     /// shows up on the next check, without waiting for the meter flush or
-    /// for the cache to expire.
+    /// for the cache to expire. A database error returns that total, even
+    /// past [`BANDWIDTH_CACHE_TTL`], plus bytes proxied since the snapshot.
+    /// The error is returned only when this user has never been cached.
     pub async fn month_bytes(&self, user_id: Uuid, core: &TunnelCore) -> Result<i64> {
         if let Some(hit) = self.cached_month_bytes(user_id, core) {
             return Ok(hit);
         }
         let live = core.live_bytes_proxied_for_user(user_id);
-        let bytes = month_bytes_including_live(&self.pool, user_id, &live).await?;
-        if !self.bandwidth_ttl.is_zero() {
-            self.bandwidth.insert(
-                user_id,
-                CachedBytes {
-                    bytes,
-                    at: Instant::now(),
-                    live,
-                },
-            );
+        match month_bytes_including_live(&self.pool, user_id, &live).await {
+            Ok(bytes) => {
+                if !self.bandwidth_ttl.is_zero() {
+                    self.bandwidth.insert(
+                        user_id,
+                        CachedBytes {
+                            bytes,
+                            at: Instant::now(),
+                            live,
+                        },
+                    );
+                }
+                Ok(bytes)
+            }
+            Err(e) => match self.any_month_bytes(user_id, core) {
+                Some(bytes) => {
+                    tracing::warn!(
+                        error = %e,
+                        %user_id,
+                        "bandwidth lookup failed; using cached bytes"
+                    );
+                    Ok(bytes)
+                }
+                None => Err(e),
+            },
         }
-        Ok(bytes)
     }
 
     fn cached_month_bytes(&self, user_id: Uuid, core: &TunnelCore) -> Option<i64> {
@@ -272,6 +308,20 @@ impl AccountGate {
         } else {
             None
         }
+    }
+
+    fn any_view(&self, user_id: Uuid) -> Option<AccountView> {
+        self.accounts.get(&user_id).map(|entry| entry.view.clone())
+    }
+
+    fn any_month_bytes(&self, user_id: Uuid, core: &TunnelCore) -> Option<i64> {
+        let cached = self
+            .bandwidth
+            .get(&user_id)
+            .map(|entry| (entry.bytes, entry.live.clone()))?;
+        let (base, snapshot) = cached;
+        let now = core.live_bytes_proxied_for_user(user_id);
+        Some(base.saturating_add(live_growth(&snapshot, &now)))
     }
 }
 
@@ -816,9 +866,15 @@ struct LiveToken {
 
 /// Close sessions whose token or user is no longer allowed.
 ///
-/// Reads Postgres on every call (not the request cache). Sends
-/// [`ControlMessage::Shutdown`]; the session task drops its tunnels.
-pub async fn disconnect_blocked_sessions(pool: &PgPool, core: &TunnelCore) -> Result<usize> {
+/// Reads Postgres on every call. A database error uses `gate`'s last
+/// account snapshot, including one past its TTL, and closes the session
+/// when that snapshot is blocked. With no snapshot the session stays up.
+/// Sends [`ControlMessage::Shutdown`]; the session task drops its tunnels.
+pub async fn disconnect_blocked_sessions(
+    pool: &PgPool,
+    core: &TunnelCore,
+    gate: &AccountGate,
+) -> Result<usize> {
     let snapshot: Vec<(Uuid, String)> = core
         .sessions
         .iter()
@@ -833,10 +889,25 @@ pub async fn disconnect_blocked_sessions(pool: &PgPool, core: &TunnelCore) -> Re
     for (session_id, token_id) in snapshot {
         let blocked = match session_blocked(pool, &token_id).await {
             Ok(blocked) => blocked,
-            Err(e) => {
-                tracing::warn!(error = %e, %session_id, "session access recheck failed");
-                false
-            }
+            Err(e) => match cached_account_block(core, gate, session_id) {
+                Some(blocked) => {
+                    tracing::warn!(
+                        error = %e,
+                        %session_id,
+                        blocked,
+                        "session recheck failed; using cached account"
+                    );
+                    blocked
+                }
+                None => {
+                    tracing::warn!(
+                        error = %e,
+                        %session_id,
+                        "session recheck failed with no cache; leaving session up"
+                    );
+                    false
+                }
+            },
         };
         if !blocked {
             continue;
@@ -853,6 +924,15 @@ pub async fn disconnect_blocked_sessions(pool: &PgPool, core: &TunnelCore) -> Re
         }
     }
     Ok(closed)
+}
+
+fn cached_account_block(core: &TunnelCore, gate: &AccountGate, session_id: Uuid) -> Option<bool> {
+    let user_id = core
+        .sessions
+        .get(&session_id)
+        .and_then(|session| session.user_id)?;
+    let view = gate.any_view(user_id)?;
+    Some(account_block(&view).is_some())
 }
 
 async fn session_blocked(pool: &PgPool, token_id: &str) -> Result<bool> {
@@ -886,7 +966,11 @@ async fn session_blocked(pool: &PgPool, token_id: &str) -> Result<bool> {
 /// Sweep plus session recheck. Runs until the task is aborted on shutdown.
 /// The sweep's first tick is immediate, so a restart deactivates before the
 /// full interval.
-pub async fn run_account_maintenance(pool: PgPool, core: std::sync::Arc<TunnelCore>) {
+pub async fn run_account_maintenance(
+    pool: PgPool,
+    core: std::sync::Arc<TunnelCore>,
+    gate: std::sync::Arc<AccountGate>,
+) {
     let mut sweep = tokio::time::interval(DEACTIVATION_SWEEP_INTERVAL);
     let mut sessions = tokio::time::interval(SESSION_RECHECK_INTERVAL);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -901,7 +985,7 @@ pub async fn run_account_maintenance(pool: PgPool, core: std::sync::Arc<TunnelCo
                 }
             }
             _ = sessions.tick() => {
-                if let Err(e) = disconnect_blocked_sessions(&pool, &core).await {
+                if let Err(e) = disconnect_blocked_sessions(&pool, &core, &gate).await {
                     tracing::warn!(error = %e, "session access recheck failed");
                 }
             }

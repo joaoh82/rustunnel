@@ -154,7 +154,12 @@ async fn fetch(
 }
 
 async fn close_blocked(server: &TestServer, client: &mut TestClient) {
-    let disconnect = policy::disconnect_blocked_sessions(&server.db.pg, &server.core);
+    let gate = policy::AccountGate::new(
+        server.db.pg.clone(),
+        policy::ACCOUNT_CACHE_TTL,
+        policy::BANDWIDTH_CACHE_TTL,
+    );
+    let disconnect = policy::disconnect_blocked_sessions(&server.db.pg, &server.core, &gate);
     tokio::pin!(disconnect);
     let mut finished = false;
     loop {

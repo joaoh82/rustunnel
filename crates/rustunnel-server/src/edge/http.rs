@@ -917,7 +917,7 @@ async fn account_guard(
         Ok(Some(view)) => view,
         Ok(None) => return None,
         Err(e) => {
-            warn!(error = %e, %user_id, "account lookup failed; proxying");
+            warn!(error = %e, %user_id, "account lookup failed with no cache; proxying");
             return None;
         }
     };
@@ -933,7 +933,7 @@ async fn account_guard(
         {
             Ok(bytes) => bytes,
             Err(e) => {
-                warn!(error = %e, %user_id, "bandwidth lookup failed; proxying");
+                warn!(error = %e, %user_id, "bandwidth lookup failed with no cache; proxying");
                 0
             }
         }

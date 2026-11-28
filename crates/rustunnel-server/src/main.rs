@@ -414,13 +414,17 @@ async fn run(config: Arc<ServerConfig>) -> Result<()> {
 
     // ── task: deactivation sweep + session recheck ────────────────────────────
     // First ticks run immediately. A ban or expiry closes the session within
-    // SESSION_RECHECK_INTERVAL even when the HTTP cache is still warm.
+    // SESSION_RECHECK_INTERVAL even when the HTTP cache is still warm. If
+    // Postgres is unreachable, the recheck uses the last cached account,
+    // including one past its TTL, and leaves the session up only when that
+    // user has never been cached.
 
     let h_accounts = {
         let pool = db.pg.clone();
         let core = Arc::clone(&core);
+        let gate = Arc::clone(&account_gate);
         tokio::spawn(async move {
-            policy::run_account_maintenance(pool, core).await;
+            policy::run_account_maintenance(pool, core, gate).await;
         })
     };
 
