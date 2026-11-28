@@ -1511,6 +1511,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_cache_keeps_limits_when_the_database_fails() {
+        use std::sync::atomic::Ordering;
+
+        let pool = pool().await;
+        let capped = Fixture::insert(&pool, "agent", "agent", false, "active").await;
+        let banned = Fixture::insert(&pool, "agent", "agent", false, "banned").await;
+        let capped_id = capped.user_id;
+        let banned_id = banned.user_id;
+        let core = idle_core();
+        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::channel(4);
+        let cap_session = core.register_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "cap".into(),
+            Some("cap-token".into()),
+            Some(capped_id),
+            cap_tx,
+        );
+        let (tunnel_id, subdomain) = core
+            .register_http_tunnel(&cap_session, None, TunnelProtocol::Http, None)
+            .unwrap();
+        let (ban_tx, mut ban_rx) = tokio::sync::mpsc::channel(4);
+        core.register_session(
+            "127.0.0.1:10".parse().unwrap(),
+            "ban".into(),
+            Some("ban-token".into()),
+            Some(banned_id),
+            ban_tx,
+        );
+        let uncached_id = Uuid::new_v4();
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel(4);
+        core.register_session(
+            "127.0.0.1:11".parse().unwrap(),
+            "open".into(),
+            Some("open-token".into()),
+            Some(uncached_id),
+            open_tx,
+        );
+
+        let ttl = Duration::from_millis(1);
+        let gate = AccountGate::new(pool.clone(), ttl, ttl);
+        let active = gate.view(capped_id).await.unwrap().unwrap();
+        assert!(account_block(&active).is_none());
+        assert_eq!(gate.month_bytes(capped_id, &core).await.unwrap(), 0);
+        let banned_view = gate.view(banned_id).await.unwrap().unwrap();
+        assert!(account_block(&banned_view).is_some());
+
+        core.http_routes
+            .get(&subdomain)
+            .unwrap()
+            .members
+            .get(&tunnel_id)
+            .unwrap()
+            .info
+            .bytes_in
+            .store(
+                AgentPlanLimits::BANDWIDTH_LIMIT_BYTES as u64,
+                Ordering::Relaxed,
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        capped.cleanup().await;
+        banned.cleanup().await;
+        pool.close().await;
+
+        let still_active = gate.view(capped_id).await.unwrap().unwrap();
+        let bytes = gate.month_bytes(capped_id, &core).await.unwrap();
+        assert!(bytes >= AgentPlanLimits::BANDWIDTH_LIMIT_BYTES);
+        let curl = IncomingRequest {
+            method: "GET",
+            accept: Some("application/json"),
+            sec_fetch_mode: None,
+            skip_warning: None,
+            cookie: None,
+            host: "h.example",
+            path_and_query: "/",
+        };
+        match edge_action(&still_active, bytes, &curl) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 402);
+                assert!(page.body.contains(code::BANDWIDTH_CAP_REACHED));
+            }
+            EdgeAction::Proxy => panic!("stale byte cache must keep the cap"),
+        }
+        let still_banned = gate.view(banned_id).await.unwrap().unwrap();
+        match edge_action(&still_banned, 0, &curl) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 403);
+                assert!(page.body.contains("account banned"));
+            }
+            EdgeAction::Proxy => panic!("stale account cache must keep the ban"),
+        }
+        let closed = disconnect_blocked_sessions(&pool, &core, &gate)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+        assert!(matches!(ban_rx.try_recv(), Ok(ControlMessage::Shutdown)));
+        assert!(cap_rx.try_recv().is_err());
+        assert!(open_rx.try_recv().is_err());
+
+        assert!(gate.view(uncached_id).await.is_err());
+        assert!(gate.month_bytes(uncached_id, &core).await.is_err());
+        assert!(
+            evaluate_plan_registration(&pool, capped_id, "http", None, &core)
+                .await
+                .is_err(),
+            "registration stays fail-closed"
+        );
+        let token = crate::db::models::Token {
+            id: "t".into(),
+            token_hash: "h".into(),
+            label: "l".into(),
+            created_at: Utc::now(),
+            last_used_at: None,
+            scope: None,
+            user_id: Some(capped_id),
+            expires_at: None,
+            tier: None,
+            tunnel_limit: None,
+            status: "active".into(),
+            unlimited: false,
+        };
+        assert!(
+            token_auth_block(&pool, &token).await.is_err(),
+            "token auth stays fail-closed"
+        );
+    }
+
+    #[tokio::test]
     async fn hobby_registration_is_not_rewritten_to_agent_codes() {
         let pool = pool().await;
         let core = idle_core();
