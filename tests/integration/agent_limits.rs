@@ -8,6 +8,7 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::{routing::get, routing::post, Router};
@@ -376,6 +377,87 @@ async fn bandwidth_cap_refuses_new_tunnels_and_proxied_traffic() {
     assert!(html.contains("Bandwidth cap reached"));
     assert!(!html.contains("http://") && !html.contains("https://"));
     open.cleanup().await;
+}
+
+#[tokio::test]
+async fn long_lived_tunnel_is_cut_off_when_live_bytes_cross_the_cap() {
+    init_tracing();
+    let server = TestServer::start().await;
+    let cap = AgentPlanLimits::BANDWIDTH_LIMIT_BYTES;
+    let (local, _shutdown) = hello().await;
+    let seed = Seed::create(&server.db.pg, "agent", "agent").await;
+    let mut client = TestClient::connect_with_token(&server, &seed.raw)
+        .await
+        .unwrap();
+    let session_id = client.session_id.unwrap();
+    let (tunnel_id, subdomain, _) = client.register_http_tunnel(None).await.unwrap();
+    connect_data_bridge(&server, session_id, local)
+        .await
+        .expect("bridge");
+    let host = format!("{subdomain}.{}", server.domain);
+
+    let first = fetch(server.https_port, &host, reqwest::Method::GET, "*/*", &[]).await;
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.text().await.unwrap(), "Hello, World!");
+
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes_proxied), 0)::bigint FROM tunnel_log WHERE user_id = $1",
+    )
+    .bind(seed.user_id)
+    .fetch_one(&server.db.pg)
+    .await
+    .unwrap();
+    assert!(
+        stored < cap,
+        "the open row is still under the cap before the live counter moves: {stored}"
+    );
+
+    server
+        .core
+        .http_routes
+        .get(&subdomain)
+        .expect("live tunnel")
+        .members
+        .get(&tunnel_id)
+        .expect("member")
+        .info
+        .bytes_in
+        .store(cap as u64, Ordering::Relaxed);
+
+    let blocked = fetch(
+        server.https_port,
+        &host,
+        reqwest::Method::GET,
+        "application/json",
+        &[],
+    )
+    .await;
+    assert_eq!(blocked.status(), 402);
+    let body: Value = blocked.json().await.unwrap();
+    assert_eq!(body["code"], code::BANDWIDTH_CAP_REACHED);
+
+    let page = fetch(
+        server.https_port,
+        &host,
+        reqwest::Method::GET,
+        "text/html",
+        &[("Sec-Fetch-Mode", "navigate")],
+    )
+    .await;
+    assert_eq!(page.status(), 402);
+
+    let still: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes_proxied), 0)::bigint FROM tunnel_log WHERE user_id = $1",
+    )
+    .bind(seed.user_id)
+    .fetch_one(&server.db.pg)
+    .await
+    .unwrap();
+    assert!(
+        still < cap,
+        "402 must come from the in-memory counter, not a flushed row: {still}"
+    );
+    seed.cleanup().await;
 }
 
 #[tokio::test]
