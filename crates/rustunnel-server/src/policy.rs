@@ -482,7 +482,8 @@ fn hard_cap_limit(plan: &PlanLimits) -> Option<i64> {
 ///
 /// [`TunnelCountScope::all`] counts every open row. A registration passes
 /// the reconnecting token, its new session, and this edge's region so a
-/// dead or superseded session of that same token is left out.
+/// dead session of that same token is left out. A second live session of
+/// the same token still counts.
 pub struct TunnelCountScope<'a> {
     pub token_id: Option<&'a str>,
     pub session_id: Uuid,
@@ -574,26 +575,21 @@ async fn count_open_tunnels(
         return Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX));
     };
     let current = scope.session_id.to_string();
-    let mut live = std::collections::HashSet::new();
-    let mut superseded = std::collections::HashSet::new();
-    for entry in core.sessions.iter() {
-        let id = entry.key().to_string();
-        if entry.db_token_id.as_deref() == Some(token_id) && id != current {
-            superseded.insert(id.clone());
-        }
-        live.insert(id);
-    }
+    let live: std::collections::HashSet<String> = core
+        .sessions
+        .iter()
+        .map(|entry| entry.key().to_string())
+        .collect();
     let count = rows
         .iter()
-        .filter(|row| {
-            counts_toward_tunnel_limit(row, token_id, &current, scope.region_id, &live, &superseded)
-        })
+        .filter(|row| counts_toward_tunnel_limit(row, token_id, &current, scope.region_id, &live))
         .count();
     Ok(i64::try_from(count).unwrap_or(i64::MAX))
 }
 
-/// A row counts unless it is this token's superseded session, or this
-/// token's row on this region whose session is already gone.
+/// A row counts unless it belongs to this token, is on this region, and its
+/// session is already gone. Another live session of the same token still
+/// counts, so one token cannot open a tunnel per websocket.
 ///
 /// Another token still counts. The same token on another region still
 /// counts: that session is live somewhere else, not dead on this edge.
@@ -603,13 +599,9 @@ fn counts_toward_tunnel_limit(
     current_session: &str,
     region_id: &str,
     live: &std::collections::HashSet<String>,
-    superseded: &std::collections::HashSet<String>,
 ) -> bool {
     if row.token_id.as_deref() != Some(token_id) || row.session_id == current_session {
         return true;
-    }
-    if superseded.contains(&row.session_id) {
-        return false;
     }
     let dead_on_this_region =
         row.region_id.as_deref() == Some(region_id) && !live.contains(&row.session_id);
@@ -1815,7 +1807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_ignores_the_same_tokens_dead_or_superseded_session() {
+    async fn a_second_live_session_hits_the_tunnel_limit_and_a_dead_one_does_not() {
         let pool = pool().await;
         let fixture = Fixture::insert(&pool, "agent", "agent", false, "active").await;
         let token_id = Uuid::new_v4().to_string();
@@ -1858,19 +1850,22 @@ mod tests {
         )
         .await;
 
-        let scope = TunnelCountScope {
-            token_id: Some(&token_id),
-            session_id: new_session,
-            region_id: "test",
-        };
-        let superseded =
-            evaluate_plan_registration(&pool, fixture.user_id, "http", None, &core, scope)
-                .await
-                .unwrap();
-        assert!(
-            superseded.is_none(),
-            "the still-connected old session must not count"
-        );
+        let live = evaluate_plan_registration(
+            &pool,
+            fixture.user_id,
+            "http",
+            None,
+            &core,
+            TunnelCountScope {
+                token_id: Some(&token_id),
+                session_id: new_session,
+                region_id: "test",
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(live.code, code::TUNNEL_LIMIT);
 
         core.remove_session(&old_session);
         let dead = evaluate_plan_registration(
