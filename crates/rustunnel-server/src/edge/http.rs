@@ -962,6 +962,10 @@ fn edge_response(response: EdgeResponse) -> Response<BoxBody> {
         .header("content-type", response.content_type)
         .header("cache-control", "no-store");
     if let Some(cookie) = response.set_cookie {
+        // The only Set-Cookie the edge emits today is the continue cookie.
+        // Drop Domain anyway, so a later cookie cannot be scoped to
+        // rustunnel.com and shared with every tunnel and the dashboard.
+        let cookie = policy::without_domain_attribute(cookie);
         builder = builder.header("set-cookie", cookie);
     }
     if let Some(location) = response.location {
@@ -1015,6 +1019,45 @@ fn emit_capture(tx: &Option<CaptureTx>, event: CaptureEvent) {
 mod tests {
     use super::*;
     use hyper::header::HeaderValue;
+
+    #[test]
+    fn emitted_set_cookie_has_no_domain_attribute() {
+        for https in [false, true] {
+            let built = edge_response(
+                policy::warning_acknowledgement("/?rustunnel_warn_continue=1", https).unwrap(),
+            );
+            let cookies: Vec<_> = built
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .map(|value| value.to_str().unwrap().to_string())
+                .collect();
+            assert_eq!(cookies.len(), 1, "{cookies:?}");
+            assert!(
+                !policy::set_cookie_has_domain(&cookies[0]),
+                "{}",
+                cookies[0]
+            );
+        }
+    }
+
+    #[test]
+    fn edge_strips_a_domain_attribute_before_emitting_set_cookie() {
+        let built = edge_response(EdgeResponse {
+            status: 303,
+            content_type: "text/plain; charset=utf-8",
+            body: String::new(),
+            set_cookie: Some(
+                "rustunnel_warn_ok=1; Domain=rustunnel.com; Path=/; HttpOnly; Secure".into(),
+            ),
+            location: Some("/".into()),
+            frame_options: None,
+            content_security_policy: None,
+        });
+        let cookie = built.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert_eq!(cookie, "rustunnel_warn_ok=1; Path=/; HttpOnly; Secure");
+        assert!(!policy::set_cookie_has_domain(cookie));
+    }
 
     #[test]
     fn subdomain_extraction() {

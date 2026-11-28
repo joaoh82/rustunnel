@@ -63,9 +63,20 @@ const STATEMENT_TIMEOUT: &str = "2s";
 /// How often expired unclaimed agent accounts are marked `deactivated_at`.
 pub const DEACTIVATION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Host-only cookie set by Continue. The browser stores it for the tunnel
-/// host, so a visitor is not warned again on that host for this long.
+/// Unprefixed continue cookie.
+///
+/// Written on plain HTTP. A `__Host-` cookie has to be `Secure`, and
+/// browsers drop it on `http`. Readers also accept this name for one
+/// release after HTTPS moved to [`WARNING_COOKIE_HOST_NAME`], so a cookie
+/// already stored still skips the warning. Drop that read in the following
+/// release: another host on `rustunnel.com` can set this name with
+/// `Domain`, which [`WARNING_COOKIE_HOST_NAME`] cannot.
 pub const WARNING_COOKIE_NAME: &str = "rustunnel_warn_ok";
+/// HTTPS continue cookie. `__Host-` requires `Secure`, `Path=/`, and no
+/// `Domain`, so the browser stores it for the tunnel host that set it and
+/// rejects a `Domain` attribute.
+pub const WARNING_COOKIE_HOST_NAME: &str = "__Host-rustunnel_warn_ok";
+/// How long either continue cookie skips the warning on that host.
 pub const WARNING_COOKIE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// Query flag the Continue link uses. The edge answers it itself and does
 /// not forward it to the local service.
@@ -183,7 +194,8 @@ pub struct IncomingRequest<'a> {
     pub cookie: Option<&'a str>,
     pub host: &'a str,
     pub path_and_query: &'a str,
-    /// Public scheme. The continue cookie is `Secure` only on HTTPS.
+    /// Public scheme. HTTPS writes [`WARNING_COOKIE_HOST_NAME`] with
+    /// `Secure`. Plain HTTP writes [`WARNING_COOKIE_NAME`] without `Secure`.
     pub https: bool,
 }
 
@@ -709,8 +721,12 @@ pub fn cookie_has_warning_ack(cookie: Option<&str>) -> bool {
         let mut kv = part.trim().splitn(2, '=');
         let name = kv.next().unwrap_or("");
         let value = kv.next().map(str::trim).unwrap_or("");
-        name == WARNING_COOKIE_NAME && value == "1"
+        value == "1" && is_warning_cookie_name(name)
     })
+}
+
+fn is_warning_cookie_name(name: &str) -> bool {
+    name == WARNING_COOKIE_HOST_NAME || name == WARNING_COOKIE_NAME
 }
 
 /// Continue link target. `None` when this request is not the acknowledgement.
@@ -733,13 +749,59 @@ pub fn warning_acknowledgement(path_and_query: &str, https: bool) -> Option<Edge
 }
 
 pub fn warning_cookie(https: bool) -> String {
-    let mut cookie = format!(
-        "{WARNING_COOKIE_NAME}=1; Path=/; Max-Age={WARNING_COOKIE_MAX_AGE_SECS}; SameSite=Lax; HttpOnly"
-    );
+    // `__Host-` is only valid with `Secure`. Plain HTTP keeps the unprefixed
+    // name so the browser will store the cookie. Neither form has a Domain
+    // attribute: that would share it with every tunnel and the dashboard.
+    let name = if https {
+        WARNING_COOKIE_HOST_NAME
+    } else {
+        WARNING_COOKIE_NAME
+    };
+    let mut cookie =
+        format!("{name}=1; Path=/; Max-Age={WARNING_COOKIE_MAX_AGE_SECS}; SameSite=Lax; HttpOnly");
     if https {
         cookie.push_str("; Secure");
     }
+    debug_assert!(
+        !set_cookie_has_domain(&cookie),
+        "continue cookie must be host-only"
+    );
     cookie
+}
+
+/// `true` when `set_cookie` has a `Domain` attribute, in any case.
+///
+/// The first `name=value` pair is the cookie. Later pairs are attributes.
+/// A value that contains the word "domain" is not an attribute.
+pub fn set_cookie_has_domain(set_cookie: &str) -> bool {
+    set_cookie
+        .split(';')
+        .skip(1)
+        .any(|part| attribute_name(part).eq_ignore_ascii_case("domain"))
+}
+
+/// Copy of `set_cookie` with any `Domain` attribute removed.
+///
+/// `Path`, `Secure`, `HttpOnly`, `SameSite`, and `Max-Age` are kept. The
+/// string is unchanged when it was already host-only.
+pub fn without_domain_attribute(set_cookie: String) -> String {
+    if !set_cookie_has_domain(&set_cookie) {
+        return set_cookie;
+    }
+    set_cookie
+        .split(';')
+        .enumerate()
+        .filter(|(index, part)| *index == 0 || !attribute_name(part).eq_ignore_ascii_case("domain"))
+        .map(|(_, part)| part)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn attribute_name(part: &str) -> &str {
+    part.split_once('=')
+        .map(|(name, _)| name)
+        .unwrap_or(part)
+        .trim()
 }
 
 fn strip_ack_param(path_and_query: &str) -> Option<String> {
@@ -1484,6 +1546,13 @@ mod tests {
         let mut acked = browser("h.example", "/");
         acked.cookie = Some("other=1; rustunnel_warn_ok=1");
         assert!(matches!(edge_action(&agent, 0, &acked), EdgeAction::Proxy));
+        acked.cookie = Some("__Host-rustunnel_warn_ok=1");
+        assert!(matches!(edge_action(&agent, 0, &acked), EdgeAction::Proxy));
+        acked.cookie = Some("rustunnel_warn_ok=0");
+        assert!(matches!(
+            edge_action(&agent, 0, &acked),
+            EdgeAction::Respond(_)
+        ));
     }
 
     #[test]
@@ -1529,19 +1598,70 @@ mod tests {
         let ack = warning_acknowledgement("/docs?x=1&rustunnel_warn_continue=1", true).unwrap();
         assert_eq!(ack.status, 303);
         assert_eq!(ack.location.as_deref(), Some("/docs?x=1"));
-        let cookie = ack.set_cookie.unwrap();
-        assert!(cookie.starts_with("rustunnel_warn_ok=1; Path=/;"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("Secure"));
-        assert!(!cookie.contains("Domain="));
+        assert_warning_set_cookie(&ack.set_cookie.unwrap(), true);
+        let plain = warning_acknowledgement("/?rustunnel_warn_continue=1", false).unwrap();
+        assert_eq!(plain.location.as_deref(), Some("/"));
+        assert_warning_set_cookie(&plain.set_cookie.unwrap(), false);
         assert!(warning_acknowledgement("/docs?x=1", false).is_none());
+    }
+
+    #[test]
+    fn set_cookie_domain_attribute_is_detected_and_removed() {
+        assert!(!set_cookie_has_domain(
+            "session=Domain=rustunnel.com; Path=/"
+        ));
+        assert!(!set_cookie_has_domain(
+            "rustunnel_warn_ok=1; Path=/; Secure"
+        ));
+        assert!(set_cookie_has_domain(
+            "rustunnel_warn_ok=1; Domain=rustunnel.com; Path=/"
+        ));
+        assert!(set_cookie_has_domain(
+            "rustunnel_warn_ok=1; domain=.rustunnel.com"
+        ));
+        assert!(set_cookie_has_domain("rustunnel_warn_ok=1; Domain"));
+        let scoped = "rustunnel_warn_ok=1; Domain=rustunnel.com; Path=/; HttpOnly; Secure";
         assert_eq!(
-            warning_acknowledgement("/?rustunnel_warn_continue=1", false)
-                .unwrap()
-                .location
-                .as_deref(),
-            Some("/")
+            without_domain_attribute(scoped.into()),
+            "rustunnel_warn_ok=1; Path=/; HttpOnly; Secure"
         );
+        let host_only = "rustunnel_warn_ok=1; Path=/; Secure";
+        assert_eq!(without_domain_attribute(host_only.into()), host_only);
+    }
+
+    fn assert_warning_set_cookie(cookie: &str, https: bool) {
+        assert!(
+            !set_cookie_has_domain(cookie),
+            "Set-Cookie must not carry a Domain attribute: {cookie}"
+        );
+        assert!(cookie.contains("Path=/"), "{cookie}");
+        assert!(
+            cookie.contains(&format!("Max-Age={WARNING_COOKIE_MAX_AGE_SECS}")),
+            "{cookie}"
+        );
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        if https {
+            assert_eq!(WARNING_COOKIE_HOST_NAME, "__Host-rustunnel_warn_ok");
+            assert!(
+                cookie.starts_with("__Host-rustunnel_warn_ok=1; Path=/;"),
+                "{cookie}"
+            );
+            assert!(cookie.contains("Secure"), "{cookie}");
+        } else {
+            assert_eq!(WARNING_COOKIE_NAME, "rustunnel_warn_ok");
+            assert!(
+                cookie.starts_with("rustunnel_warn_ok=1; Path=/;"),
+                "{cookie}"
+            );
+            assert!(
+                !cookie
+                    .split(';')
+                    .any(|part| part.trim().eq_ignore_ascii_case("secure")),
+                "{cookie}"
+            );
+            assert!(!cookie.contains("__Host-"), "{cookie}");
+        }
     }
 
     #[test]
