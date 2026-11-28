@@ -1315,6 +1315,80 @@ async fn plain_http_navigation_redirects_to_https_and_other_requests_proxy() {
 }
 
 #[tokio::test]
+async fn plain_http_form_post_is_sent_to_https() {
+    init_tracing();
+    let server = TestServer::start().await;
+    let (local, _shutdown) = hello().await;
+    let seed = Seed::create(&server.db.pg, "agent", "agent").await;
+    let mut client = TestClient::connect_with_token(&server, &seed.raw)
+        .await
+        .unwrap();
+    let session_id = client.session_id.unwrap();
+    let (_, subdomain, _) = client.register_http_tunnel(None).await.unwrap();
+    connect_data_bridge(&server, session_id, local)
+        .await
+        .expect("bridge");
+    let host = format!("{subdomain}.{}", server.domain);
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+
+    let form = http
+        .post(format!("http://127.0.0.1:{}/submit", server.http_port))
+        .header("Host", &host)
+        .header("Accept", "text/html")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("a=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(form.status(), 307);
+    assert_eq!(
+        form.headers().get("location").unwrap().to_str().unwrap(),
+        format!("https://{host}/submit")
+    );
+    seed.cleanup().await;
+}
+
+#[tokio::test]
+async fn plain_http_json_webhook_is_proxied() {
+    init_tracing();
+    let server = TestServer::start().await;
+    let (local, _shutdown) = hello().await;
+    let seed = Seed::create(&server.db.pg, "agent", "agent").await;
+    let mut client = TestClient::connect_with_token(&server, &seed.raw)
+        .await
+        .unwrap();
+    let session_id = client.session_id.unwrap();
+    let (_, subdomain, _) = client.register_http_tunnel(None).await.unwrap();
+    connect_data_bridge(&server, session_id, local)
+        .await
+        .expect("bridge");
+    let host = format!("{subdomain}.{}", server.domain);
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+
+    let webhook = http
+        .post(format!("http://127.0.0.1:{}/", server.http_port))
+        .header("Host", &host)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .body(r#"{"ok":true}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(webhook.status(), 200);
+    assert!(webhook.headers().get("location").is_none());
+    assert_eq!(webhook.text().await.unwrap(), "posted");
+    seed.cleanup().await;
+}
+
+#[tokio::test]
 async fn agent_tunnels_cannot_mint_or_see_warning_cookies() {
     init_tracing();
     let server = TestServer::start().await;

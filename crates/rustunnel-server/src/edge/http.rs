@@ -969,6 +969,7 @@ async fn account_guard(
             sec_fetch_site: header_str(req, "sec-fetch-site"),
             skip_warning: header_str(req, policy::WARNING_SKIP_HEADER),
             cookie: header_str(req, "cookie"),
+            content_type: header_str(req, "content-type"),
             host,
             path_and_query,
             https: scheme == ForwardScheme::Https,

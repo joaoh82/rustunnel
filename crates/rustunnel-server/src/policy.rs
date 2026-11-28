@@ -212,6 +212,9 @@ pub struct IncomingRequest<'a> {
     pub sec_fetch_site: Option<&'a str>,
     pub skip_warning: Option<&'a str>,
     pub cookie: Option<&'a str>,
+    /// `Content-Type` when the client sent one. A form POST with no fetch
+    /// metadata is still a navigation.
+    pub content_type: Option<&'a str>,
     pub host: &'a str,
     pub path_and_query: &'a str,
     /// Public scheme of the request.
@@ -949,12 +952,16 @@ async fn load_account(pool: &PgPool, user_id: Uuid) -> Result<Option<AccountView
 /// `Sec-Fetch-Mode: navigate` or `Sec-Fetch-Dest: document|iframe` counts
 /// for any method, so a cross-site form POST cannot skip the warning.
 /// When the browser sent neither header, a GET whose `Accept` contains
-/// `text/html` is the fallback. `*/*` (curl) is not HTML.
+/// `text/html` is the fallback, and so is a non-GET form submission
+/// (`Accept` contains `text/html` and `Content-Type` is a form type).
+/// Browsers omit `Sec-Fetch-*` on plain HTTP. `*/*` (curl) and a JSON
+/// body are not navigations.
 pub fn is_browser_navigation(
     method: &str,
     accept: Option<&str>,
     sec_fetch_mode: Option<&str>,
     sec_fetch_dest: Option<&str>,
+    content_type: Option<&str>,
 ) -> bool {
     if sec_fetch_mode
         .map(str::trim)
@@ -972,8 +979,22 @@ pub fn is_browser_navigation(
     if sec_fetch_mode.is_some() || sec_fetch_dest.is_some() {
         return false;
     }
-    method.eq_ignore_ascii_case("GET")
-        && accept.is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+    let wants_html = accept.is_some_and(|value| value.to_ascii_lowercase().contains("text/html"));
+    if !wants_html {
+        return false;
+    }
+    method.eq_ignore_ascii_case("GET") || is_form_content_type(content_type)
+}
+
+/// HTML form encodings. The media type is the part before `;`.
+fn is_form_content_type(content_type: Option<&str>) -> bool {
+    let Some(value) = content_type else {
+        return false;
+    };
+    let media = value.split(';').next().unwrap_or(value).trim();
+    media.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        || media.eq_ignore_ascii_case("multipart/form-data")
+        || media.eq_ignore_ascii_case("text/plain")
 }
 
 pub fn warning_skipped(skip_header: Option<&str>, cookie: Option<&str>) -> bool {
@@ -1208,6 +1229,7 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
             req.accept,
             req.sec_fetch_mode,
             req.sec_fetch_dest,
+            req.content_type,
         )
     {
         if let Some(redirect) = https_navigation(req) {
@@ -1231,6 +1253,7 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
             req.accept,
             req.sec_fetch_mode,
             req.sec_fetch_dest,
+            req.content_type,
         )
     {
         return EdgeAction::Respond(warning_page(req.host, req.path_and_query));
@@ -1245,6 +1268,7 @@ fn account_page(block: AuthBlock, req: &IncomingRequest<'_>) -> EdgeResponse {
         req.accept,
         req.sec_fetch_mode,
         req.sec_fetch_dest,
+        req.content_type,
     ) {
         let body = html_doc(
             "Tunnel unavailable",
@@ -1270,6 +1294,7 @@ fn bandwidth_page(plan: &PlanLimits, limit: i64, req: &IncomingRequest<'_>) -> E
         req.accept,
         req.sec_fetch_mode,
         req.sec_fetch_dest,
+        req.content_type,
     ) {
         let body = html_doc(
             "Bandwidth cap reached",
@@ -1904,6 +1929,7 @@ mod tests {
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
+            content_type: None,
             host,
             path_and_query: path,
             https: true,
@@ -2281,6 +2307,38 @@ mod tests {
     }
 
     #[test]
+    fn a_form_post_without_fetch_metadata_is_a_navigation() {
+        let agent = view("agent", false, "agent");
+        for content_type in [
+            "application/x-www-form-urlencoded",
+            "multipart/form-data; boundary=----x",
+            "text/plain;charset=UTF-8",
+        ] {
+            let mut post = browser("demo.example", "/submit");
+            post.https = false;
+            post.method = "POST";
+            post.sec_fetch_mode = None;
+            post.accept = Some("text/html");
+            post.content_type = Some(content_type);
+            match edge_action(&agent, 0, &post) {
+                EdgeAction::Respond(page) => assert_eq!(page.status, 307, "{content_type}"),
+                EdgeAction::Proxy => panic!("{content_type} skipped the warning"),
+            }
+        }
+
+        let mut json = browser("demo.example", "/");
+        json.https = false;
+        json.method = "POST";
+        json.sec_fetch_mode = None;
+        json.accept = Some("application/json");
+        json.content_type = Some("application/json");
+        assert!(
+            matches!(edge_action(&agent, 0, &json), EdgeAction::Proxy),
+            "a JSON webhook is proxied"
+        );
+    }
+
+    #[test]
     fn continue_is_ignored_unless_this_is_an_unclaimed_agent_get() {
         let agent = view("agent", false, "agent");
         let human = view("human", false, "free");
@@ -2324,6 +2382,7 @@ mod tests {
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
+            content_type: None,
             host: "h.example",
             path_and_query: "/",
             https: false,
@@ -3000,6 +3059,7 @@ mod tests {
             sec_fetch_site: None,
             skip_warning: None,
             cookie: None,
+            content_type: None,
             host: "h.example",
             path_and_query: "/",
             https: false,
