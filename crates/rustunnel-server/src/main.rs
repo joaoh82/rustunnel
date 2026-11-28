@@ -671,6 +671,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> Response {
             .map(|e| (e.key().to_string(), Arc::clone(e.value()))),
     ));
 
+    let dropped_cookies = rustunnel_server::edge::http::upstream_set_cookie_domains_dropped();
+
     let body = format!(
         "# HELP rustunnel_active_sessions Number of active client sessions\n\
          # TYPE rustunnel_active_sessions gauge\n\
@@ -693,6 +695,9 @@ async fn metrics_handler(State(state): State<MetricsState>) -> Response {
          # HELP rustunnel_requests_total Total requests/connections across all tunnels\n\
          # TYPE rustunnel_requests_total counter\n\
          rustunnel_requests_total {total_requests}\n\
+         # HELP rustunnel_upstream_set_cookie_domain_dropped_total Upstream Set-Cookie headers dropped because Domain was not the exact tunnel host\n\
+         # TYPE rustunnel_upstream_set_cookie_domain_dropped_total counter\n\
+         rustunnel_upstream_set_cookie_domain_dropped_total {dropped_cookies}\n\
          {groups_block}"
     );
 
