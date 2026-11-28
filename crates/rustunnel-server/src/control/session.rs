@@ -614,12 +614,30 @@ where
                     // cannot raise the cap. Tokens with no user_id (direct,
                     // admin, legacy) skip the check.
                     if let Some(user_id) = token.user_id {
-                        let gate = crate::billing::evaluate_hobby_limits(
+                        let gate = match crate::billing::evaluate_hobby_limits(
                             &db.pg,
                             user_id,
                             subdomain.as_deref(),
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(gate) => gate,
+                            Err(e) => {
+                                // Same as the plan check below: refuse the
+                                // tunnel and leave the websocket up.
+                                tracing::warn!(
+                                    error = %e,
+                                    %session_id,
+                                    "hobby registration check failed"
+                                );
+                                send_frame(
+                                    ws,
+                                    &tunnel_error(request_id, "tunnel registration failed", None),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                        };
                         if let Some(block) = gate.block {
                             let message = block.message(surface);
                             crate::billing::spawn_hobby_limit_report(
