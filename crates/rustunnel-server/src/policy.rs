@@ -172,6 +172,8 @@ pub struct IncomingRequest<'a> {
     pub cookie: Option<&'a str>,
     pub host: &'a str,
     pub path_and_query: &'a str,
+    /// Public scheme. The continue cookie is `Secure` only on HTTPS.
+    pub https: bool,
 }
 
 struct CachedView {
@@ -621,7 +623,11 @@ pub fn cookie_has_warning_ack(cookie: Option<&str>) -> bool {
 }
 
 /// Continue link target. `None` when this request is not the acknowledgement.
-/// The returned path drops only [`WARNING_ACK_PARAM`] and stays on this host.
+///
+/// The caller must invoke this only for a GET on an unclaimed agent tunnel.
+/// Any other request, including one that carries the query flag, is proxied
+/// with that flag still on it. The returned path drops only
+/// [`WARNING_ACK_PARAM`] and stays on this host.
 pub fn warning_acknowledgement(path_and_query: &str, https: bool) -> Option<EdgeResponse> {
     let location = strip_ack_param(path_and_query)?;
     Some(EdgeResponse {
@@ -674,12 +680,33 @@ fn strip_ack_param(path_and_query: &str) -> Option<String> {
     }
 }
 
+/// Same-origin path, or `/` when `path` could leave this host.
+///
+/// A browser treats `/\evil.com` as `//evil.com`. `%5C` is that backslash
+/// once decoded, in either case. A path has to start with one `/` and no
+/// second slash.
 fn safe_path(path: &str) -> &str {
-    if path.starts_with('/') && !path.starts_with("//") {
+    if is_same_origin_path(path) {
         path
     } else {
         "/"
     }
+}
+
+fn is_same_origin_path(path: &str) -> bool {
+    let mut chars = path.chars();
+    if chars.next() != Some('/') {
+        return false;
+    }
+    // A second slash is a protocol-relative URL. A backslash is the same
+    // thing after a browser normalizes it.
+    if matches!(chars.next(), Some('/') | Some('\\')) {
+        return false;
+    }
+    if path.contains('\\') || path.to_ascii_lowercase().contains("%5c") {
+        return false;
+    }
+    true
 }
 
 /// Ban, hard cap, or the unclaimed-agent warning. `Proxy` means forward.
@@ -692,6 +719,14 @@ pub fn edge_action(view: &AccountView, month_bytes: i64, req: &IncomingRequest<'
             if month_bytes >= limit {
                 return EdgeAction::Respond(bandwidth_page(plan, limit, req));
             }
+        }
+    }
+    // The continue flag is handled only for GET on an unclaimed agent
+    // tunnel. A human tunnel, a POST, or any other request keeps the query
+    // string and is proxied.
+    if req.method.eq_ignore_ascii_case("GET") && unclaimed_agent_tunnel(view) {
+        if let Some(ack) = warning_acknowledgement(req.path_and_query, req.https) {
+            return EdgeAction::Respond(ack);
         }
     }
     if unclaimed_agent_tunnel(view)
@@ -1134,6 +1169,7 @@ mod tests {
             cookie: None,
             host,
             path_and_query: path,
+            https: true,
         }
     }
 
@@ -1231,6 +1267,52 @@ mod tests {
     }
 
     #[test]
+    fn continue_stays_on_this_host() {
+        for path in [
+            "/\\evil.com",
+            "/%5Cevil.com",
+            "/%5cevil.com",
+            "//evil.com",
+            "https://evil.com",
+        ] {
+            let ack = warning_acknowledgement(&format!("{path}?rustunnel_warn_continue=1"), false)
+                .unwrap();
+            let location = ack.location.unwrap();
+            assert_eq!(location, "/", "{path} redirected to {location}");
+        }
+        let kept = warning_acknowledgement("/docs?rustunnel_warn_continue=1&x=1", false).unwrap();
+        assert_eq!(kept.location.as_deref(), Some("/docs?x=1"));
+    }
+
+    #[test]
+    fn continue_is_ignored_unless_this_is_an_unclaimed_agent_get() {
+        let agent = view("agent", false, "agent");
+        let human = view("human", false, "free");
+        let flagged = "/\\evil.com?rustunnel_warn_continue=1";
+
+        let mut post = browser("h.example", flagged);
+        post.method = "POST";
+        assert!(
+            matches!(edge_action(&agent, 0, &post), EdgeAction::Proxy),
+            "a POST carrying the flag is proxied"
+        );
+
+        let human_get = browser("h.example", "/?rustunnel_warn_continue=1");
+        assert!(
+            matches!(edge_action(&human, 0, &human_get), EdgeAction::Proxy),
+            "a human tunnel carrying the flag is proxied"
+        );
+
+        match edge_action(&agent, 0, &browser("h.example", flagged)) {
+            EdgeAction::Respond(page) => {
+                assert_eq!(page.status, 303);
+                assert_eq!(page.location.as_deref(), Some("/"));
+            }
+            EdgeAction::Proxy => panic!("an unclaimed agent GET should acknowledge"),
+        }
+    }
+
+    #[test]
     fn bandwidth_and_ban_pages_use_stable_codes() {
         let mut plan = agent_plan();
         plan.bandwidth_hard_cap = true;
@@ -1244,6 +1326,7 @@ mod tests {
             cookie: None,
             host: "h.example",
             path_and_query: "/",
+            https: false,
         };
         match edge_action(&account, AgentPlanLimits::BANDWIDTH_LIMIT_BYTES, &curl) {
             EdgeAction::Respond(page) => {
@@ -1585,6 +1668,7 @@ mod tests {
             cookie: None,
             host: "h.example",
             path_and_query: "/",
+            https: false,
         };
         match edge_action(&still_active, bytes, &curl) {
             EdgeAction::Respond(page) => {

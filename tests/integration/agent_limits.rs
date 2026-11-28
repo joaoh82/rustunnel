@@ -970,3 +970,132 @@ async fn admin_users_list_filters_kind_and_keeps_deactivated_rows() {
     agent.cleanup().await;
     human.cleanup().await;
 }
+
+#[tokio::test]
+async fn warning_ack_is_not_an_open_redirect() {
+    init_tracing();
+    let server = TestServer::start().await;
+    let (local, _shutdown) = hello().await;
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+
+    let human = Seed::create(&server.db.pg, "human", "free").await;
+    let mut human_client = TestClient::connect_with_token(&server, &human.raw)
+        .await
+        .unwrap();
+    let human_session = human_client.session_id.unwrap();
+    let (_, human_sub, _) = human_client.register_http_tunnel(None).await.unwrap();
+    connect_data_bridge(&server, human_session, local)
+        .await
+        .expect("human bridge");
+    let human_host = format!("{human_sub}.{}", server.domain);
+    let proxied = http
+        .get(format!(
+            "https://127.0.0.1:{}/?rustunnel_warn_continue=1",
+            server.https_port
+        ))
+        .header("Host", &human_host)
+        .header("Accept", "text/html")
+        .header("Sec-Fetch-Mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(proxied.status(), 200, "a human tunnel proxies the flag");
+    assert!(proxied.headers().get("location").is_none());
+    assert_eq!(proxied.text().await.unwrap(), "Hello, World!");
+
+    let agent = Seed::create(&server.db.pg, "agent", "agent").await;
+    let mut agent_client = TestClient::connect_with_token(&server, &agent.raw)
+        .await
+        .unwrap();
+    let agent_session = agent_client.session_id.unwrap();
+    let (_, agent_sub, _) = agent_client.register_http_tunnel(None).await.unwrap();
+    connect_data_bridge(&server, agent_session, local)
+        .await
+        .expect("agent bridge");
+    let agent_host = format!("{agent_sub}.{}", server.domain);
+    let posted = http
+        .post(format!(
+            "https://127.0.0.1:{}/?rustunnel_warn_continue=1",
+            server.https_port
+        ))
+        .header("Host", &agent_host)
+        .header("Accept", "text/html")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), 200, "a POST carrying the flag is proxied");
+    assert!(posted.headers().get("location").is_none());
+    assert_eq!(posted.text().await.unwrap(), "posted");
+
+    for path in [
+        "/\\evil.com?rustunnel_warn_continue=1",
+        "/%5Cevil.com?rustunnel_warn_continue=1",
+        "//evil.com?rustunnel_warn_continue=1",
+    ] {
+        let (status, location) = raw_https_get(server.https_port, &agent_host, path).await;
+        let off_host = location.as_deref().is_some_and(location_leaves_host);
+        assert!(
+            !off_host,
+            "{path} status {status} location {location:?} left the host"
+        );
+        if status == 303 {
+            assert_eq!(location.as_deref(), Some("/"), "{path}");
+        }
+    }
+
+    human.cleanup().await;
+    agent.cleanup().await;
+}
+
+fn location_leaves_host(location: &str) -> bool {
+    let lower = location.to_ascii_lowercase();
+    lower.starts_with("//")
+        || lower.starts_with("/\\")
+        || lower.contains("evil.com")
+        || lower.contains("%5c")
+        || lower.contains("\\")
+}
+
+async fn raw_https_get(port: u16, host: &str, path: &str) -> (u16, Option<String>) {
+    use rustls::pki_types::ServerName;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsConnector;
+
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    let connector = TlsConnector::from(insecure_client_tls());
+    let name = ServerName::try_from("localhost").expect("server name");
+    let mut tls = connector.connect(name, tcp).await.expect("tls");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    let _ = tls.read_to_end(&mut buf).await;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let mut location = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("location") {
+            location = Some(value.trim().to_string());
+        }
+    }
+    (status, location)
+}

@@ -901,12 +901,6 @@ async fn account_guard(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    if let Some(ack) =
-        policy::warning_acknowledgement(path_and_query, scheme == ForwardScheme::Https)
-    {
-        return Some(edge_response(ack));
-    }
-
     let user_id = ctx
         .core
         .sessions
@@ -952,6 +946,7 @@ async fn account_guard(
             cookie: header_str(req, "cookie"),
             host,
             path_and_query,
+            https: scheme == ForwardScheme::Https,
         },
     );
     match action {
