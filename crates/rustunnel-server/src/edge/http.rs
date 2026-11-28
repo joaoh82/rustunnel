@@ -942,6 +942,7 @@ async fn account_guard(
             method: req.method().as_str(),
             accept: header_str(req, "accept"),
             sec_fetch_mode: header_str(req, "sec-fetch-mode"),
+            sec_fetch_site: header_str(req, "sec-fetch-site"),
             skip_warning: header_str(req, policy::WARNING_SKIP_HEADER),
             cookie: header_str(req, "cookie"),
             host,
@@ -972,6 +973,12 @@ fn edge_response(response: EdgeResponse) -> Response<BoxBody> {
     }
     if let Some(value) = response.content_security_policy {
         builder = builder.header("content-security-policy", value);
+    }
+    if let Some(value) = response.robots {
+        builder = builder.header("x-robots-tag", value);
+    }
+    if let Some(value) = response.referrer_policy {
+        builder = builder.header("referrer-policy", value);
     }
     builder.body(full(response.body)).unwrap()
 }

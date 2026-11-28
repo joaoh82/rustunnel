@@ -802,6 +802,31 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
     .await;
     assert_eq!(page.status(), 200);
     assert_eq!(page.headers().get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(page.headers().get("x-robots-tag").unwrap(), "noindex");
+    assert_eq!(
+        page.headers().get("referrer-policy").unwrap(),
+        "no-referrer"
+    );
+    assert_eq!(page.headers().get("cache-control").unwrap(), "no-store");
+    let nonce_cookie = page
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(nonce_cookie.starts_with("__Host-rustunnel_warn_nonce="));
+    assert!(nonce_cookie.contains("Path=/"));
+    assert!(nonce_cookie.contains("Secure"));
+    assert!(!nonce_cookie.to_ascii_lowercase().contains("domain="));
+    let nonce = nonce_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_string();
     let csp = page
         .headers()
         .get("content-security-policy")
@@ -817,6 +842,7 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
     assert!(html.contains(&host));
     assert!(html.contains("Do not enter passwords"));
     assert!(html.contains(">Continue<"));
+    assert!(html.contains(&format!("rustunnel_warn_continue={nonce}")));
     assert!(!html.contains("src="));
     assert!(!html.contains("http://") && !html.contains("https://"));
     assert!(!html.contains("Hello, World!"));
@@ -880,13 +906,28 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap();
-    let ack = client
+    let missing = client
         .get(format!(
             "https://127.0.0.1:{}/?rustunnel_warn_continue=1",
             server.https_port
         ))
         .header("Host", &host)
         .header("Accept", "text/html")
+        .header("Sec-Fetch-Site", "same-origin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 200);
+
+    let ack = client
+        .get(format!(
+            "https://127.0.0.1:{}/?rustunnel_warn_continue={nonce}",
+            server.https_port
+        ))
+        .header("Host", &host)
+        .header("Accept", "text/html")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Cookie", format!("__Host-rustunnel_warn_nonce={nonce}"))
         .send()
         .await
         .unwrap();
@@ -898,7 +939,7 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(cookie.starts_with("rustunnel_warn_ok=1"));
+    assert!(cookie.starts_with("__Host-rustunnel_warn_ok=1"));
     assert!(cookie.contains("Path=/"));
     assert!(cookie.contains("Max-Age=86400"));
     assert!(cookie.contains("Secure"));
@@ -907,12 +948,15 @@ async fn browser_warning_is_only_for_unclaimed_agent_plan_navigations() {
         ack.headers().get("location").unwrap().to_str().unwrap(),
         "/"
     );
+    assert_eq!(ack.headers().get("x-robots-tag").unwrap(), "noindex");
+    assert_eq!(ack.headers().get("referrer-policy").unwrap(), "no-referrer");
+    assert_eq!(ack.headers().get("cache-control").unwrap(), "no-store");
 
     let through = client
         .get(format!("https://127.0.0.1:{}/", server.https_port))
         .header("Host", &host)
         .header("Accept", "text/html")
-        .header("Cookie", "rustunnel_warn_ok=1")
+        .header("Cookie", "__Host-rustunnel_warn_ok=1")
         .send()
         .await
         .unwrap();
